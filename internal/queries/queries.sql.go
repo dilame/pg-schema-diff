@@ -233,6 +233,105 @@ func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) 
 	return items, nil
 }
 
+const getCompositeTypes = `-- name: GetCompositeTypes :many
+SELECT
+    pg_type.oid AS type_oid,
+    pg_type.typname::TEXT AS type_name,
+    type_namespace.nspname::TEXT AS type_schema_name,
+    COALESCE(att.attname, '')::TEXT AS attribute_name,
+    COALESCE(
+        pg_catalog.format_type(att.atttypid, att.atttypmod), ''
+    )::TEXT AS attribute_type,
+    COALESCE(coll.collname, '')::TEXT AS collation_name,
+    COALESCE(coll_ns.nspname, '')::TEXT AS collation_schema_name,
+    COALESCE(
+        pg_catalog.obj_description(pg_type.oid, 'pg_type'), ''
+    )::TEXT AS description
+FROM pg_catalog.pg_type AS pg_type
+INNER JOIN
+    pg_catalog.pg_namespace AS type_namespace
+    ON pg_type.typnamespace = type_namespace.oid
+INNER JOIN
+    pg_catalog.pg_class AS rel
+    -- A user-defined composite type's underlying class has relkind = 'c'. Implicit
+    -- row types created for tables/views/sequences have relkind in ('r','p','v','m','S')
+    -- and must be excluded.
+    ON pg_type.typrelid = rel.oid AND rel.relkind = 'c'
+LEFT JOIN
+    pg_catalog.pg_attribute AS att
+    ON
+        att.attrelid = rel.oid
+        AND att.attnum > 0
+        AND NOT att.attisdropped
+LEFT JOIN
+    pg_catalog.pg_collation AS coll
+    ON att.attcollation = coll.oid
+LEFT JOIN
+    pg_catalog.pg_namespace AS coll_ns
+    ON coll.collnamespace = coll_ns.oid
+WHERE
+    pg_type.typtype = 'c'
+    AND type_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND type_namespace.nspname !~ '^pg_toast'
+    AND type_namespace.nspname !~ '^pg_temp'
+    -- Exclude composite types belonging to extensions
+    AND NOT EXISTS (
+        SELECT ext_depend.objid
+        FROM pg_catalog.pg_depend AS ext_depend
+        WHERE
+            ext_depend.classid = 'pg_type'::REGCLASS
+            AND ext_depend.objid = pg_type.oid
+            AND ext_depend.deptype = 'e'
+    )
+ORDER BY pg_type.oid, att.attnum
+`
+
+type GetCompositeTypesRow struct {
+	TypeOid             interface{}
+	TypeName            string
+	TypeSchemaName      string
+	AttributeName       string
+	AttributeType       string
+	CollationName       string
+	CollationSchemaName string
+	Description         string
+}
+
+// Returns one row per (composite type, attribute) pair, ordered so that the consumer
+// can rebuild attribute lists in their declared order. Types with zero attributes still
+// get a single row with attribute_name = ” so the type itself is not lost.
+func (q *Queries) GetCompositeTypes(ctx context.Context) ([]GetCompositeTypesRow, error) {
+	rows, err := q.db.QueryContext(ctx, getCompositeTypes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetCompositeTypesRow
+	for rows.Next() {
+		var i GetCompositeTypesRow
+		if err := rows.Scan(
+			&i.TypeOid,
+			&i.TypeName,
+			&i.TypeSchemaName,
+			&i.AttributeName,
+			&i.AttributeType,
+			&i.CollationName,
+			&i.CollationSchemaName,
+			&i.Description,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getDependsOnFunctions = `-- name: GetDependsOnFunctions :many
 SELECT
     pg_proc.proname::TEXT AS func_name,

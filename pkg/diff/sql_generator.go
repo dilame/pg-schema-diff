@@ -94,6 +94,10 @@ type (
 		oldAndNew[schema.Enum]
 	}
 
+	compositeTypeDiff struct {
+		oldAndNew[schema.CompositeType]
+	}
+
 	extensionDiff struct {
 		oldAndNew[schema.Extension]
 	}
@@ -146,6 +150,7 @@ type schemaDiff struct {
 	namedSchemaDiffs          listDiff[schema.NamedSchema, namedSchemaDiff]
 	extensionDiffs            listDiff[schema.Extension, extensionDiff]
 	enumDiffs                 listDiff[schema.Enum, enumDiff]
+	compositeTypeDiffs        listDiff[schema.CompositeType, compositeTypeDiff]
 	tableDiffs                listDiff[schema.Table, tableDiff]
 	indexDiffs                listDiff[schema.Index, indexDiff]
 	foreignKeyConstraintDiffs listDiff[schema.ForeignKeyConstraint, foreignKeyConstraintDiff]
@@ -232,6 +237,15 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing enums: %w", err)
+	}
+
+	compositeTypeDiffs, err := diffLists(old.CompositeTypes, new.CompositeTypes, func(old, new schema.CompositeType, _, _ int) (compositeTypeDiff, bool, error) {
+		return compositeTypeDiff{
+			oldAndNew[schema.CompositeType]{old: old, new: new},
+		}, false, nil
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing composite types: %w", err)
 	}
 
 	tableDiffs, err := diffLists(old.Tables, new.Tables, buildTableDiff)
@@ -347,6 +361,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		namedSchemaDiffs:          schemaDiffs,
 		extensionDiffs:            extensionDiffs,
 		enumDiffs:                 enumDiffs,
+		compositeTypeDiffs:        compositeTypeDiffs,
 		tableDiffs:                tableDiffs,
 		indexDiffs:                indexesDiff,
 		foreignKeyConstraintDiffs: foreignKeyConstraintDiffs,
@@ -661,6 +676,13 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving sequence ownership diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, sequenceOwnershipsPartialGraph)
+
+	compositeTypeGenerator := newCompositeTypeSQLVertexGenerator(diff.old, diff.new)
+	compositeTypesPartialGraph, err := generatePartialGraph(compositeTypeGenerator, diff.compositeTypeDiffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving composite type diff: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, compositeTypesPartialGraph)
 
 	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName)
 	functionsPartialGraph, err := generatePartialGraph(functionGenerator, diff.functionDiffs)
