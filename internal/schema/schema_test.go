@@ -239,7 +239,7 @@ var (
 			GRANT SELECT ON schema_2.foo TO some_role_1;
 			GRANT INSERT ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "64ef09172f9f5924",
+			expectedHash: "26652af0380a102d",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					{Name: "public", Description: "standard public schema"},
@@ -593,7 +593,7 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "9cec6881c66436cb",
+			expectedHash: "e2acfd59c86909be",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					{Name: "public", Description: "standard public schema"},
@@ -1175,7 +1175,7 @@ var (
 				CREATE TYPE pg_temp.color AS ENUM ('red', 'green', 'blue');
 			`},
 			// Assert empty schema hash, since we want to validate specifically that this hash is deterministic
-			expectedHash: "586c891bd7a36300",
+			expectedHash: "ab91b603e898f324",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					{Name: "public", Description: "standard public schema"},

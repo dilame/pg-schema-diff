@@ -55,6 +55,7 @@ type Schema struct {
 	NamedSchemas          []NamedSchema
 	Extensions            []Extension
 	Enums                 []Enum
+	CompositeTypes        []CompositeType
 	Tables                []Table
 	Indexes               []Index
 	ForeignKeyConstraints []ForeignKeyConstraint
@@ -72,6 +73,10 @@ func (s Schema) Normalize() Schema {
 	s.NamedSchemas = sortSchemaObjectsByName(s.NamedSchemas)
 	s.Extensions = sortSchemaObjectsByName(s.Extensions)
 	s.Enums = sortSchemaObjectsByName(s.Enums)
+
+	// Composite type attribute order is meaningful (it determines the layout of every value
+	// of that type), so do NOT sort attributes — only sort the types themselves.
+	s.CompositeTypes = sortSchemaObjectsByName(s.CompositeTypes)
 
 	var normTables []Table
 	for _, t := range sortSchemaObjectsByName(s.Tables) {
@@ -215,6 +220,29 @@ type Enum struct {
 	SchemaQualifiedName
 	Labels []string
 	// Description is the comment attached to the enum type (pg_description). Empty means no comment.
+	Description string
+}
+
+// CompositeTypeAttribute represents a single attribute (field) of a composite type.
+type CompositeTypeAttribute struct {
+	Name string
+	// Type is the formatted type, as returned by `pg_catalog.format_type` (e.g. `integer`, `numeric(10,2)`,
+	// `text[]`, or another schema-qualified composite type).
+	Type      string
+	Collation SchemaQualifiedName
+}
+
+func (a CompositeTypeAttribute) GetName() string {
+	return a.Name
+}
+
+// CompositeType represents a user-defined composite type (`CREATE TYPE foo AS (a int, b text)`).
+// It does NOT include the implicit row types created for tables/views — those have a backing
+// pg_class entry of relkind != 'c' and are filtered out by GetCompositeTypes.
+type CompositeType struct {
+	SchemaQualifiedName
+	Attributes []CompositeTypeAttribute
+	// Description is the comment attached to the type (pg_description). Empty means no comment.
 	Description string
 }
 
@@ -738,6 +766,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("starting enums future: %w", err)
 	}
 
+	compositeTypesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]CompositeType, error) {
+		return s.fetchCompositeTypes(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting composite types future: %w", err)
+	}
+
 	tablesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Table, error) {
 		return s.fetchTables(ctx)
 	})
@@ -816,6 +851,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("getting enums: %w", err)
 	}
 
+	compositeTypes, err := compositeTypesFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting composite types: %w", err)
+	}
+
 	tables, err := tablesFuture.Get(ctx)
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting tables: %w", err)
@@ -865,6 +905,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		NamedSchemas:          schemas,
 		Extensions:            extensions,
 		Enums:                 enums,
+		CompositeTypes:        compositeTypes,
 		Tables:                tables,
 		Indexes:               indexes,
 		ForeignKeyConstraints: fkCons,
@@ -961,6 +1002,62 @@ func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
 	)
 
 	return enums, nil
+}
+
+func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeType, error) {
+	rawAttrs, err := s.q.GetCompositeTypes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetCompositeTypes: %w", err)
+	}
+
+	byOid := make(map[interface{}]*CompositeType)
+	var ordered []*CompositeType
+	for _, row := range rawAttrs {
+		ct, ok := byOid[row.TypeOid]
+		if !ok {
+			ct = &CompositeType{
+				SchemaQualifiedName: SchemaQualifiedName{
+					SchemaName:  row.TypeSchemaName,
+					EscapedName: EscapeIdentifier(row.TypeName),
+				},
+				Description: row.Description,
+			}
+			byOid[row.TypeOid] = ct
+			ordered = append(ordered, ct)
+		}
+		// rawAttrs may include a synthetic row with attribute_name = '' for types that
+		// have zero attributes (rare but valid for types being constructed). Skip those.
+		if row.AttributeName == "" {
+			continue
+		}
+		collation := SchemaQualifiedName{}
+		if row.CollationName != "" {
+			collation = SchemaQualifiedName{
+				EscapedName: EscapeIdentifier(row.CollationName),
+				SchemaName:  row.CollationSchemaName,
+			}
+		}
+		ct.Attributes = append(ct.Attributes, CompositeTypeAttribute{
+			Name:      row.AttributeName,
+			Type:      row.AttributeType,
+			Collation: collation,
+		})
+	}
+
+	var compositeTypes []CompositeType
+	for _, ct := range ordered {
+		compositeTypes = append(compositeTypes, *ct)
+	}
+
+	compositeTypes = filterSliceByName(
+		compositeTypes,
+		func(ct CompositeType) SchemaQualifiedName {
+			return ct.SchemaQualifiedName
+		},
+		s.nameFilter,
+	)
+
+	return compositeTypes, nil
 }
 
 func (s *schemaFetcher) fetchTables(ctx context.Context) ([]Table, error) {
