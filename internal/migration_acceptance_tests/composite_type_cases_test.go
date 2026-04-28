@@ -101,13 +101,57 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			CREATE TYPE outer_t AS (i inner_t, label text);
 		`},
 	},
+	// ─── Phase 2: drop+recreate cascade for function-only dependents ───
 	{
-		name: "alter composite type attributes is unsupported",
+		name: "alter composite type attrs - cascade through dependent function",
 		oldSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text);
+			CREATE FUNCTION mk_pair(x int, y text) RETURNS pair LANGUAGE sql AS 'SELECT (x, y)::pair';
 		`},
 		newSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE FUNCTION mk_pair(x int, y text, z boolean) RETURNS pair LANGUAGE sql AS 'SELECT (x, y, z)::pair';
+		`},
+	},
+	{
+		name: "alter composite type attrs - cascade through dependent procedure",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE PROCEDURE use_pair(p pair) LANGUAGE plpgsql AS $$ BEGIN END $$;
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE PROCEDURE use_pair(p pair) LANGUAGE plpgsql AS $$ BEGIN END $$;
+		`},
+		// Procedures always carry the untrackable-deps hazard regardless of the
+		// underlying composite-type recreation; pg-schema-diff cannot follow plpgsql
+		// body references through pg_depend.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeHasUntrackableDependencies,
+		},
+	},
+	{
+		name: "alter composite type attrs - cascade through multiple dependent functions",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE FUNCTION f_a(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+			CREATE FUNCTION f_b(p pair) RETURNS text LANGUAGE sql AS 'SELECT (p).b';
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE FUNCTION f_a(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+			CREATE FUNCTION f_b(p pair) RETURNS text LANGUAGE sql AS 'SELECT (p).b';
+		`},
+	},
+	{
+		name: "alter composite type attrs is unsupported when used by a table column",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE TABLE users (id int, attrs pair);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE TABLE users (id int, attrs pair);
 		`},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
 	},

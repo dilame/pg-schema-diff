@@ -233,6 +233,55 @@ func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) 
 	return items, nil
 }
 
+const getCompositeTypeTableConsumers = `-- name: GetCompositeTypeTableConsumers :many
+SELECT
+    consumer_c.relname::TEXT AS table_name,
+    consumer_ns.nspname::TEXT AS table_schema_name
+FROM pg_catalog.pg_attribute AS att
+INNER JOIN pg_catalog.pg_class AS consumer_c
+    ON
+        att.attrelid = consumer_c.oid
+        AND consumer_c.relkind IN ('r', 'p')
+INNER JOIN pg_catalog.pg_namespace AS consumer_ns
+    ON consumer_c.relnamespace = consumer_ns.oid
+WHERE
+    att.atttypid = $1
+    AND att.attnum > 0
+    AND NOT att.attisdropped
+`
+
+type GetCompositeTypeTableConsumersRow struct {
+	TableName       string
+	TableSchemaName string
+}
+
+// Returns the tables (relkind in r,p) whose columns are typed by the given
+// composite type. Used to refuse a `CREATE TYPE` attribute change when a
+// table column depends on the type — recreating the type would require
+// rewriting the table, which is out of scope for this generator.
+func (q *Queries) GetCompositeTypeTableConsumers(ctx context.Context, typeOid interface{}) ([]GetCompositeTypeTableConsumersRow, error) {
+	rows, err := q.db.QueryContext(ctx, getCompositeTypeTableConsumers, typeOid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetCompositeTypeTableConsumersRow
+	for rows.Next() {
+		var i GetCompositeTypeTableConsumersRow
+		if err := rows.Scan(&i.TableName, &i.TableSchemaName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getCompositeTypes = `-- name: GetCompositeTypes :many
 SELECT
     pg_type.oid AS type_oid,
@@ -319,6 +368,63 @@ func (q *Queries) GetCompositeTypes(ctx context.Context) ([]GetCompositeTypesRow
 			&i.CollationSchemaName,
 			&i.Description,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getDependsOnCompositeTypes = `-- name: GetDependsOnCompositeTypes :many
+SELECT
+    pg_type.typname::TEXT AS type_name,
+    type_namespace.nspname::TEXT AS type_schema_name
+FROM pg_catalog.pg_depend AS depend
+INNER JOIN pg_catalog.pg_type AS pg_type
+    ON
+        depend.refclassid = 'pg_type'::REGCLASS
+        AND depend.refobjid = pg_type.oid
+        AND pg_type.typtype = 'c'
+INNER JOIN
+    pg_catalog.pg_namespace AS type_namespace
+    ON pg_type.typnamespace = type_namespace.oid
+INNER JOIN pg_catalog.pg_class AS rel
+    ON pg_type.typrelid = rel.oid AND rel.relkind = 'c'
+WHERE
+    depend.classid = $1::REGCLASS
+    AND depend.objid = $2
+    AND depend.deptype = 'n'
+`
+
+type GetDependsOnCompositeTypesParams struct {
+	SystemCatalog interface{}
+	ObjectID      interface{}
+}
+
+type GetDependsOnCompositeTypesRow struct {
+	TypeName       string
+	TypeSchemaName string
+}
+
+// Returns the composite types (typtype = 'c') that the given object depends on.
+// Used to drive cascading drop+recreate of functions and procedures when the
+// attribute list of a composite type changes.
+func (q *Queries) GetDependsOnCompositeTypes(ctx context.Context, arg GetDependsOnCompositeTypesParams) ([]GetDependsOnCompositeTypesRow, error) {
+	rows, err := q.db.QueryContext(ctx, getDependsOnCompositeTypes, arg.SystemCatalog, arg.ObjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetDependsOnCompositeTypesRow
+	for rows.Next() {
+		var i GetDependsOnCompositeTypesRow
+		if err := rows.Scan(&i.TypeName, &i.TypeSchemaName); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
