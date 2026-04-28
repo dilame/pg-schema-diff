@@ -239,10 +239,32 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing enums: %w", err)
 	}
 
+	// compositeTypesBeingRecreated tracks types whose attribute list is changing.
+	// Functions and procedures that reference any of these must be force-recreated so
+	// they pick up the new attribute layout — `CREATE OR REPLACE FUNCTION` cannot
+	// change a function's argument or return type. (Pure adds and pure deletes do not
+	// contribute, and would not match new functions' DependsOnCompositeTypes anyway.)
+	compositeTypesBeingRecreated := make(map[string]bool)
 	compositeTypeDiffs, err := diffLists(old.CompositeTypes, new.CompositeTypes, func(old, new schema.CompositeType, _, _ int) (compositeTypeDiff, bool, error) {
+		// Compare attribute lists ignoring Description (handled separately via COMMENT
+		// statements). If attributes match, no recreation is needed.
+		if cmp.Equal(old.Attributes, new.Attributes) {
+			return compositeTypeDiff{
+				oldAndNew[schema.CompositeType]{old: old, new: new},
+			}, false, nil
+		}
+		// Attributes differ. If a table column already uses this type, recreating it
+		// would require rewriting the consumer table — out of scope here.
+		if old.IsUsedByTable {
+			return compositeTypeDiff{}, false, fmt.Errorf("changing attributes of composite type %s used by a table column: %w", new.GetFQEscapedName(), ErrNotImplemented)
+		}
+		// Otherwise: signal recreation. The diff machinery will route the change
+		// through Delete + Add. We register the type so dependent functions and
+		// procedures are force-recreated below.
+		compositeTypesBeingRecreated[new.GetName()] = true
 		return compositeTypeDiff{
 			oldAndNew[schema.CompositeType]{old: old, new: new},
-		}, false, nil
+		}, true, nil
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing composite types: %w", err)
@@ -299,6 +321,14 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	}
 
 	functionDiffs, err := diffLists(old.Functions, new.Functions, func(old, new schema.Function, _, _ int) (functionDiff, bool, error) {
+		// If the new function references a composite type whose attributes are being
+		// recreated, the function must be dropped and recreated alongside the type
+		// (CREATE OR REPLACE cannot change a function's argument or return type).
+		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+			}, true, nil
+		}
 		return functionDiff{
 			oldAndNew[schema.Function]{
 				old: old,
@@ -311,6 +341,11 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	}
 
 	procedureDiffs, err := diffLists(old.Procedures, new.Procedures, func(old, new schema.Procedure, _, _ int) (procedureDiff, bool, error) {
+		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) {
+			return procedureDiff{
+				oldAndNew[schema.Procedure]{old: old, new: new},
+			}, true, nil
+		}
 		return procedureDiff{
 			oldAndNew[schema.Procedure]{
 				old: old,

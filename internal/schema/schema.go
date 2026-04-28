@@ -91,6 +91,7 @@ func (s Schema) Normalize() Schema {
 	var normFunctions []Function
 	for _, function := range sortSchemaObjectsByName(s.Functions) {
 		function.DependsOnFunctions = sortSchemaObjectsByName(function.DependsOnFunctions)
+		function.DependsOnCompositeTypes = sortSchemaObjectsByName(function.DependsOnCompositeTypes)
 		normFunctions = append(normFunctions, function)
 	}
 	s.Functions = normFunctions
@@ -244,6 +245,10 @@ type CompositeType struct {
 	Attributes []CompositeTypeAttribute
 	// Description is the comment attached to the type (pg_description). Empty means no comment.
 	Description string
+	// IsUsedByTable is true iff at least one table column has this composite type as its
+	// declared type. When true, attribute-level changes to the type are unsupported by the
+	// diff generator (recreating the type would require rewriting every consumer table).
+	IsUsedByTable bool
 }
 
 type Table struct {
@@ -501,6 +506,11 @@ type Function struct {
 	// can track the dependencies of the function (or not)
 	Language           string
 	DependsOnFunctions []SchemaQualifiedName
+	// DependsOnCompositeTypes is the list of user-defined composite types referenced
+	// (by argument, return, or body resolution) by this function. When any of those
+	// types' attributes change, this function must be dropped and recreated alongside
+	// the type recreation.
+	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the function (pg_description). Empty means no comment.
 	Description string
 }
@@ -511,6 +521,8 @@ type Procedure struct {
 	// the procedure, as returned by `pg_get_functiondef`. It is a CREATE OR REPLACE
 	// statement.
 	Def string
+	// DependsOnCompositeTypes — see Function.DependsOnCompositeTypes.
+	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the procedure (pg_description). Empty means no comment.
 	Description string
 }
@@ -1010,8 +1022,12 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 		return nil, fmt.Errorf("GetCompositeTypes: %w", err)
 	}
 
+	type ctWithOid struct {
+		oid interface{}
+		ct  *CompositeType
+	}
 	byOid := make(map[interface{}]*CompositeType)
-	var ordered []*CompositeType
+	var ordered []ctWithOid
 	for _, row := range rawAttrs {
 		ct, ok := byOid[row.TypeOid]
 		if !ok {
@@ -1023,7 +1039,7 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 				Description: row.Description,
 			}
 			byOid[row.TypeOid] = ct
-			ordered = append(ordered, ct)
+			ordered = append(ordered, ctWithOid{oid: row.TypeOid, ct: ct})
 		}
 		// rawAttrs may include a synthetic row with attribute_name = '' for types that
 		// have zero attributes (rare but valid for types being constructed). Skip those.
@@ -1044,9 +1060,17 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 		})
 	}
 
+	// Mark each composite type as IsUsedByTable iff at least one table column has it as
+	// its declared type. We probe pg_attribute per-type because pg_depend doesn't track
+	// the column→type relationship in a way we can rely on here.
 	var compositeTypes []CompositeType
-	for _, ct := range ordered {
-		compositeTypes = append(compositeTypes, *ct)
+	for _, e := range ordered {
+		consumers, err := s.q.GetCompositeTypeTableConsumers(ctx, e.oid)
+		if err != nil {
+			return nil, fmt.Errorf("GetCompositeTypeTableConsumers: %w", err)
+		}
+		e.ct.IsUsedByTable = len(consumers) > 0
+		compositeTypes = append(compositeTypes, *e.ct)
 	}
 
 	compositeTypes = filterSliceByName(
@@ -1463,13 +1487,18 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 	if err != nil {
 		return Function{}, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rawFunction.Oid, err)
 	}
+	dependsOnTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_proc", rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", rawFunction.Oid, err)
+	}
 
 	return Function{
-		SchemaQualifiedName: buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
-		FunctionDef:         rawFunction.FuncDef,
-		Language:            rawFunction.FuncLang,
-		DependsOnFunctions:  dependsOnFunctions,
-		Description:         rawFunction.Description,
+		SchemaQualifiedName:     buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
+		FunctionDef:             rawFunction.FuncDef,
+		Language:                rawFunction.FuncLang,
+		DependsOnFunctions:      dependsOnFunctions,
+		DependsOnCompositeTypes: dependsOnTypes,
+		Description:             rawFunction.Description,
 	}, nil
 }
 
@@ -1490,6 +1519,25 @@ func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatal
 	return functionNames, nil
 }
 
+func (s *schemaFetcher) fetchDependsOnCompositeTypes(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
+	rows, err := s.q.GetDependsOnCompositeTypes(ctx, queries.GetDependsOnCompositeTypesParams{
+		SystemCatalog: systemCatalog,
+		ObjectID:      oid,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var names []SchemaQualifiedName
+	for _, r := range rows {
+		names = append(names, SchemaQualifiedName{
+			SchemaName:  r.TypeSchemaName,
+			EscapedName: EscapeIdentifier(r.TypeName),
+		})
+	}
+	return names, nil
+}
+
 func (s *schemaFetcher) fetchProcedures(ctx context.Context) ([]Procedure, error) {
 	rawProcedures, err := s.q.GetProcs(ctx, 'p')
 	if err != nil {
@@ -1498,10 +1546,15 @@ func (s *schemaFetcher) fetchProcedures(ctx context.Context) ([]Procedure, error
 
 	var procedures []Procedure
 	for _, rawProcedure := range rawProcedures {
+		dependsOnTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_proc", rawProcedure.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", rawProcedure.Oid, err)
+		}
 		p := Procedure{
-			SchemaQualifiedName: buildProcName(rawProcedure.FuncName, rawProcedure.FuncIdentityArguments, rawProcedure.FuncSchemaName),
-			Def:                 rawProcedure.FuncDef,
-			Description:         rawProcedure.Description,
+			SchemaQualifiedName:     buildProcName(rawProcedure.FuncName, rawProcedure.FuncIdentityArguments, rawProcedure.FuncSchemaName),
+			Def:                     rawProcedure.FuncDef,
+			DependsOnCompositeTypes: dependsOnTypes,
+			Description:             rawProcedure.Description,
 		}
 		procedures = append(procedures, p)
 	}

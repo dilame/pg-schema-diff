@@ -140,6 +140,19 @@ func buildCreateCompositeTypeDDL(ct schema.CompositeType) string {
 	return fmt.Sprintf("CREATE TYPE %s AS (\n%s\n)", ct.GetFQEscapedName(), strings.Join(attrDefs, ",\n"))
 }
 
+// dependsOnAnyRecreatedType reports whether any of the given composite-type
+// references is in the set of types being recreated (their attribute list is
+// changing). Used to force-recreate functions and procedures so PostgreSQL
+// resolves their argument/return types against the new layout.
+func dependsOnAnyRecreatedType(deps []schema.SchemaQualifiedName, recreated map[string]bool) bool {
+	for _, d := range deps {
+		if recreated[d.GetName()] {
+			return true
+		}
+	}
+	return false
+}
+
 // consumerDepsForAddAlter returns dependency edges that force the
 // composite type's CREATE to run before any consumer's CREATE/ALTER in
 // the new schema.
@@ -161,9 +174,33 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForAddAlter(ct schema.Comp
 
 // consumerDepsForDelete returns dependency edges that force the
 // composite type's DROP to run after every consumer in the old schema is
-// dropped or altered (so consumers no longer reference the type).
+// dropped or (in the case of a pure delete) altered to no longer reference
+// the type.
+//
+// When a consumer (function/procedure) STILL references this type in the
+// new schema — i.e. the type is being recreated because its attributes
+// changed and the consumer is force-recreated alongside it — we must NOT
+// add the `typeDelete > consumerAddAlter` edge: doing so would force the
+// consumer to be created BEFORE the type is dropped, which contradicts
+// the required order
+//
+//	consumerDelete < typeDelete < typeAdd < consumerAddAlter
+//
+// Tables are unconditional because we explicitly refuse type-recreation
+// when a table column depends on the type (see buildSchemaDiff), so the
+// recreation edge case never arises for tables.
 func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.CompositeType) []dependency {
 	deleteVertexId := buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeDelete)
+	ctName := ct.GetName()
+
+	newFunctionsByName := make(map[string]schema.Function, len(c.newSchema.Functions))
+	for _, f := range c.newSchema.Functions {
+		newFunctionsByName[f.GetName()] = f
+	}
+	newProceduresByName := make(map[string]schema.Procedure, len(c.newSchema.Procedures))
+	for _, p := range c.newSchema.Procedures {
+		newProceduresByName[p.GetName()] = p
+	}
 
 	var deps []dependency
 	for _, t := range c.oldSchema.Tables {
@@ -172,11 +209,24 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 	}
 	for _, f := range c.oldSchema.Functions {
 		deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
+		if !consumerStillDependsOnType(newFunctionsByName[f.GetName()].DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
+		}
 	}
 	for _, p := range c.oldSchema.Procedures {
 		deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
+		if !consumerStillDependsOnType(newProceduresByName[p.GetName()].DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
+		}
 	}
 	return deps
+}
+
+func consumerStillDependsOnType(deps []schema.SchemaQualifiedName, ctName string) bool {
+	for _, d := range deps {
+		if d.GetName() == ctName {
+			return true
+		}
+	}
+	return false
 }
