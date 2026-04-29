@@ -245,7 +245,14 @@ INNER JOIN pg_catalog.pg_class AS consumer_c
 INNER JOIN pg_catalog.pg_namespace AS consumer_ns
     ON consumer_c.relnamespace = consumer_ns.oid
 WHERE
-    att.atttypid = $1
+    (
+        att.atttypid = $1
+        OR att.atttypid = (
+            SELECT typarray
+            FROM pg_catalog.pg_type
+            WHERE oid = $1
+        )
+    )
     AND att.attnum > 0
     AND NOT att.attisdropped
 `
@@ -382,14 +389,20 @@ func (q *Queries) GetCompositeTypes(ctx context.Context) ([]GetCompositeTypesRow
 }
 
 const getDependsOnCompositeTypes = `-- name: GetDependsOnCompositeTypes :many
-SELECT
+SELECT DISTINCT
     pg_type.typname::TEXT AS type_name,
     type_namespace.nspname::TEXT AS type_schema_name
 FROM pg_catalog.pg_depend AS depend
-INNER JOIN pg_catalog.pg_type AS pg_type
+INNER JOIN pg_catalog.pg_type AS referenced_type
     ON
         depend.refclassid = 'pg_type'::REGCLASS
-        AND depend.refobjid = pg_type.oid
+        AND depend.refobjid = referenced_type.oid
+INNER JOIN pg_catalog.pg_type AS pg_type
+    ON
+        (
+            referenced_type.oid = pg_type.oid
+            OR referenced_type.typelem = pg_type.oid
+        )
         AND pg_type.typtype = 'c'
 INNER JOIN
     pg_catalog.pg_namespace AS type_namespace
@@ -413,6 +426,8 @@ type GetDependsOnCompositeTypesRow struct {
 }
 
 // Returns the composite types (typtype = 'c') that the given object depends on.
+// This includes dependencies through PostgreSQL's automatically-created array
+// type for a composite type, e.g. `some_type[]`.
 // Used to drive cascading drop+recreate of functions and procedures when the
 // attribute list of a composite type changes.
 func (q *Queries) GetDependsOnCompositeTypes(ctx context.Context, arg GetDependsOnCompositeTypesParams) ([]GetDependsOnCompositeTypesRow, error) {

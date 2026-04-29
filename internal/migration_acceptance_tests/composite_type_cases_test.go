@@ -144,6 +144,17 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
+		name: "alter composite type attrs - cascade through dependent function using array argument",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE FUNCTION f_items(p pair[]) RETURNS int LANGUAGE sql AS 'SELECT pg_catalog.cardinality(p)';
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE FUNCTION f_items(p pair[]) RETURNS int LANGUAGE sql AS 'SELECT pg_catalog.cardinality(p)';
+		`},
+	},
+	{
 		name: "alter composite type attrs is unsupported when used by a table column",
 		oldSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text);
@@ -152,6 +163,18 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		newSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text, c boolean);
 			CREATE TABLE users (id int, attrs pair);
+		`},
+		expectedPlanErrorIs: diff.ErrNotImplemented,
+	},
+	{
+		name: "alter composite type attrs is unsupported when used by a table array column",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE TABLE users (id int, attrs pair[]);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE TABLE users (id int, attrs pair[]);
 		`},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
 	},
