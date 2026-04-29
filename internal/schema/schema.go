@@ -76,7 +76,12 @@ func (s Schema) Normalize() Schema {
 
 	// Composite type attribute order is meaningful (it determines the layout of every value
 	// of that type), so do NOT sort attributes — only sort the types themselves.
-	s.CompositeTypes = sortSchemaObjectsByName(s.CompositeTypes)
+	var normCompositeTypes []CompositeType
+	for _, compositeType := range sortSchemaObjectsByName(s.CompositeTypes) {
+		compositeType.DependsOnCompositeTypes = sortSchemaObjectsByName(compositeType.DependsOnCompositeTypes)
+		normCompositeTypes = append(normCompositeTypes, compositeType)
+	}
+	s.CompositeTypes = normCompositeTypes
 
 	var normTables []Table
 	for _, t := range sortSchemaObjectsByName(s.Tables) {
@@ -246,6 +251,9 @@ func (a CompositeTypeAttribute) GetName() string {
 type CompositeType struct {
 	SchemaQualifiedName
 	Attributes []CompositeTypeAttribute
+	// DependsOnCompositeTypes is the list of user-defined composite types referenced
+	// by this composite type's attributes, including references through array types.
+	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the type (pg_description). Empty means no comment.
 	Description string
 	// IsUsedByTable is true iff at least one table column has this composite type as its
@@ -1027,8 +1035,9 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 	}
 
 	type ctWithOid struct {
-		oid interface{}
-		ct  *CompositeType
+		typeOid interface{}
+		relOid  interface{}
+		ct      *CompositeType
 	}
 	byOid := make(map[interface{}]*CompositeType)
 	var ordered []ctWithOid
@@ -1043,7 +1052,7 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 				Description: row.Description,
 			}
 			byOid[row.TypeOid] = ct
-			ordered = append(ordered, ctWithOid{oid: row.TypeOid, ct: ct})
+			ordered = append(ordered, ctWithOid{typeOid: row.TypeOid, relOid: row.TypeRelOid, ct: ct})
 		}
 		// rawAttrs may include a synthetic row with attribute_name = '' for types that
 		// have zero attributes (rare but valid for types being constructed). Skip those.
@@ -1069,7 +1078,13 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 	// the column→type relationship in a way we can rely on here.
 	var compositeTypes []CompositeType
 	for _, e := range ordered {
-		consumers, err := s.q.GetCompositeTypeTableConsumers(ctx, e.oid)
+		dependsOnTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_class", e.relOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", e.relOid, err)
+		}
+		e.ct.DependsOnCompositeTypes = dependsOnTypes
+
+		consumers, err := s.q.GetCompositeTypeTableConsumers(ctx, e.typeOid)
 		if err != nil {
 			return nil, fmt.Errorf("GetCompositeTypeTableConsumers: %w", err)
 		}

@@ -292,6 +292,7 @@ func (q *Queries) GetCompositeTypeTableConsumers(ctx context.Context, typeOid in
 const getCompositeTypes = `-- name: GetCompositeTypes :many
 SELECT
     pg_type.oid AS type_oid,
+    rel.oid AS type_rel_oid,
     pg_type.typname::TEXT AS type_name,
     type_namespace.nspname::TEXT AS type_schema_name,
     COALESCE(att.attname, '')::TEXT AS attribute_name,
@@ -344,6 +345,7 @@ ORDER BY pg_type.oid, att.attnum
 
 type GetCompositeTypesRow struct {
 	TypeOid             interface{}
+	TypeRelOid          interface{}
 	TypeName            string
 	TypeSchemaName      string
 	AttributeName       string
@@ -367,6 +369,7 @@ func (q *Queries) GetCompositeTypes(ctx context.Context) ([]GetCompositeTypesRow
 		var i GetCompositeTypesRow
 		if err := rows.Scan(
 			&i.TypeOid,
+			&i.TypeRelOid,
 			&i.TypeName,
 			&i.TypeSchemaName,
 			&i.AttributeName,

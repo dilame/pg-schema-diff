@@ -32,6 +32,14 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		newSchemaDDL: []string{},
 	},
 	{
+		name: "drop nested composite types",
+		oldSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+		`},
+		newSchemaDDL: []string{},
+	},
+	{
 		name:         "create composite type with comment",
 		oldSchemaDDL: []string{},
 		newSchemaDDL: []string{`
@@ -155,6 +163,19 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
+		name: "alter composite type attrs - cascade through dependent composite type and function",
+		oldSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE FUNCTION f_outer(p outer_t) RETURNS int LANGUAGE sql AS 'SELECT ((p).i).n';
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int, extra text);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE FUNCTION f_outer(p outer_t) RETURNS int LANGUAGE sql AS 'SELECT ((p).i).n';
+		`},
+	},
+	{
 		name: "alter composite type attrs is unsupported when used by a table column",
 		oldSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text);
@@ -163,6 +184,20 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		newSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text, c boolean);
 			CREATE TABLE users (id int, attrs pair);
+		`},
+		expectedPlanErrorIs: diff.ErrNotImplemented,
+	},
+	{
+		name: "alter composite type attrs is unsupported when dependent composite type is used by a table column",
+		oldSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE TABLE users (id int, attrs outer_t);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int, extra text);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE TABLE users (id int, attrs outer_t);
 		`},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
 	},

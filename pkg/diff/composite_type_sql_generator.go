@@ -28,12 +28,15 @@ type compositeTypeSQLVertexGenerator struct {
 	// how procedureSQLVertexGenerator handles its own untrackable deps.
 	newSchema schema.Schema
 	oldSchema schema.Schema
+
+	recreatedCompositeTypes map[string]bool
 }
 
-func newCompositeTypeSQLVertexGenerator(oldSchema, newSchema schema.Schema) sqlVertexGenerator[schema.CompositeType, compositeTypeDiff] {
+func newCompositeTypeSQLVertexGenerator(oldSchema, newSchema schema.Schema, recreatedCompositeTypes map[string]bool) sqlVertexGenerator[schema.CompositeType, compositeTypeDiff] {
 	return &compositeTypeSQLVertexGenerator{
-		newSchema: newSchema,
-		oldSchema: oldSchema,
+		newSchema:               newSchema,
+		oldSchema:               oldSchema,
+		recreatedCompositeTypes: recreatedCompositeTypes,
 	}
 }
 
@@ -52,6 +55,7 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 	// from every such consumer in the new schema; the topo sort will pick the
 	// correct order.
 	deps := c.consumerDepsForAddAlter(ct)
+	deps = append(deps, c.compositeTypeDepsForAddAlter(ct)...)
 	// Run after re-create (if recreated). Mirrors the view/mview pattern.
 	deps = append(deps, mustRun(addVertexId).after(buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeDelete)))
 
@@ -73,6 +77,7 @@ func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (parti
 	// "before-this" dependencies on the type's delete from every consumer's
 	// delete and add/alter vertices.
 	deps := c.consumerDepsForDelete(ct)
+	deps = append(deps, c.compositeTypeDepsForDelete(ct)...)
 
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
@@ -172,6 +177,16 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForAddAlter(ct schema.Comp
 	return deps
 }
 
+func (c *compositeTypeSQLVertexGenerator) compositeTypeDepsForAddAlter(ct schema.CompositeType) []dependency {
+	addVertexId := buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeAddAlter)
+
+	var deps []dependency
+	for _, dep := range ct.DependsOnCompositeTypes {
+		deps = append(deps, mustRun(addVertexId).after(buildCompositeTypeVertexId(dep, diffTypeAddAlter)))
+	}
+	return deps
+}
+
 // consumerDepsForDelete returns dependency edges that force the
 // composite type's DROP to run after every consumer in the old schema is
 // dropped or (in the case of a pure delete) altered to no longer reference
@@ -209,15 +224,27 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 	}
 	for _, f := range c.oldSchema.Functions {
 		deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeDelete)))
-		if !consumerStillDependsOnType(newFunctionsByName[f.GetName()].DependsOnCompositeTypes, ctName) {
+		newDeps := newFunctionsByName[f.GetName()].DependsOnCompositeTypes
+		if !consumerStillDependsOnType(newDeps, ctName) && !dependsOnAnyRecreatedType(newDeps, c.recreatedCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
 	for _, p := range c.oldSchema.Procedures {
 		deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeDelete)))
-		if !consumerStillDependsOnType(newProceduresByName[p.GetName()].DependsOnCompositeTypes, ctName) {
+		newDeps := newProceduresByName[p.GetName()].DependsOnCompositeTypes
+		if !consumerStillDependsOnType(newDeps, ctName) && !dependsOnAnyRecreatedType(newDeps, c.recreatedCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
 		}
+	}
+	return deps
+}
+
+func (c *compositeTypeSQLVertexGenerator) compositeTypeDepsForDelete(ct schema.CompositeType) []dependency {
+	deleteVertexId := buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeDelete)
+
+	var deps []dependency
+	for _, dep := range ct.DependsOnCompositeTypes {
+		deps = append(deps, mustRun(deleteVertexId).before(buildCompositeTypeVertexId(dep, diffTypeDelete)))
 	}
 	return deps
 }

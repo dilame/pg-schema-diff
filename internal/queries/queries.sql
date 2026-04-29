@@ -499,6 +499,7 @@ WHERE
 -- get a single row with attribute_name = '' so the type itself is not lost.
 SELECT
     pg_type.oid AS type_oid,
+    rel.oid AS type_rel_oid,
     pg_type.typname::TEXT AS type_name,
     type_namespace.nspname::TEXT AS type_schema_name,
     COALESCE(att.attname, '')::TEXT AS attribute_name,
