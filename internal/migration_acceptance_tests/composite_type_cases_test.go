@@ -40,6 +40,26 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
+		name:         "create schema-qualified composite type with comment used by function",
+		oldSchemaDDL: []string{},
+		newSchemaDDL: []string{`
+			CREATE SCHEMA app;
+			CREATE TYPE app.result AS (status text, reason text);
+			COMMENT ON TYPE app.result IS 'function result row type';
+			CREATE FUNCTION app.resolve() RETURNS app.result LANGUAGE plpgsql AS $$
+			DECLARE
+				v_result app.result;
+			BEGIN
+				SELECT ROW('ok', 'ready')::app.result INTO v_result;
+				RETURN v_result;
+			END
+			$$;
+		`},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeHasUntrackableDependencies,
+		},
+	},
+	{
 		name: "add comment to composite type",
 		oldSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text);
