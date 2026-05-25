@@ -250,7 +250,7 @@ var (
 			GRANT SELECT ON schema_2.foo TO some_role_1;
 			GRANT INSERT ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "931d217a8d7f2416",
+			expectedHash: "1c3120ed0bcdf0b",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -604,7 +604,7 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "d8715d195892dccf",
+			expectedHash: "dc11cf85d525ca75",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
