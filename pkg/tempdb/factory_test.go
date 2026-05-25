@@ -176,6 +176,11 @@ func (suite *onInstanceTempDbFactorySuite) TestCreate_CreateAndDropFlow() {
 		NamedSchemas: []internalschema.NamedSchema{{
 			Name:        "public",
 			Description: "standard public schema",
+			Privileges: []internalschema.SchemaPrivilege{{
+				Grantee:     "",
+				Privilege:   "USAGE",
+				IsGrantable: false,
+			}},
 		}},
 	}, schema)
 
