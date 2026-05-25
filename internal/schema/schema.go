@@ -212,7 +212,9 @@ type NamedSchema struct {
 	Name string
 	// Description is the comment attached to the schema (pg_description). Empty means no comment.
 	Description string
-	Privileges  []SchemaPrivilege
+	// Owner is used to classify implicit owner privileges; schema ownership changes are not generated.
+	Owner      string
+	Privileges []SchemaPrivilege
 }
 
 func (n NamedSchema) GetName() string {
@@ -978,6 +980,7 @@ func (s *schemaFetcher) fetchNamedSchemas(ctx context.Context) ([]NamedSchema, e
 		schemas = append(schemas, NamedSchema{
 			Name:        rs.SchemaName,
 			Description: rs.Description,
+			Owner:       rs.Owner,
 			Privileges:  privilegesBySchema[rs.SchemaName],
 		})
 	}

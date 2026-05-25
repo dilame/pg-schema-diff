@@ -1196,11 +1196,14 @@ func (q *Queries) GetSchemaPrivileges(ctx context.Context) ([]GetSchemaPrivilege
 
 const getSchemas = `-- name: GetSchemas :many
 SELECT
-    nspname::TEXT AS schema_name,
+    pg_namespace.nspname::TEXT AS schema_name,
     COALESCE(
         pg_catalog.obj_description(pg_namespace.oid, 'pg_namespace'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    owner_role.rolname::TEXT AS owner
 FROM pg_catalog.pg_namespace
+INNER JOIN pg_catalog.pg_roles AS owner_role
+    ON pg_namespace.nspowner = owner_role.oid
 WHERE
     nspname NOT IN ('pg_catalog', 'information_schema')
     AND nspname !~ '^pg_toast'
@@ -1219,6 +1222,7 @@ WHERE
 type GetSchemasRow struct {
 	SchemaName  string
 	Description string
+	Owner       string
 }
 
 func (q *Queries) GetSchemas(ctx context.Context) ([]GetSchemasRow, error) {
@@ -1230,7 +1234,7 @@ func (q *Queries) GetSchemas(ctx context.Context) ([]GetSchemasRow, error) {
 	var items []GetSchemasRow
 	for rows.Next() {
 		var i GetSchemasRow
-		if err := rows.Scan(&i.SchemaName, &i.Description); err != nil {
+		if err := rows.Scan(&i.SchemaName, &i.Description, &i.Owner); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
