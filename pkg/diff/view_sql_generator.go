@@ -113,6 +113,7 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}
+	stmts = append(stmts, ownerDDLForAdd(commentTargetView(v.SchemaQualifiedName), v.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetView(v.SchemaQualifiedName), v.Description)...)
 
 	privilegeGenerator := &privilegeSQLVertexGenerator{tableName: v.SchemaQualifiedName}
@@ -179,6 +180,7 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 	oldMasked := vd.old
 	oldMasked.Privileges = nil
 	oldMasked.Description = vd.new.Description
+	oldMasked.Owner = vd.new.Owner
 	newMasked := vd.new
 	newMasked.Privileges = nil
 
@@ -192,14 +194,15 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 		return partialSQLGraph{}, fmt.Errorf("resolving privilege sql: %w", err)
 	}
 
-	commentStmts := commentDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Description, vd.new.Description)
-	if len(commentStmts) > 0 {
-		commentVertex := sqlVertex{
+	metadataStmts := ownerDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Owner, vd.new.Owner)
+	metadataStmts = append(metadataStmts, commentDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Description, vd.new.Description)...)
+	if len(metadataStmts) > 0 {
+		metadataVertex := sqlVertex{
 			id:         buildTableVertexId(vd.new.SchemaQualifiedName, diffTypeAddAlter),
 			priority:   sqlPrioritySooner,
-			statements: commentStmts,
+			statements: metadataStmts,
 		}
-		privilegesPartialGraph.vertices = append(privilegesPartialGraph.vertices, commentVertex)
+		privilegesPartialGraph.vertices = append(privilegesPartialGraph.vertices, metadataVertex)
 	}
 
 	return privilegesPartialGraph, nil

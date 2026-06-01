@@ -114,6 +114,7 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}
+	stmts = append(stmts, ownerDDLForAdd(commentTargetMaterializedView(mv.SchemaQualifiedName), mv.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetMaterializedView(mv.SchemaQualifiedName), mv.Description)...)
 
 	return partialSQLGraph{
@@ -154,20 +155,22 @@ func (mvsg *materializedViewSQLGenerator) Alter(mvd materializedViewDiff) (parti
 	// Mask Description: a comment-only diff is altered via an explicit COMMENT statement.
 	oldCopy := mvd.old
 	oldCopy.Description = mvd.new.Description
+	oldCopy.Owner = mvd.new.Owner
 	if !cmp.Equal(oldCopy, mvd.new) {
 		// In the initial MVP, we don't support altering anything other than the comment.
 		return partialSQLGraph{}, ErrNotImplemented
 	}
 
-	commentStmts := commentDDLForAlter(commentTargetMaterializedView(mvd.new.SchemaQualifiedName), mvd.old.Description, mvd.new.Description)
-	if len(commentStmts) == 0 {
+	stmts := ownerDDLForAlter(commentTargetMaterializedView(mvd.new.SchemaQualifiedName), mvd.old.Owner, mvd.new.Owner)
+	stmts = append(stmts, commentDDLForAlter(commentTargetMaterializedView(mvd.new.SchemaQualifiedName), mvd.old.Description, mvd.new.Description)...)
+	if len(stmts) == 0 {
 		return partialSQLGraph{}, nil
 	}
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
 			id:         buildMaterializedViewVertexId(mvd.new.SchemaQualifiedName, diffTypeAddAlter),
 			priority:   sqlPrioritySooner,
-			statements: commentStmts,
+			statements: stmts,
 		}},
 	}, nil
 }

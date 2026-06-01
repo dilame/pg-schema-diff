@@ -133,17 +133,21 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeHasUntrackableDependencies,
 		},
 		expectedPlanDDL: []string{
-			`CREATE SCHEMA "casino_wager_stats"`,
+			`CREATE SCHEMA "casino_wager_stats" AUTHORIZATION "postgres"`,
 			`CREATE TYPE "casino_wager_stats"."peak_candidate_row" AS (
 	"metric_code" text COLLATE "pg_catalog"."default",
 	"round_id" bigint
 )`,
+			`ALTER TYPE "casino_wager_stats"."peak_candidate_row" OWNER TO "postgres"`,
 			`CREATE TYPE "casino_wager_stats"."peak_source_row" AS (
 	"id" bigint,
 	"round_id" bigint
 )`,
+			`ALTER TYPE "casino_wager_stats"."peak_source_row" OWNER TO "postgres"`,
 			"CREATE OR REPLACE FUNCTION casino_wager_stats.project_peak_candidates(p_peak_sources casino_wager_stats.peak_source_row[])\n RETURNS SETOF casino_wager_stats.peak_candidate_row\n LANGUAGE sql\n STABLE\nAS $function$SELECT 'payout'::text AS metric_code, source$.round_id FROM pg_catalog.unnest(p_peak_sources) AS source$$function$\n",
+			`ALTER FUNCTION "casino_wager_stats"."project_peak_candidates"(p_peak_sources casino_wager_stats.peak_source_row[]) OWNER TO "postgres"`,
 			"CREATE OR REPLACE FUNCTION casino_wager_stats.refresh_peaks(p_peak_sources casino_wager_stats.peak_source_row[])\n RETURNS void\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tDECLARE\n\t\t\t\t\tv_candidates casino_wager_stats.peak_candidate_row[];\n\t\t\t\tBEGIN\n\t\t\t\t\tSELECT COALESCE(array_agg(candidate$), ARRAY[]::casino_wager_stats.peak_candidate_row[])\n\t\t\t\t\tINTO v_candidates\n\t\t\t\t\tFROM casino_wager_stats.project_peak_candidates(p_peak_sources) candidate$;\n\t\t\t\tEND;\n\t\t\t\t$function$\n",
+			`ALTER FUNCTION "casino_wager_stats"."refresh_peaks"(p_peak_sources casino_wager_stats.peak_source_row[]) OWNER TO "postgres"`,
 		},
 	},
 	{

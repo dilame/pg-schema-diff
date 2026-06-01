@@ -45,6 +45,7 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}
+	stmts = append(stmts, ownerDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Description)...)
 
 	// The type must exist before any consumer (table/function/procedure/trigger)
@@ -93,16 +94,18 @@ func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQL
 	// not require touching the type itself.
 	oldCopy := d.old
 	oldCopy.Description = d.new.Description
+	oldCopy.Owner = d.new.Owner
 	if cmp.Equal(oldCopy, d.new) {
-		commentStmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
-		if len(commentStmts) == 0 {
+		stmts := ownerDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)
+		stmts = append(stmts, commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)...)
+		if len(stmts) == 0 {
 			return partialSQLGraph{}, nil
 		}
 		return partialSQLGraph{
 			vertices: []sqlVertex{{
 				id:         buildCompositeTypeVertexId(d.new.SchemaQualifiedName, diffTypeAddAlter),
 				priority:   sqlPrioritySooner,
-				statements: commentStmts,
+				statements: stmts,
 			}},
 		}, nil
 	}

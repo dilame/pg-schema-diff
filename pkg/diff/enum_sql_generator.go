@@ -26,6 +26,7 @@ func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 			LockTimeout: lockTimeoutDefault,
 		},
 	}
+	stmts = append(stmts, ownerDDLForAdd(commentTargetType(enum.SchemaQualifiedName), enum.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(enum.SchemaQualifiedName), enum.Description)...)
 	return stmts, nil
 }
@@ -45,6 +46,8 @@ func (e *enumSQLGenerator) Alter(diff enumDiff) ([]Statement, error) {
 	// Mask Description: a comment-only diff is handled by an explicit COMMENT statement
 	// emitted at the end, so it must not trip the final cmp.Diff equality check.
 	oldCopy.Description = diff.new.Description
+	oldOwner := oldCopy.Owner
+	oldCopy.Owner = diff.new.Owner
 	oldVals := set.NewSet(diff.old.Labels...)
 	newVals := set.NewSet(diff.new.Labels...)
 	if len(set.Difference(oldVals, newVals)) > 0 {
@@ -97,6 +100,7 @@ func (e *enumSQLGenerator) Alter(diff enumDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("unable to resolve the diff %s: %w", d, ErrNotImplemented)
 	}
 
+	stmts = append(stmts, ownerDDLForAlter(commentTargetType(diff.new.SchemaQualifiedName), oldOwner, diff.new.Owner)...)
 	stmts = append(stmts, commentDDLForAlter(commentTargetType(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
 	return stmts, nil
 }

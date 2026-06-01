@@ -51,6 +51,7 @@ func (p procedureSQLVertexGenerator) Add(s schema.Procedure) (partialSQLGraph, e
 				"are added before this statement.",
 		}},
 	}}
+	stmts = append(stmts, ownerDDLForAdd(commentTargetProcedure(s.SchemaQualifiedName), s.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetProcedure(s.SchemaQualifiedName), s.Description)...)
 
 	return partialSQLGraph{
@@ -115,24 +116,32 @@ func (p procedureSQLVertexGenerator) Alter(d procedureDiff) (partialSQLGraph, er
 	// Comment-only diff: don't recreate, emit a COMMENT statement only.
 	oldCopy := d.old
 	oldCopy.Description = d.new.Description
+	oldCopy.Owner = d.new.Owner
 	if cmp.Equal(oldCopy, d.new) {
-		commentStmts := commentDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
-		if len(commentStmts) == 0 {
+		stmts := ownerDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)
+		stmts = append(stmts, commentDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)...)
+		if len(stmts) == 0 {
 			return partialSQLGraph{}, nil
 		}
 		return partialSQLGraph{
 			vertices: []sqlVertex{{
 				id:         buildProcedureVertexId(d.new.SchemaQualifiedName, diffTypeAddAlter),
 				priority:   sqlPrioritySooner,
-				statements: commentStmts,
+				statements: stmts,
 			}},
 		}, nil
 	}
 
 	// New adds or replaces the procedure (Add() also re-emits the COMMENT for the new schema).
-	graph, err := p.Add(d.new)
+	newForAlter := d.new
+	newForAlter.Owner = ""
+	graph, err := p.Add(newForAlter)
 	if err != nil {
 		return partialSQLGraph{}, err
+	}
+	for i := range graph.vertices {
+		graph.vertices[i].statements = append(graph.vertices[i].statements,
+			ownerDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)...)
 	}
 	// Add() didn't emit anything when Description == "" — but if the old schema had a
 	// description and the new one doesn't, we still need to clear it explicitly.

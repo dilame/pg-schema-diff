@@ -36,6 +36,7 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 		LockTimeout: lockTimeoutDefault,
 		Hazards:     hazards,
 	}}
+	stmts = append(stmts, ownerDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Description)...)
 	return stmts, nil
 }
@@ -69,17 +70,24 @@ func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, erro
 	// Comment-only diff: don't `CREATE OR REPLACE`, just emit a COMMENT statement.
 	oldCopy := diff.old
 	oldCopy.Description = diff.new.Description
+	oldCopy.Owner = diff.new.Owner
 	if cmp.Equal(oldCopy, diff.new) {
-		return commentDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description), nil
+		var stmts []Statement
+		stmts = append(stmts, ownerDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
+		stmts = append(stmts, commentDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
+		return stmts, nil
 	}
 
 	// Add() emits CREATE OR REPLACE plus the COMMENT statement (if Description is non-empty
 	// in the new schema). For ALTER we additionally need to emit `COMMENT ON ... IS NULL`
 	// when Description was removed.
-	stmts, err := f.Add(diff.new)
+	newForAlter := diff.new
+	newForAlter.Owner = ""
+	stmts, err := f.Add(newForAlter)
 	if err != nil {
 		return nil, err
 	}
+	stmts = append(stmts, ownerDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	if diff.new.Description == "" && diff.old.Description != "" {
 		stmts = append(stmts, commentOnStatement(commentTargetFunction(diff.new.SchemaQualifiedName), ""))
 	}

@@ -287,6 +287,7 @@ SELECT
     pg_type.oid AS type_oid,
     pg_type.typname::TEXT AS type_name,
     type_namespace.nspname::TEXT AS type_schema_name,
+    owner_role.rolname::TEXT AS owner,
     COALESCE(att.attname, '')::TEXT AS attribute_name,
     COALESCE(
         pg_catalog.format_type(att.atttypid, att.atttypmod), ''
@@ -300,6 +301,7 @@ FROM pg_catalog.pg_type AS pg_type
 INNER JOIN
     pg_catalog.pg_namespace AS type_namespace
     ON pg_type.typnamespace = type_namespace.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON pg_type.typowner = owner_role.oid
 INNER JOIN
     pg_catalog.pg_class AS rel
     -- A user-defined composite type's underlying class has relkind = 'c'. Implicit
@@ -339,6 +341,7 @@ type GetCompositeTypesRow struct {
 	TypeOid             interface{}
 	TypeName            string
 	TypeSchemaName      string
+	Owner               string
 	AttributeName       string
 	AttributeType       string
 	CollationName       string
@@ -362,6 +365,7 @@ func (q *Queries) GetCompositeTypes(ctx context.Context) ([]GetCompositeTypesRow
 			&i.TypeOid,
 			&i.TypeName,
 			&i.TypeSchemaName,
+			&i.Owner,
 			&i.AttributeName,
 			&i.AttributeType,
 			&i.CollationName,
@@ -497,6 +501,7 @@ const getEnums = `-- name: GetEnums :many
 SELECT
     pg_type.typname::TEXT AS enum_name,
     type_namespace.nspname::TEXT AS enum_schema_name,
+    owner_role.rolname::TEXT AS owner,
     (SELECT
         ARRAY_AGG(
             pg_enum.enumlabel
@@ -511,6 +516,7 @@ FROM pg_catalog.pg_type AS pg_type
 INNER JOIN
     pg_catalog.pg_namespace AS type_namespace
     ON pg_type.typnamespace = type_namespace.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON pg_type.typowner = owner_role.oid
 WHERE
     pg_type.typtype = 'e'
     AND type_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -530,6 +536,7 @@ WHERE
 type GetEnumsRow struct {
 	EnumName       string
 	EnumSchemaName string
+	Owner          string
 	EnumLabels     []string
 	Description    string
 }
@@ -546,6 +553,7 @@ func (q *Queries) GetEnums(ctx context.Context) ([]GetEnumsRow, error) {
 		if err := rows.Scan(
 			&i.EnumName,
 			&i.EnumSchemaName,
+			&i.Owner,
 			pq.Array(&i.EnumLabels),
 			&i.Description,
 		); err != nil {
@@ -829,6 +837,7 @@ const getMaterializedViews = `-- name: GetMaterializedViews :many
 SELECT
     n.nspname::TEXT AS schema_name,
     c.relname::TEXT AS view_name,
+    owner_role.rolname::TEXT AS owner,
     c.reloptions::TEXT [] AS rel_options,
     COALESCE(ts.spcname, '')::TEXT AS tablespace_name,
     (SELECT
@@ -885,6 +894,7 @@ SELECT
     )::TEXT AS description
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
 LEFT JOIN pg_catalog.pg_tablespace AS ts ON c.reltablespace = ts.oid
 WHERE
     c.relkind = 'm'
@@ -904,6 +914,7 @@ WHERE
 type GetMaterializedViewsRow struct {
 	SchemaName        string
 	ViewName          string
+	Owner             string
 	RelOptions        []string
 	TablespaceName    string
 	TableDependencies []string
@@ -923,6 +934,7 @@ func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedVi
 		if err := rows.Scan(
 			&i.SchemaName,
 			&i.ViewName,
+			&i.Owner,
 			pq.Array(&i.RelOptions),
 			&i.TablespaceName,
 			pq.Array(&i.TableDependencies),
@@ -1050,6 +1062,7 @@ SELECT
     pg_proc.oid,
     pg_proc.proname::TEXT AS func_name,
     proc_namespace.nspname::TEXT AS func_schema_name,
+    owner_role.rolname::TEXT AS owner,
     proc_lang.lanname::TEXT AS func_lang,
     pg_catalog.pg_get_function_identity_arguments(
         pg_proc.oid
@@ -1062,6 +1075,7 @@ FROM pg_catalog.pg_proc
 INNER JOIN
     pg_catalog.pg_namespace AS proc_namespace
     ON pg_proc.pronamespace = proc_namespace.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON pg_proc.proowner = owner_role.oid
 INNER JOIN
     pg_catalog.pg_language AS proc_lang
     ON pg_proc.prolang = proc_lang.oid
@@ -1085,6 +1099,7 @@ type GetProcsRow struct {
 	Oid                   interface{}
 	FuncName              string
 	FuncSchemaName        string
+	Owner                 string
 	FuncLang              string
 	FuncIdentityArguments string
 	FuncDef               string
@@ -1104,6 +1119,7 @@ func (q *Queries) GetProcs(ctx context.Context, prokind interface{}) ([]GetProcs
 			&i.Oid,
 			&i.FuncName,
 			&i.FuncSchemaName,
+			&i.Owner,
 			&i.FuncLang,
 			&i.FuncIdentityArguments,
 			&i.FuncDef,
@@ -1252,6 +1268,7 @@ const getSequences = `-- name: GetSequences :many
 SELECT
     seq_c.relname::TEXT AS sequence_name,
     seq_ns.nspname::TEXT AS sequence_schema_name,
+    owner_role.rolname::TEXT AS owner,
     COALESCE(owner_attr.attname, '')::TEXT AS owner_column_name,
     COALESCE(owner_ns.nspname, '')::TEXT AS owner_schema_name,
     COALESCE(owner_c.relname, '')::TEXT AS owner_table_name,
@@ -1268,6 +1285,7 @@ SELECT
 FROM pg_catalog.pg_sequence AS pg_seq
 INNER JOIN pg_catalog.pg_class AS seq_c ON pg_seq.seqrelid = seq_c.oid
 INNER JOIN pg_catalog.pg_namespace AS seq_ns ON seq_c.relnamespace = seq_ns.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON seq_c.relowner = owner_role.oid
 LEFT JOIN pg_catalog.pg_depend AS depend
     ON
         depend.classid = 'pg_class'::REGCLASS
@@ -1303,6 +1321,7 @@ WHERE
 type GetSequencesRow struct {
 	SequenceName       string
 	SequenceSchemaName string
+	Owner              string
 	OwnerColumnName    string
 	OwnerSchemaName    string
 	OwnerTableName     string
@@ -1328,6 +1347,7 @@ func (q *Queries) GetSequences(ctx context.Context) ([]GetSequencesRow, error) {
 		if err := rows.Scan(
 			&i.SequenceName,
 			&i.SequenceSchemaName,
+			&i.Owner,
 			&i.OwnerColumnName,
 			&i.OwnerSchemaName,
 			&i.OwnerTableName,
@@ -1438,6 +1458,7 @@ SELECT
     c.oid,
     c.relname::TEXT AS table_name,
     table_namespace.nspname::TEXT AS table_schema_name,
+    owner_role.rolname::TEXT AS owner,
     c.relpersistence = 'u' AS is_unlogged,
     c.relreplident::TEXT AS replica_identity,
     c.relrowsecurity AS rls_enabled,
@@ -1460,6 +1481,7 @@ FROM pg_catalog.pg_class AS c
 INNER JOIN
     pg_catalog.pg_namespace AS table_namespace
     ON c.relnamespace = table_namespace.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
 LEFT JOIN
     pg_catalog.pg_inherits AS table_inherits
     ON c.oid = table_inherits.inhrelid
@@ -1489,6 +1511,7 @@ type GetTablesRow struct {
 	Oid                   interface{}
 	TableName             string
 	TableSchemaName       string
+	Owner                 string
 	IsUnlogged            bool
 	ReplicaIdentity       string
 	RlsEnabled            bool
@@ -1513,6 +1536,7 @@ func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
 			&i.Oid,
 			&i.TableName,
 			&i.TableSchemaName,
+			&i.Owner,
 			&i.IsUnlogged,
 			&i.ReplicaIdentity,
 			&i.RlsEnabled,
@@ -1617,6 +1641,7 @@ const getViews = `-- name: GetViews :many
 SELECT
     n.nspname::TEXT AS schema_name,
     c.relname::TEXT AS view_name,
+    owner_role.rolname::TEXT AS owner,
     c.reloptions::TEXT [] AS rel_options,
     (SELECT
         ARRAY_AGG(DISTINCT JSONB_BUILD_OBJECT(
@@ -1671,6 +1696,7 @@ SELECT
     )::TEXT AS description
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
 WHERE
     c.relkind = 'v'
     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -1689,6 +1715,7 @@ WHERE
 type GetViewsRow struct {
 	SchemaName        string
 	ViewName          string
+	Owner             string
 	RelOptions        []string
 	TableDependencies []string
 	ViewDefinition    string
@@ -1707,6 +1734,7 @@ func (q *Queries) GetViews(ctx context.Context) ([]GetViewsRow, error) {
 		if err := rows.Scan(
 			&i.SchemaName,
 			&i.ViewName,
+			&i.Owner,
 			pq.Array(&i.RelOptions),
 			pq.Array(&i.TableDependencies),
 			&i.ViewDefinition,
