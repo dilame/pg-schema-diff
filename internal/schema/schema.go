@@ -212,7 +212,7 @@ type NamedSchema struct {
 	Name string
 	// Description is the comment attached to the schema (pg_description). Empty means no comment.
 	Description string
-	// Owner is used to classify implicit owner privileges; schema ownership changes are not generated.
+	// Owner is used for ownership diffs and for filtering the owner's implicit schema privileges.
 	Owner      string
 	Privileges []SchemaPrivilege
 }
