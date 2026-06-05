@@ -53,6 +53,14 @@ func (p procedureSQLVertexGenerator) Add(s schema.Procedure) (partialSQLGraph, e
 	}}
 	stmts = append(stmts, ownerDDLForAdd(commentTargetProcedure(s.SchemaQualifiedName), s.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetProcedure(s.SchemaQualifiedName), s.Description)...)
+	privilegeStmts, err := exactRoutinePrivilegeStatements(
+		newProcedurePrivilegeSQLVertexGenerator(s.SchemaQualifiedName),
+		s.Privileges,
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating procedure privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
@@ -109,17 +117,25 @@ func (p procedureSQLVertexGenerator) Delete(s schema.Procedure) (partialSQLGraph
 }
 
 func (p procedureSQLVertexGenerator) Alter(d procedureDiff) (partialSQLGraph, error) {
-	if cmp.Equal(d.old, d.new) {
-		return partialSQLGraph{}, nil
-	}
-
-	// Comment-only diff: don't recreate, emit a COMMENT statement only.
-	oldCopy := d.old
-	oldCopy.Description = d.new.Description
-	oldCopy.Owner = d.new.Owner
-	if cmp.Equal(oldCopy, d.new) {
+	oldMetadataCopy := d.old
+	oldMetadataCopy.Description = d.new.Description
+	oldMetadataCopy.Owner = d.new.Owner
+	oldMetadataCopy.Privileges = d.new.Privileges
+	if cmp.Equal(oldMetadataCopy, d.new) {
 		stmts := ownerDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)
 		stmts = append(stmts, commentDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)...)
+		privilegesPartialGraph, err := generatePartialGraph(
+			newProcedurePrivilegeSQLVertexGenerator(d.new.SchemaQualifiedName),
+			d.privilegesDiff,
+		)
+		if err != nil {
+			return partialSQLGraph{}, fmt.Errorf("resolving procedure privilege sql: %w", err)
+		}
+		privilegeStmts, err := graphStatements(privilegesPartialGraph)
+		if err != nil {
+			return partialSQLGraph{}, fmt.Errorf("ordering procedure privilege sql: %w", err)
+		}
+		stmts = append(stmts, privilegeStmts...)
 		if len(stmts) == 0 {
 			return partialSQLGraph{}, nil
 		}
@@ -132,7 +148,8 @@ func (p procedureSQLVertexGenerator) Alter(d procedureDiff) (partialSQLGraph, er
 		}, nil
 	}
 
-	// New adds or replaces the procedure (Add() also re-emits the COMMENT for the new schema).
+	// New adds or replaces the procedure (Add() also re-emits COMMENT and
+	// privilege statements for the new schema).
 	newForAlter := d.new
 	newForAlter.Owner = ""
 	graph, err := p.Add(newForAlter)

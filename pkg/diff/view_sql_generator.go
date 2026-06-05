@@ -116,14 +116,14 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 	stmts = append(stmts, ownerDDLForAdd(commentTargetView(v.SchemaQualifiedName), v.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetView(v.SchemaQualifiedName), v.Description)...)
 
-	privilegeGenerator := &privilegeSQLVertexGenerator{tableName: v.SchemaQualifiedName}
+	privilegeGenerator := newPrivilegeSQLVertexGenerator(v.SchemaQualifiedName)
 	for _, privilege := range v.Privileges {
-		addPrivilegeStmts, err := privilegeGenerator.Add(privilege)
+		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
 		if err != nil {
 			return partialSQLGraph{}, fmt.Errorf("generating add privilege statements for privilege %s: %w", privilege.GetName(), err)
 		}
 		// Remove hazards from statements since the view is brand new
-		stmts = append(stmts, stripMigrationHazards(addPrivilegeStmts...)...)
+		stmts = append(stmts, stripMigrationHazards(addPrivilegePartialGraph.statements()...)...)
 	}
 
 	addVertexId := buildTableVertexId(v.SchemaQualifiedName, diffTypeAddAlter)

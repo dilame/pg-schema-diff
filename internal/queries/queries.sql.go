@@ -1070,7 +1070,19 @@ SELECT
     pg_catalog.pg_get_functiondef(pg_proc.oid) AS func_def,
     COALESCE(
         pg_catalog.obj_description(pg_proc.oid, 'pg_proc'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    ARRAY(
+        SELECT json_build_object(
+            'grantee', COALESCE(grantee_role.rolname, ''),
+            'privilege', acl.privilege_type,
+            'is_grantable', acl.is_grantable
+        )::TEXT
+        FROM ACLEXPLODE(COALESCE(pg_proc.proacl, ACLDEFAULT('f', pg_proc.proowner))) AS acl
+        LEFT JOIN pg_catalog.pg_roles AS grantee_role
+            ON acl.grantee = grantee_role.oid
+        WHERE acl.grantee != pg_proc.proowner OR acl.grantee = 0
+        ORDER BY COALESCE(grantee_role.rolname, ''), acl.privilege_type
+    ) AS privileges
 FROM pg_catalog.pg_proc
 INNER JOIN
     pg_catalog.pg_namespace AS proc_namespace
@@ -1104,6 +1116,7 @@ type GetProcsRow struct {
 	FuncIdentityArguments string
 	FuncDef               string
 	Description           string
+	Privileges            []string
 }
 
 func (q *Queries) GetProcs(ctx context.Context, prokind interface{}) ([]GetProcsRow, error) {
@@ -1124,6 +1137,7 @@ func (q *Queries) GetProcs(ctx context.Context, prokind interface{}) ([]GetProcs
 			&i.FuncIdentityArguments,
 			&i.FuncDef,
 			&i.Description,
+			pq.Array(&i.Privileges),
 		); err != nil {
 			return nil, err
 		}

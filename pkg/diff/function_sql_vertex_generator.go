@@ -38,6 +38,14 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 	}}
 	stmts = append(stmts, ownerDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Description)...)
+	privilegeStmts, err := exactRoutinePrivilegeStatements(
+		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
+		function.Privileges,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generating function privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 	return stmts, nil
 }
 
@@ -63,23 +71,31 @@ func (f *functionSQLVertexGenerator) Delete(function schema.Function) ([]Stateme
 func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, error) {
 	// We are assuming the function has been normalized, i.e., we don't have to worry DependsOnFunctions ordering
 	// causing a false positive diff detected.
-	if cmp.Equal(diff.old, diff.new) {
-		return nil, nil
-	}
-
-	// Comment-only diff: don't `CREATE OR REPLACE`, just emit a COMMENT statement.
-	oldCopy := diff.old
-	oldCopy.Description = diff.new.Description
-	oldCopy.Owner = diff.new.Owner
-	if cmp.Equal(oldCopy, diff.new) {
+	oldMetadataCopy := diff.old
+	oldMetadataCopy.Description = diff.new.Description
+	oldMetadataCopy.Owner = diff.new.Owner
+	oldMetadataCopy.Privileges = diff.new.Privileges
+	if cmp.Equal(oldMetadataCopy, diff.new) {
 		var stmts []Statement
 		stmts = append(stmts, ownerDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 		stmts = append(stmts, commentDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
+		privilegesPartialGraph, err := generatePartialGraph(
+			newFunctionPrivilegeSQLVertexGenerator(diff.new.SchemaQualifiedName),
+			diff.privilegesDiff,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("resolving function privilege sql: %w", err)
+		}
+		privilegeStmts, err := graphStatements(privilegesPartialGraph)
+		if err != nil {
+			return nil, fmt.Errorf("ordering function privilege sql: %w", err)
+		}
+		stmts = append(stmts, privilegeStmts...)
 		return stmts, nil
 	}
 
-	// Add() emits CREATE OR REPLACE plus the COMMENT statement (if Description is non-empty
-	// in the new schema). For ALTER we additionally need to emit `COMMENT ON ... IS NULL`
+	// Add() emits CREATE OR REPLACE plus the COMMENT/privilege statements for the
+	// new schema. For ALTER we additionally need to emit `COMMENT ON ... IS NULL`
 	// when Description was removed.
 	newForAlter := diff.new
 	newForAlter.Owner = ""
