@@ -253,6 +253,8 @@ type Extension struct {
 
 type Enum struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the enum type.
+	Owner  string
 	Labels []string
 	// Description is the comment attached to the enum type (pg_description). Empty means no comment.
 	Description string
@@ -288,6 +290,8 @@ type CompositeType struct {
 
 type Table struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the table.
+	Owner            string
 	Columns          []Column
 	CheckConstraints []CheckConstraint
 	Policies         []Policy
@@ -519,6 +523,9 @@ type (
 
 	Sequence struct {
 		SchemaQualifiedName
+		// RoleOwner is the role that owns the sequence. Owner is already used for
+		// the sequence's OWNED BY table/column dependency.
+		RoleOwner  string
 		Owner      *SequenceOwner
 		Type       string
 		StartValue int64
@@ -534,6 +541,8 @@ type (
 
 type Function struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the function.
+	Owner string
 	// FunctionDef is the statement required to completely (re)create
 	// the function, as returned by `pg_get_functiondef`. It is a CREATE OR REPLACE
 	// statement
@@ -553,6 +562,8 @@ type Function struct {
 
 type Procedure struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the procedure.
+	Owner string
 	// Def is the statement required to completely (re)create
 	// the procedure, as returned by `pg_get_functiondef`. It is a CREATE OR REPLACE
 	// statement.
@@ -632,6 +643,8 @@ type TableDependency struct {
 
 type View struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the view.
+	Owner string
 	// ViewDefinition is the select query that defines the view. It is derived from pg_get_viewdef.
 	ViewDefinition string
 	// Options represents key value map of view options, i.e., pg_class.reloptions.
@@ -646,6 +659,8 @@ type View struct {
 
 type MaterializedView struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the materialized view.
+	Owner string
 	// ViewDefinition is the select query that defines the materialized view. It is derived from pg_get_viewdef.
 	ViewDefinition string
 	// Options represents key value map of materialized view options, i.e., pg_class.reloptions.
@@ -1048,6 +1063,7 @@ func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
 				SchemaName:  rawEnum.EnumSchemaName,
 				EscapedName: EscapeIdentifier(rawEnum.EnumName),
 			},
+			Owner:       rawEnum.Owner,
 			Labels:      rawEnum.EnumLabels,
 			Description: rawEnum.Description,
 		})
@@ -1267,6 +1283,7 @@ func (s *schemaFetcher) buildTable(
 	}
 	return Table{
 		SchemaQualifiedName: schemaQualifiedName,
+		Owner:               table.Owner,
 		Columns:             columns,
 		CheckConstraints:    checkConsByTable[schemaQualifiedName.GetFQEscapedName()],
 		Policies:            policiesByTable[schemaQualifiedName.GetFQEscapedName()],
@@ -1476,6 +1493,7 @@ func (s *schemaFetcher) fetchSequences(ctx context.Context) ([]Sequence, error) 
 				SchemaName:  rawSeq.SequenceSchemaName,
 				EscapedName: EscapeIdentifier(rawSeq.SequenceName),
 			},
+			RoleOwner:   rawSeq.Owner,
 			Owner:       owner,
 			Type:        rawSeq.DataType,
 			StartValue:  rawSeq.StartValue,
@@ -1549,6 +1567,7 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 
 	return Function{
 		SchemaQualifiedName:     buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
+		Owner:                   rawFunction.Owner,
 		FunctionDef:             rawFunction.FuncDef,
 		Language:                rawFunction.FuncLang,
 		DependsOnFunctions:      dependsOnFunctions,
@@ -1607,6 +1626,7 @@ func (s *schemaFetcher) fetchProcedures(ctx context.Context) ([]Procedure, error
 		}
 		p := Procedure{
 			SchemaQualifiedName:     buildProcName(rawProcedure.FuncName, rawProcedure.FuncIdentityArguments, rawProcedure.FuncSchemaName),
+			Owner:                   rawProcedure.Owner,
 			Def:                     rawProcedure.FuncDef,
 			Description:             rawProcedure.Description,
 			DependsOnCompositeTypes: dependsOnTypes,
@@ -1816,6 +1836,7 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 		schemaQualifiedName := buildNameFromUnescaped(v.ViewName, v.SchemaName)
 		views = append(views, View{
 			SchemaQualifiedName: schemaQualifiedName,
+			Owner:               v.Owner,
 			ViewDefinition:      v.ViewDefinition,
 			Options:             options,
 
@@ -1856,6 +1877,7 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 
 		materializedViews = append(materializedViews, MaterializedView{
 			SchemaQualifiedName: buildNameFromUnescaped(mv.ViewName, mv.SchemaName),
+			Owner:               mv.Owner,
 			ViewDefinition:      mv.ViewDefinition,
 			Options:             options,
 			Tablespace:          mv.TablespaceName,

@@ -978,6 +978,7 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	})
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("TABLE", table.SchemaQualifiedName), table.Owner)...)
 
 	// Emit COMMENT ON TABLE / COMMENT ON COLUMN immediately after CREATE TABLE so that
 	// metadata travels with the structural DDL. PG drops these along with the table on
@@ -1076,6 +1077,7 @@ func (t *tableSQLVertexGenerator) Alter(diff tableDiff) ([]Statement, error) {
 	}
 
 	var stmts []Statement
+	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("TABLE", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	stmts = append(stmts, commentDDLForAlter(commentTargetTable(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
 	// Only handle disabling RLS if it was previously enabled.
 	// We want to disable RLS before we do any other operations on the table, e.g., delete policies, to avoid creating an
@@ -2733,6 +2735,7 @@ func (s *sequenceSQLVertexGenerator) Add(seq schema.Sequence) ([]Statement, erro
 	stmts := []Statement{
 		s.buildAddAlterSequenceStatement(seq, false),
 	}
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("SEQUENCE", seq.SchemaQualifiedName), seq.RoleOwner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetSequence(seq.SchemaQualifiedName), seq.Description)...)
 	return stmts, nil
 }
@@ -2759,6 +2762,9 @@ func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, erro
 	var stmts []Statement
 	// Ownership changes handled by the sequenceOwnershipSQLVertexGenerator
 	diff.old.Owner = diff.new.Owner
+	oldRoleOwner := diff.old.RoleOwner
+	roleOwnerChanged := oldRoleOwner != diff.new.RoleOwner
+	diff.old.RoleOwner = diff.new.RoleOwner
 	// Mask Description: handled by an explicit COMMENT statement below.
 	descChanged := diff.old.Description != diff.new.Description
 	diff.old.Description = diff.new.Description
@@ -2786,6 +2792,9 @@ func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, erro
 
 	if !cmp.Equal(diff.old, diff.new) {
 		return nil, fmt.Errorf("altering sequence to resolve the following diff %s: %w", cmp.Diff(diff.old, diff.new), ErrNotImplemented)
+	}
+	if roleOwnerChanged {
+		stmts = append(stmts, ownerDDLForAlter(ownershipTarget("SEQUENCE", diff.new.SchemaQualifiedName), oldRoleOwner, diff.new.RoleOwner)...)
 	}
 
 	if descChanged {

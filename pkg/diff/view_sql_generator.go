@@ -137,6 +137,7 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 		deps = append(deps, mustRun(addVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
 	}
 
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("VIEW", v.SchemaQualifiedName), v.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetView(v.SchemaQualifiedName), v.Description)...)
 
 	return partialSQLGraph{
@@ -174,12 +175,13 @@ func (vsg *viewSQLGenerator) Delete(v schema.View) (partialSQLGraph, error) {
 }
 
 func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
-	// Mask Privileges (handled by the privilege generator below) and Description (handled by an
-	// explicit COMMENT statement) so the structural-equality check below only triggers
-	// ErrNotImplemented when something we cannot alter changed.
+	// Mask Privileges (handled by the privilege generator below), Description and Owner (handled
+	// by explicit COMMENT / OWNER TO statements) so the structural-equality check below only
+	// triggers ErrNotImplemented when something we cannot alter changed.
 	oldMasked := vd.old
 	oldMasked.Privileges = nil
 	oldMasked.Description = vd.new.Description
+	oldMasked.Owner = vd.new.Owner
 	newMasked := vd.new
 	newMasked.Privileges = nil
 
@@ -193,12 +195,13 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 		return partialSQLGraph{}, fmt.Errorf("resolving privilege sql: %w", err)
 	}
 
-	commentStmts := commentDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Description, vd.new.Description)
-	if len(commentStmts) > 0 {
+	metadataStmts := ownerDDLForAlter(ownershipTarget("VIEW", vd.new.SchemaQualifiedName), vd.old.Owner, vd.new.Owner)
+	metadataStmts = append(metadataStmts, commentDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Description, vd.new.Description)...)
+	if len(metadataStmts) > 0 {
 		privilegesPartialGraph.vertices = append(privilegesPartialGraph.vertices, sqlVertex{
 			id:         buildTableVertexId(vd.new.SchemaQualifiedName, diffTypeAddAlter),
 			priority:   sqlPrioritySooner,
-			statements: commentStmts,
+			statements: metadataStmts,
 		})
 	}
 

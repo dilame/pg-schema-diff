@@ -38,6 +38,7 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 		LockTimeout: lockTimeoutDefault,
 		Hazards:     hazards,
 	}}
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("FUNCTION", function.SchemaQualifiedName), function.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Description)...)
 	return stmts, nil
 }
@@ -68,20 +69,26 @@ func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, erro
 		return nil, nil
 	}
 
-	// Comment-only diff: don't `CREATE OR REPLACE`, just emit a COMMENT statement.
+	// Metadata-only diff: don't `CREATE OR REPLACE`, just emit the COMMENT / OWNER statements.
 	oldCopy := diff.old
 	oldCopy.Description = diff.new.Description
+	oldCopy.Owner = diff.new.Owner
 	if cmp.Equal(oldCopy, diff.new) {
-		return commentDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description), nil
+		stmts := ownerDDLForAlter(ownershipTarget("FUNCTION", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)
+		stmts = append(stmts, commentDDLForAlter(commentTargetFunction(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
+		return stmts, nil
 	}
 
 	// Add() emits CREATE OR REPLACE plus the COMMENT statement (if Description is non-empty
 	// in the new schema). For ALTER we additionally need to emit `COMMENT ON ... IS NULL`
-	// when Description was removed.
-	stmts, err := f.Add(diff.new)
+	// when Description was removed, and the OWNER TO statement when the owner changed.
+	newForAlter := diff.new
+	newForAlter.Owner = ""
+	stmts, err := f.Add(newForAlter)
 	if err != nil {
 		return nil, err
 	}
+	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("FUNCTION", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	if diff.new.Description == "" && diff.old.Description != "" {
 		stmts = append(stmts, commentOnStatement(commentTargetFunction(diff.new.SchemaQualifiedName), ""))
 	}
