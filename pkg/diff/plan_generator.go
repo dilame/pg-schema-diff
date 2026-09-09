@@ -299,6 +299,13 @@ func clearSkippedPrivileges(s schema.Schema) schema.Schema {
 	}
 	s.Tables = tables
 
+	views := make([]schema.View, len(s.Views))
+	for i, v := range s.Views {
+		v.Privileges = nil
+		views[i] = v
+	}
+	s.Views = views
+
 	functions := make([]schema.Function, len(s.Functions))
 	for i, f := range s.Functions {
 		f.Privileges = nil

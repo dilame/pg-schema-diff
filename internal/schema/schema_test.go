@@ -273,7 +273,7 @@ var (
 			-- Validate database-wide default privileges are out of scope
 			ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO some_role_1;
 		`},
-			expectedHash: "e045c528fd265b07",
+			expectedHash: "bf8e52620fee6bb6",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -664,7 +664,7 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "a8c17a395024ffde",
+			expectedHash: "c8a933d063d91c8c",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1247,7 +1247,7 @@ var (
 				CREATE TYPE pg_temp.color AS ENUM ('red', 'green', 'blue');
 			`},
 			// Assert empty schema hash, since we want to validate specifically that this hash is deterministic
-			expectedHash: "bfda373852505980",
+			expectedHash: "88672a4b111c43a5",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
