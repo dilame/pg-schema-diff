@@ -44,11 +44,11 @@ func (d *domainSQLVertexGenerator) Add(domain schema.Domain) (partialSQLGraph, e
 		vertices: []sqlVertex{{
 			id:       addVertexId,
 			priority: sqlPrioritySooner,
-			statements: []Statement{{
+			statements: append([]Statement{{
 				DDL:         buildCreateDomainDDL(domain),
 				Timeout:     statementTimeoutDefault,
 				LockTimeout: lockTimeoutDefault,
-			}},
+			}}, commentDDLForAdd(commentTargetDomain(domain.SchemaQualifiedName), domain.Description)...),
 		}},
 		dependencies: deps,
 	}, nil
@@ -100,6 +100,7 @@ func (d *domainSQLVertexGenerator) Alter(diff domainDiff) (partialSQLGraph, erro
 	if err != nil {
 		return partialSQLGraph{}, err
 	}
+	statements = append(statements, commentDDLForAlter(commentTargetDomain(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
 	if len(statements) == 0 {
 		return partialSQLGraph{}, nil
 	}
@@ -201,6 +202,8 @@ func buildAlterDomainStatements(old, new schema.Domain) ([]Statement, error) {
 	oldCopy.IsNotNull = new.IsNotNull
 	oldCopy.DependsOnFunctions = new.DependsOnFunctions
 	oldCopy.DependsOnDomains = new.DependsOnDomains
+	// The comment is resolved by an explicit COMMENT statement in Alter.
+	oldCopy.Description = new.Description
 	if diff := cmp.Diff(oldCopy, new); diff != "" {
 		return nil, fmt.Errorf("unable to resolve the diff %s: %w", diff, ErrNotImplemented)
 	}

@@ -440,6 +440,26 @@ var domainAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name: "create, change and remove a domain comment",
+		oldSchemaDDL: []string{
+			`
+            CREATE DOMAIN with_comment AS NUMERIC(10, 2);
+            COMMENT ON DOMAIN with_comment IS 'the old comment';
+            CREATE DOMAIN losing_comment AS NUMERIC(10, 2);
+            COMMENT ON DOMAIN losing_comment IS 'to be removed';
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE DOMAIN with_comment AS NUMERIC(10, 2);
+            COMMENT ON DOMAIN with_comment IS 'the new comment';
+            CREATE DOMAIN losing_comment AS NUMERIC(10, 2);
+            CREATE DOMAIN gaining_comment AS NUMERIC(10, 2);
+            COMMENT ON DOMAIN gaining_comment IS 'a brand new comment';
+			`,
+		},
+	},
+	{
 		name: "create a domain with a collation",
 		oldSchemaDDL: []string{
 			``,

@@ -383,6 +383,8 @@ type Domain struct {
 	// DependsOnDomains is the list of domains this domain is built on top of (a domain
 	// may have another domain as its base type).
 	DependsOnDomains []SchemaQualifiedName
+	// Description is the comment attached to the domain (pg_description). Empty means no comment.
+	Description string
 }
 
 type Table struct {
@@ -1392,6 +1394,7 @@ func (s *schemaFetcher) fetchDomains(ctx context.Context) ([]Domain, error) {
 			Constraints:        constraints,
 			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
 			DependsOnDomains:   dependsOnDomains,
+			Description:        rawDomain.Description,
 		})
 	}
 

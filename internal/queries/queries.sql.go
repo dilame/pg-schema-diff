@@ -709,7 +709,10 @@ SELECT
         pg_catalog.pg_get_expr(pg_type.typdefaultbin, 0), ''
     )::TEXT AS default_value,
     COALESCE(coll.collname, '')::TEXT AS collation_name,
-    COALESCE(coll_ns.nspname, '')::TEXT AS collation_schema_name
+    COALESCE(coll_ns.nspname, '')::TEXT AS collation_schema_name,
+    COALESCE(
+        pg_catalog.obj_description(pg_type.oid, 'pg_type'), ''
+    )::TEXT AS description
 FROM pg_catalog.pg_type AS pg_type
 INNER JOIN
     pg_catalog.pg_namespace AS type_namespace
@@ -751,6 +754,7 @@ type GetDomainsRow struct {
 	DefaultValue        string
 	CollationName       string
 	CollationSchemaName string
+	Description         string
 }
 
 // Returns the user-defined domains (typtype = 'd'). The base type is formatted
@@ -775,6 +779,7 @@ func (q *Queries) GetDomains(ctx context.Context) ([]GetDomainsRow, error) {
 			&i.DefaultValue,
 			&i.CollationName,
 			&i.CollationSchemaName,
+			&i.Description,
 		); err != nil {
 			return nil, err
 		}

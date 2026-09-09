@@ -113,6 +113,7 @@ var (
 			-- A domain built on another domain, with a CHECK calling a user-defined function
 			CREATE DOMAIN schema_1.dependent_domain AS schema_1.foobar_domain
 				CONSTRAINT dependent_domain_check CHECK (function_with_dependencies(length(VALUE), 1) > 0);
+			COMMENT ON DOMAIN schema_1.foobar_domain IS 'some domain comment';
 			-- Validate domains are filtered out
 			CREATE DOMAIN schema_filtered_1.foobar_domain AS TEXT;
 
@@ -273,7 +274,7 @@ var (
 			-- Validate database-wide default privileges are out of scope
 			ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO some_role_1;
 		`},
-			expectedHash: "bf8e52620fee6bb6",
+			expectedHash: "57ad162bf0653dce",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -338,6 +339,7 @@ var (
 						Constraints: []DomainConstraint{
 							{Name: "foobar_domain_check", Def: "CHECK ((length(VALUE) > 0))"},
 						},
+						Description: "some domain comment",
 					},
 				},
 				Tables: []Table{
