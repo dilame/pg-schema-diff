@@ -53,6 +53,7 @@ func (o SchemaQualifiedName) IsEmpty() bool {
 // Schema is the schema of the database, not just a single Postgres schema.
 type Schema struct {
 	NamedSchemas          []NamedSchema
+	DefaultPrivileges     []DefaultPrivilege
 	Extensions            []Extension
 	Enums                 []Enum
 	CompositeTypes        []CompositeType
@@ -77,6 +78,7 @@ func (s Schema) Normalize() Schema {
 		normNamedSchemas = append(normNamedSchemas, namedSchema)
 	}
 	s.NamedSchemas = normNamedSchemas
+	s.DefaultPrivileges = sortSchemaObjectsByName(s.DefaultPrivileges)
 	s.Extensions = sortSchemaObjectsByName(s.Extensions)
 	s.Enums = sortSchemaObjectsByName(s.Enums)
 
@@ -263,6 +265,44 @@ func (p SchemaPrivilege) GetName() string {
 		grantee = "PUBLIC"
 	}
 	return fmt.Sprintf("%s:%s", grantee, p.Privilege)
+}
+
+// DefaultPrivilege is one privilege of an `ALTER DEFAULT PRIVILEGES ... IN SCHEMA ...` rule,
+// i.e. one aclitem of one schema-scoped `pg_default_acl` row.
+//
+// Database-wide default privileges (`ALTER DEFAULT PRIVILEGES` without `IN SCHEMA`) are out of
+// scope: they are not attached to any schema, so a schema-scoped declarative source cannot
+// express them.
+type DefaultPrivilege struct {
+	// TargetRole is the role whose newly created objects the rule applies to (`FOR ROLE`).
+	TargetRole string
+	// SchemaName is the schema the rule is scoped to (`IN SCHEMA`).
+	SchemaName string
+	// ObjectType is the object class the rule applies to: TABLES, SEQUENCES, FUNCTIONS or TYPES.
+	ObjectType string
+	// Grantee is the role that receives the privilege. Empty string means PUBLIC.
+	Grantee string
+	// Privilege is the type of privilege, e.g. SELECT, USAGE, EXECUTE.
+	Privilege string
+	// IsGrantable indicates if the grantee can grant this privilege to others (WITH GRANT OPTION).
+	IsGrantable bool
+}
+
+func (p DefaultPrivilege) GetName() string {
+	grantee := p.Grantee
+	if grantee == "" {
+		grantee = "PUBLIC"
+	}
+	return fmt.Sprintf("%s:%s:%s:%s:%s", p.TargetRole, p.SchemaName, p.ObjectType, grantee, p.Privilege)
+}
+
+// defaultACLObjectTypes maps a `pg_default_acl.defaclobjtype` char to the keyword used by
+// `ALTER DEFAULT PRIVILEGES ... ON <object type>`.
+var defaultACLObjectTypes = map[string]string{
+	"r": "TABLES",
+	"S": "SEQUENCES",
+	"f": "FUNCTIONS",
+	"T": "TYPES",
 }
 
 type Extension struct {
@@ -886,6 +926,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("starting named schemas future: %w", err)
 	}
 
+	defaultPrivilegesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]DefaultPrivilege, error) {
+		return s.fetchDefaultPrivileges(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting default privileges future: %w", err)
+	}
+
 	extensionsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Extension, error) {
 		return s.fetchExtensions(ctx)
 	})
@@ -982,6 +1029,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("getting named schemas: %w", err)
 	}
 
+	defaultPrivileges, err := defaultPrivilegesFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting default privileges: %w", err)
+	}
+
 	extensions, err := extensionsFuture.Get(ctx)
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting extensions: %w", err)
@@ -1049,6 +1101,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 
 	return Schema{
 		NamedSchemas:          schemas,
+		DefaultPrivileges:     defaultPrivileges,
 		Extensions:            extensions,
 		Enums:                 enums,
 		CompositeTypes:        compositeTypes,
@@ -1063,6 +1116,49 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		Views:                 views,
 		MaterializedViews:     materializedViews,
 	}, nil
+}
+
+func (s *schemaFetcher) fetchDefaultPrivileges(ctx context.Context) ([]DefaultPrivilege, error) {
+	rawPrivileges, err := s.q.GetDefaultPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetDefaultPrivileges: %w", err)
+	}
+
+	var privileges []DefaultPrivilege
+	for _, rawPrivilege := range rawPrivileges {
+		objectType, ok := defaultACLObjectTypes[rawPrivilege.ObjectType]
+		if !ok {
+			return nil, fmt.Errorf("unknown pg_default_acl object type %q", rawPrivilege.ObjectType)
+		}
+
+		// sqlc types ACLEXPLODE's is_grantable as interface{}.
+		isGrantable := false
+		if b, ok := rawPrivilege.IsGrantable.(bool); ok {
+			isGrantable = b
+		}
+
+		privileges = append(privileges, DefaultPrivilege{
+			TargetRole:  rawPrivilege.TargetRole,
+			SchemaName:  rawPrivilege.SchemaName,
+			ObjectType:  objectType,
+			Grantee:     rawPrivilege.Grantee,
+			Privilege:   rawPrivilege.Privilege,
+			IsGrantable: isGrantable,
+		})
+	}
+
+	privileges = filterSliceByName(
+		privileges,
+		func(p DefaultPrivilege) SchemaQualifiedName {
+			return SchemaQualifiedName{
+				SchemaName:  p.SchemaName,
+				EscapedName: EscapeIdentifier(p.SchemaName),
+			}
+		},
+		s.nameFilter,
+	)
+
+	return privileges, nil
 }
 
 func (s *schemaFetcher) fetchNamedSchemas(ctx context.Context) ([]NamedSchema, error) {

@@ -261,6 +261,17 @@ var (
 			-- Add table privileges to test they are fetched correctly
 			GRANT SELECT ON schema_2.foo TO some_role_1;
 			GRANT INSERT ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
+
+			-- Add default privileges to test they are fetched correctly
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1 GRANT SELECT ON TABLES TO some_role_1;
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+				GRANT USAGE ON SEQUENCES TO some_role_2 WITH GRANT OPTION;
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_2 GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+			-- Validate default privileges of filtered schemas are filtered out
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_filtered_1
+				GRANT SELECT ON TABLES TO some_role_1;
+			-- Validate database-wide default privileges are out of scope
+			ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO some_role_1;
 		`},
 			expectedHash: "e045c528fd265b07",
 			expectedSchema: Schema{
@@ -268,6 +279,11 @@ var (
 					publicSchema,
 					postgresOwnedSchema("schema_1"),
 					postgresOwnedSchema("schema_2"),
+				},
+				DefaultPrivileges: []DefaultPrivilege{
+					{TargetRole: "postgres", SchemaName: "schema_1", ObjectType: "SEQUENCES", Grantee: "some_role_2", Privilege: "USAGE", IsGrantable: true},
+					{TargetRole: "postgres", SchemaName: "schema_1", ObjectType: "TABLES", Grantee: "some_role_1", Privilege: "SELECT"},
+					{TargetRole: "postgres", SchemaName: "schema_2", ObjectType: "FUNCTIONS", Grantee: "", Privilege: "EXECUTE"},
 				},
 				Extensions: []Extension{
 					{
