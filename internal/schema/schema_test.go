@@ -105,6 +105,17 @@ var (
 				RETURNS NULL ON NULL INPUT
 				RETURN schema_filtered_1.add(a, b) + schema_1.increment(a);
 
+			CREATE DOMAIN schema_1.foobar_domain AS TEXT
+				COLLATE "C"
+				DEFAULT 'foobar'::TEXT
+				NOT NULL
+				CONSTRAINT foobar_domain_check CHECK (length(VALUE) > 0);
+			-- A domain built on another domain, with a CHECK calling a user-defined function
+			CREATE DOMAIN schema_1.dependent_domain AS schema_1.foobar_domain
+				CONSTRAINT dependent_domain_check CHECK (function_with_dependencies(length(VALUE), 1) > 0);
+			-- Validate domains are filtered out
+			CREATE DOMAIN schema_filtered_1.foobar_domain AS TEXT;
+
 			CREATE TABLE schema_2.foo (
 				id SERIAL,
 				author TEXT COLLATE "C",
@@ -284,6 +295,33 @@ var (
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"foobar_enum\""},
 						Labels:              []string{"foobar_1", "foobar_2"},
+					},
+				},
+				Domains: []Domain{
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"dependent_domain\""},
+						BaseType:            "schema_1.foobar_domain",
+						// Postgres copies the base domain's default into the derived domain.
+						Default: "'foobar'::text",
+						Constraints: []DomainConstraint{
+							{Name: "dependent_domain_check", Def: "CHECK ((function_with_dependencies(length((VALUE)::text), 1) > 0))"},
+						},
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"function_with_dependencies\"(a integer, b integer)", SchemaName: "public"},
+						},
+						DependsOnDomains: []SchemaQualifiedName{
+							{EscapedName: "\"foobar_domain\"", SchemaName: "schema_1"},
+						},
+					},
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"foobar_domain\""},
+						BaseType:            "text",
+						IsNotNull:           true,
+						Default:             "'foobar'::text",
+						Collation:           cCollation,
+						Constraints: []DomainConstraint{
+							{Name: "foobar_domain_check", Def: "CHECK ((length(VALUE) > 0))"},
+						},
 					},
 				},
 				Tables: []Table{
