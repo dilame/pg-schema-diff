@@ -176,7 +176,6 @@ func (suite *onInstanceTempDbFactorySuite) TestCreate_CreateAndDropFlow() {
 		NamedSchemas: []internalschema.NamedSchema{{
 			Name:        "public",
 			Description: "standard public schema",
-			Name:        "public",
 			Owner:       "pg_database_owner",
 			Privileges: []internalschema.SchemaPrivilege{{
 				Grantee:     "",

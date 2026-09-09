@@ -292,6 +292,7 @@ type Table struct {
 	CheckConstraints []CheckConstraint
 	Policies         []Policy
 	Privileges       []TablePrivilege
+	IsUnlogged       bool
 	ReplicaIdentity  ReplicaIdentity
 	RLSEnabled       bool
 	RLSForced        bool
@@ -1270,6 +1271,7 @@ func (s *schemaFetcher) buildTable(
 		CheckConstraints:    checkConsByTable[schemaQualifiedName.GetFQEscapedName()],
 		Policies:            policiesByTable[schemaQualifiedName.GetFQEscapedName()],
 		Privileges:          privilegesByTable[schemaQualifiedName.GetFQEscapedName()],
+		IsUnlogged:          table.IsUnlogged,
 		ReplicaIdentity:     ReplicaIdentity(table.ReplicaIdentity),
 		RLSEnabled:          table.RlsEnabled,
 		RLSForced:           table.RlsForced,
