@@ -53,6 +53,14 @@ func (p procedureSQLVertexGenerator) Add(s schema.Procedure) (partialSQLGraph, e
 	}}
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("PROCEDURE", s.SchemaQualifiedName), s.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetProcedure(s.SchemaQualifiedName), s.Description)...)
+	privilegeStmts, err := exactRoutinePrivilegeStatements(
+		newProcedurePrivilegeSQLVertexGenerator(s.SchemaQualifiedName),
+		s.Privileges,
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating procedure privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
@@ -109,49 +117,57 @@ func (p procedureSQLVertexGenerator) Delete(s schema.Procedure) (partialSQLGraph
 }
 
 func (p procedureSQLVertexGenerator) Alter(d procedureDiff) (partialSQLGraph, error) {
-	if cmp.Equal(d.old, d.new) {
-		return partialSQLGraph{}, nil
+	// Mask everything resolved by an explicit statement below — privileges, the comment and the
+	// owner. Whatever remains can only be resolved by re-creating the procedure.
+	oldMasked := d.old
+	oldMasked.Privileges = nil
+	oldMasked.Description = d.new.Description
+	oldMasked.Owner = d.new.Owner
+	newMasked := d.new
+	newMasked.Privileges = nil
+	recreated := !cmp.Equal(oldMasked, newMasked)
+
+	var partialGraph partialSQLGraph
+	if recreated {
+		// Add() also re-emits the COMMENT and privilege statements for the new schema, so the
+		// owner is masked out of it and set by an explicit statement below.
+		newForAlter := d.new
+		newForAlter.Owner = ""
+		addPartialGraph, err := p.Add(newForAlter)
+		if err != nil {
+			return partialSQLGraph{}, err
+		}
+		partialGraph = concatPartialGraphs(partialGraph, addPartialGraph)
 	}
 
-	// Metadata-only diff: don't recreate, emit the COMMENT / OWNER statements only.
-	oldCopy := d.old
-	oldCopy.Description = d.new.Description
-	oldCopy.Owner = d.new.Owner
-	if cmp.Equal(oldCopy, d.new) {
-		metadataStmts := ownerDDLForAlter(ownershipTarget("PROCEDURE", d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)
-		metadataStmts = append(metadataStmts, commentDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)...)
-		if len(metadataStmts) == 0 {
-			return partialSQLGraph{}, nil
+	metadataStmts := ownerDDLForAlter(ownershipTarget("PROCEDURE", d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)
+	if recreated {
+		// Add() did not emit anything when the new Description is empty, so a removed comment
+		// still has to be cleared explicitly.
+		if d.new.Description == "" && d.old.Description != "" {
+			metadataStmts = append(metadataStmts, commentOnStatement(commentTargetProcedure(d.new.SchemaQualifiedName), ""))
 		}
-		return partialSQLGraph{
+	} else {
+		metadataStmts = append(metadataStmts, commentDDLForAlter(commentTargetProcedure(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)...)
+	}
+	if len(metadataStmts) > 0 {
+		partialGraph = concatPartialGraphs(partialGraph, partialSQLGraph{
 			vertices: []sqlVertex{{
 				id:         buildProcedureVertexId(d.new.SchemaQualifiedName, diffTypeAddAlter),
 				priority:   sqlPrioritySooner,
 				statements: metadataStmts,
 			}},
-		}, nil
+		})
 	}
 
-	// New adds or replaces the procedure (Add() also re-emits the COMMENT for the new schema).
-	newForAlter := d.new
-	newForAlter.Owner = ""
-	graph, err := p.Add(newForAlter)
+	privilegesPartialGraph, err := generatePartialGraph(
+		newProcedurePrivilegeSQLVertexGenerator(d.new.SchemaQualifiedName),
+		d.privilegesDiff,
+	)
 	if err != nil {
-		return partialSQLGraph{}, err
+		return partialSQLGraph{}, fmt.Errorf("resolving procedure privilege sql: %w", err)
 	}
-	for i := range graph.vertices {
-		graph.vertices[i].statements = append(graph.vertices[i].statements,
-			ownerDDLForAlter(ownershipTarget("PROCEDURE", d.new.SchemaQualifiedName), d.old.Owner, d.new.Owner)...)
-	}
-	// Add() didn't emit anything when Description == "" — but if the old schema had a
-	// description and the new one doesn't, we still need to clear it explicitly.
-	if d.new.Description == "" && d.old.Description != "" {
-		for i := range graph.vertices {
-			graph.vertices[i].statements = append(graph.vertices[i].statements,
-				commentOnStatement(commentTargetProcedure(d.new.SchemaQualifiedName), ""))
-		}
-	}
-	return graph, nil
+	return concatPartialGraphs(partialGraph, privilegesPartialGraph), nil
 }
 
 func buildProcedureVertexId(name schema.SchemaQualifiedName, diffType diffType) sqlVertexId {
