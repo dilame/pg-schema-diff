@@ -116,6 +116,55 @@ func (suite *cmdTestSuite) TestPlanCmd() {
 			outputEquals: "/*\nStatement 0\n  - INDEX_BUILD: This might affect database performance. Concurrent index builds require a non-trivial amount of CPU, potentially affecting database performance. They also can take a while but do not lock out writes.\n*/\nSET SESSION statement_timeout = 1200000;\nSET SESSION lock_timeout = 3000;\nCREATE INDEX CONCURRENTLY bar_idx ON public.foobar USING btree (bar);\n\n/*\nStatement 1\n  - INDEX_BUILD: This might affect database performance. Concurrent index builds require a non-trivial amount of CPU, potentially affecting database performance. They also can take a while but do not lock out writes.\n*/\nSET SESSION statement_timeout = 1200000;\nSET SESSION lock_timeout = 3000;\nCREATE INDEX CONCURRENTLY fizzbuzz_idx ON public.foobar USING btree (fizzbuzz);\n",
 		},
 		{
+			// Control for the "respect column order" case below: the same pair of schemas plans cleanly when column
+			// ordering is ignored, which is the default.
+			name: "column order change ignored by default",
+			dynamicArgs: []dArgGenerator{
+				tempDsnDArg(suite.pgEngine, "temp-db-dsn", []string{""}),
+				tempSchemaDirDArg("from-dir", []string{`
+						CREATE TABLE foobar(
+							bar TEXT,
+							fizzbuzz TEXT
+						);
+				`}),
+				tempSchemaDirDArg("to-dir", []string{`
+						CREATE TABLE foobar(
+							fizzbuzz TEXT,
+							bar TEXT
+						);
+				`}),
+			},
+		},
+		{
+			name: "respect column order",
+			args: []string{"--respect-column-order", "--data-pack-new-tables=false"},
+			dynamicArgs: []dArgGenerator{
+				tempDsnDArg(suite.pgEngine, "temp-db-dsn", []string{""}),
+				tempSchemaDirDArg("from-dir", []string{`
+						CREATE TABLE foobar(
+							bar TEXT,
+							fizzbuzz TEXT
+						);
+				`}),
+				tempSchemaDirDArg("to-dir", []string{`
+						CREATE TABLE foobar(
+							fizzbuzz TEXT,
+							bar TEXT
+						);
+				`}),
+			},
+			expectErrContains: []string{"column ordering changed"},
+		},
+		{
+			name: "respect column order without disabling data packing",
+			args: []string{"--respect-column-order"},
+			dynamicArgs: []dArgGenerator{
+				tempDsnDArg(suite.pgEngine, "from-dsn", nil),
+				tempDsnDArg(suite.pgEngine, "to-dsn", []string{"CREATE TABLE foobar()"}),
+			},
+			expectErrContains: []string{"--respect-column-order", "--data-pack-new-tables=false"},
+		},
+		{
 			name: "invalid output format",
 			args: []string{"--output-format", "invalid"},
 			dynamicArgs: []dArgGenerator{
@@ -133,6 +182,50 @@ func (suite *cmdTestSuite) TestPlanCmd() {
 				outputContains:    tc.outputContains,
 				expectErrContains: tc.expectErrContains,
 			})
+		})
+	}
+}
+
+func (suite *cmdTestSuite) TestParsePlanOptionsColumnOrder() {
+	for _, tc := range []struct {
+		name                string
+		flags               planOptionsFlags
+		expectedErrContains string
+		// expectedOptCount is the number of diff.PlanOpt values parsing should produce. The include/exclude schema
+		// opts are always present, so anything above two is an opt contributed by a boolean flag. The opts are
+		// funcs over an unexported struct, so their identity cannot be asserted from this package; the plan command
+		// test cases above cover the behaviour they produce.
+		expectedOptCount int
+	}{
+		{
+			name:             "neither flag set",
+			flags:            planOptionsFlags{},
+			expectedOptCount: 2,
+		},
+		{
+			name:             "respect column order with data packing disabled",
+			flags:            planOptionsFlags{respectColumnOrder: true},
+			expectedOptCount: 3,
+		},
+		{
+			name:                "respect column order with data packing enabled",
+			flags:               planOptionsFlags{respectColumnOrder: true, dataPackNewTables: true},
+			expectedErrContains: "--data-pack-new-tables=false",
+		},
+		{
+			name:             "data packing enabled without respecting column order",
+			flags:            planOptionsFlags{dataPackNewTables: true},
+			expectedOptCount: 3,
+		},
+	} {
+		suite.Run(tc.name, func() {
+			opts, err := parsePlanOptions(tc.flags)
+			if len(tc.expectedErrContains) > 0 {
+				suite.ErrorContains(err, tc.expectedErrContains)
+				return
+			}
+			suite.Require().NoError(err)
+			suite.Len(opts.opts, tc.expectedOptCount)
 		})
 	}
 }

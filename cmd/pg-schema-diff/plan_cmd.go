@@ -117,6 +117,7 @@ type (
 		dataPackNewTables     bool
 		disablePlanValidation bool
 		noConcurrentIndexOps  bool
+		respectColumnOrder    bool
 
 		statementTimeoutModifiers []string
 		lockTimeoutModifiers      []string
@@ -227,6 +228,9 @@ func createPlanOptionsFlags(cmd *cobra.Command) *planOptionsFlags {
 		"database with an identical schema to the original, asserting that the generated plan actually migrates the schema to the desired target.")
 	cmd.Flags().BoolVar(&flags.noConcurrentIndexOps, "no-concurrent-index-ops", false, "If set, will disable the use of CONCURRENTLY in CREATE INDEX and DROP INDEX statements. "+
 		"This may result in longer lock times and potential downtime during migrations.")
+	cmd.Flags().BoolVar(&flags.respectColumnOrder, "respect-column-order", false, "If set, will respect changes to the ordering of columns in existing tables rather than ignoring them. "+
+		"Postgres cannot re-order the columns of an existing table, so planning will fail instead of silently leaving the physical column order different from the declared one. "+
+		"Requires --data-pack-new-tables=false, since data packing re-arranges columns.")
 
 	timeoutModifierFlagVar(cmd, &flags.statementTimeoutModifiers, "statement", "t")
 	timeoutModifierFlagVar(cmd, &flags.lockTimeoutModifiers, "lock", "l")
@@ -315,6 +319,12 @@ func dsnSchemaSource(connConfig *pgx.ConnConfig) schemaSourceFactory {
 }
 
 func parsePlanOptions(p planOptionsFlags) (planOptions, error) {
+	if p.dataPackNewTables && p.respectColumnOrder {
+		// Data packing re-arranges the columns of new tables, so it inherently conflicts with respecting the column
+		// order declared in the schema. --data-pack-new-tables defaults to true, so say explicitly what to turn off.
+		return planOptions{}, fmt.Errorf("--respect-column-order cannot be combined with --data-pack-new-tables, which re-arranges the columns of new tables. Set --data-pack-new-tables=false")
+	}
+
 	opts := []diff.PlanOpt{
 		diff.WithIncludeSchemas(p.includeSchemas...),
 		diff.WithExcludeSchemas(p.excludeSchemas...),
@@ -328,6 +338,9 @@ func parsePlanOptions(p planOptionsFlags) (planOptions, error) {
 	}
 	if p.noConcurrentIndexOps {
 		opts = append(opts, diff.WithNoConcurrentIndexOps())
+	}
+	if p.respectColumnOrder {
+		opts = append(opts, diff.WithRespectColumnOrder())
 	}
 
 	var statementTimeoutModifiers []timeoutModifier
