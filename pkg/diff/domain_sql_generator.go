@@ -297,6 +297,11 @@ func (d *domainSQLVertexGenerator) consumerDepsForAddAlter(domain schema.Domain)
 			deps = append(deps, mustRun(addVertexId).before(buildDomainVertexId(other.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
+	for _, compositeType := range d.newSchema.CompositeTypes {
+		if dependsOnDomain(compositeType.DependsOnDomains, domainName) {
+			deps = append(deps, mustRun(addVertexId).before(buildCompositeTypeVertexId(compositeType.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
 	return deps
 }
 
@@ -316,6 +321,7 @@ func (d *domainSQLVertexGenerator) consumerDepsForDelete(domain schema.Domain) [
 	newProceduresByName := buildSchemaObjByNameMap(d.newSchema.Procedures)
 	newTablesByName := buildSchemaObjByNameMap(d.newSchema.Tables)
 	newDomainsByName := buildSchemaObjByNameMap(d.newSchema.Domains)
+	newCompositeTypesByName := buildSchemaObjByNameMap(d.newSchema.CompositeTypes)
 
 	var deps []dependency
 	for _, table := range d.oldSchema.Tables {
@@ -357,6 +363,18 @@ func (d *domainSQLVertexGenerator) consumerDepsForDelete(domain schema.Domain) [
 		deps = append(deps, mustRun(deleteVertexId).after(buildDomainVertexId(other.SchemaQualifiedName, diffTypeDelete)))
 		if !dependsOnDomain(newDomainsByName[other.GetName()].DependsOnDomains, domainName) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildDomainVertexId(other.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, compositeType := range d.oldSchema.CompositeTypes {
+		if !dependsOnDomain(compositeType.DependsOnDomains, domainName) {
+			continue
+		}
+		deps = append(deps, mustRun(deleteVertexId).after(buildCompositeTypeVertexId(compositeType.SchemaQualifiedName, diffTypeDelete)))
+		// A composite type still typed with a re-created domain is force re-created alongside it
+		// (see identifyCompositeTypesToRecreate), so the edge to its add/alter must be skipped:
+		// it would contradict compositeTypeDelete < domainDelete < domainAdd < compositeTypeAdd.
+		if !dependsOnDomain(newCompositeTypesByName[compositeType.GetName()].DependsOnDomains, domainName) {
+			deps = append(deps, mustRun(deleteVertexId).after(buildCompositeTypeVertexId(compositeType.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
 	return deps

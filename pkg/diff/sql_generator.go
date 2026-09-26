@@ -289,28 +289,10 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing enums: %w", err)
 	}
 
-	// compositeTypesBeingRecreated tracks types whose attribute layout is changing,
-	// including composite types that must be recreated because one of their
-	// attribute types is being recreated. Functions and procedures that reference
-	// any of these must be force-recreated so they pick up the new layout —
-	// `CREATE OR REPLACE FUNCTION` cannot change a function's argument or return type.
-	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(old.CompositeTypes, new.CompositeTypes)
-	if err != nil {
-		return schemaDiff{}, false, err
-	}
-	compositeTypeDiffs, err := diffLists(old.CompositeTypes, new.CompositeTypes, func(old, new schema.CompositeType, _, _ int) (compositeTypeDiff, bool, error) {
-		return compositeTypeDiff{
-			oldAndNew[schema.CompositeType]{old: old, new: new},
-		}, compositeTypesBeingRecreated[new.GetName()], nil
-	})
-	if err != nil {
-		return schemaDiff{}, false, fmt.Errorf("diffing composite types: %w", err)
-	}
-
 	// domainsBeingRecreated tracks the domains whose base type or collation is changing.
 	// Neither can be altered in place, so those domains are dropped and re-created, and every
-	// function or procedure whose signature is typed with one of them must be re-created too:
-	// `CREATE OR REPLACE FUNCTION` cannot change an argument or return type.
+	// function, procedure, or composite type whose signature/attributes are typed with one of
+	// them must be re-created too: their definitions cannot change in place.
 	domainsBeingRecreated, err := identifyDomainsToRecreate(old, new)
 	if err != nil {
 		return schemaDiff{}, false, err
@@ -322,6 +304,24 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing domains: %w", err)
+	}
+
+	// compositeTypesBeingRecreated tracks types whose attribute layout is changing,
+	// including composite types that must be recreated because one of their
+	// attribute types is being recreated. Functions and procedures that reference
+	// any of these must be force-recreated so they pick up the new layout —
+	// `CREATE OR REPLACE FUNCTION` cannot change a function's argument or return type.
+	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(old.CompositeTypes, new.CompositeTypes, domainsBeingRecreated)
+	if err != nil {
+		return schemaDiff{}, false, err
+	}
+	compositeTypeDiffs, err := diffLists(old.CompositeTypes, new.CompositeTypes, func(old, new schema.CompositeType, _, _ int) (compositeTypeDiff, bool, error) {
+		return compositeTypeDiff{
+			oldAndNew[schema.CompositeType]{old: old, new: new},
+		}, compositeTypesBeingRecreated[new.GetName()], nil
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing composite types: %w", err)
 	}
 
 	tableDiffs, err := diffLists(old.Tables, new.Tables, buildTableDiff)
@@ -836,17 +836,6 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, sequenceOwnershipsPartialGraph)
 
-	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(diff.old.CompositeTypes, diff.new.CompositeTypes)
-	if err != nil {
-		return nil, fmt.Errorf("identifying composite types to recreate: %w", err)
-	}
-	compositeTypeGenerator := newCompositeTypeSQLVertexGenerator(diff.old, diff.new, compositeTypesBeingRecreated)
-	compositeTypesPartialGraph, err := generatePartialGraph(compositeTypeGenerator, diff.compositeTypeDiffs)
-	if err != nil {
-		return nil, fmt.Errorf("resolving composite type diff: %w", err)
-	}
-	partialGraph = concatPartialGraphs(partialGraph, compositeTypesPartialGraph)
-
 	domainsBeingRecreated, err := identifyDomainsToRecreate(diff.old, diff.new)
 	if err != nil {
 		return nil, fmt.Errorf("identifying domains to recreate: %w", err)
@@ -857,6 +846,17 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving domain diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, domainsPartialGraph)
+
+	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(diff.old.CompositeTypes, diff.new.CompositeTypes, domainsBeingRecreated)
+	if err != nil {
+		return nil, fmt.Errorf("identifying composite types to recreate: %w", err)
+	}
+	compositeTypeGenerator := newCompositeTypeSQLVertexGenerator(diff.old, diff.new, compositeTypesBeingRecreated)
+	compositeTypesPartialGraph, err := generatePartialGraph(compositeTypeGenerator, diff.compositeTypeDiffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving composite type diff: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, compositeTypesPartialGraph)
 
 	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName, diff.new)
 	functionsPartialGraph, err := generatePartialGraph(functionGenerator, diff.functionDiffs)
@@ -989,7 +989,7 @@ func buildSchemaObjByNameMap[S schema.Object](s []S) map[string]S {
 	})
 }
 
-func identifyCompositeTypesToRecreate(old, new []schema.CompositeType) (map[string]bool, error) {
+func identifyCompositeTypesToRecreate(old, new []schema.CompositeType, recreatedDomains map[string]bool) (map[string]bool, error) {
 	oldByName := buildSchemaObjByNameMap(old)
 	recreated := make(map[string]bool)
 
@@ -1016,9 +1016,10 @@ func identifyCompositeTypesToRecreate(old, new []schema.CompositeType) (map[stri
 			if !ok {
 				continue
 			}
-			if dependsOnAnyRecreatedType(newType.DependsOnCompositeTypes, recreated) {
+			if dependsOnAnyRecreatedType(newType.DependsOnCompositeTypes, recreated) ||
+				dependsOnAnyRecreatedDomain(newType.DependsOnDomains, recreatedDomains) {
 				if oldType.IsUsedByTable {
-					return nil, fmt.Errorf("recreating composite type %s used by a table column because one of its composite attributes changed: %w", newType.GetFQEscapedName(), ErrNotImplemented)
+					return nil, fmt.Errorf("recreating composite type %s used by a table column because one of its attribute types changed: %w", newType.GetFQEscapedName(), ErrNotImplemented)
 				}
 				recreated[newType.GetName()] = true
 				changed = true

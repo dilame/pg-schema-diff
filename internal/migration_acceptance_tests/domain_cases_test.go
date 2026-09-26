@@ -474,6 +474,78 @@ var domainAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 	},
+	{
+		name: "create a domain referenced by a composite type attribute",
+		oldSchemaDDL: []string{
+			``,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE DOMAIN purpose_code AS TEXT;
+            CREATE TYPE outbound_call AS (
+                purpose_code purpose_code,
+                attempt_no SMALLINT
+            );
+			`,
+		},
+		// The domain must exist before the composite type that is typed with it.
+		expectedPlanDDL: []string{
+			`CREATE DOMAIN "public"."purpose_code" AS text`,
+			"CREATE TYPE \"public\".\"outbound_call\" AS (\n\t\"purpose_code\" purpose_code COLLATE \"pg_catalog\".\"default\",\n\t\"attempt_no\" smallint\n)",
+		},
+	},
+	{
+		name: "drop a composite type before the domain it is typed with",
+		oldSchemaDDL: []string{
+			`
+            CREATE DOMAIN purpose_code AS TEXT;
+            CREATE TYPE outbound_call AS (
+                purpose_code purpose_code,
+                attempt_no SMALLINT
+            );
+			`,
+		},
+		newSchemaDDL: []string{
+			``,
+		},
+		// The composite type must be dropped before the domain it depends on.
+		expectedPlanDDL: []string{
+			`DROP TYPE "public"."outbound_call"`,
+			`DROP DOMAIN "public"."purpose_code"`,
+		},
+	},
+	{
+		name: "recreate a domain used by a composite type",
+		oldSchemaDDL: []string{
+			`
+            CREATE DOMAIN purpose_code AS TEXT;
+            CREATE TYPE outbound_call AS (
+                purpose_code purpose_code,
+                attempt_no SMALLINT
+            );
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE DOMAIN purpose_code AS VARCHAR(32);
+            CREATE TYPE outbound_call AS (
+                purpose_code purpose_code,
+                attempt_no SMALLINT
+            );
+			`,
+		},
+		// The composite type is re-created alongside the domain: its DROP precedes the domain's
+		// DROP, and its CREATE follows the domain's CREATE.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeHasUntrackableDependencies,
+		},
+		expectedPlanDDL: []string{
+			`DROP TYPE "public"."outbound_call"`,
+			`DROP DOMAIN "public"."purpose_code"`,
+			`CREATE DOMAIN "public"."purpose_code" AS character varying(32)`,
+			"CREATE TYPE \"public\".\"outbound_call\" AS (\n\t\"purpose_code\" purpose_code COLLATE \"pg_catalog\".\"default\",\n\t\"attempt_no\" smallint\n)",
+		},
+	},
 }
 
 func TestDomainTestCases(t *testing.T) {

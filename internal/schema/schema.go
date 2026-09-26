@@ -87,6 +87,7 @@ func (s Schema) Normalize() Schema {
 	var normCompositeTypes []CompositeType
 	for _, compositeType := range sortSchemaObjectsByName(s.CompositeTypes) {
 		compositeType.DependsOnCompositeTypes = sortSchemaObjectsByName(compositeType.DependsOnCompositeTypes)
+		compositeType.DependsOnDomains = sortSchemaObjectsByName(compositeType.DependsOnDomains)
 		normCompositeTypes = append(normCompositeTypes, compositeType)
 	}
 	s.CompositeTypes = normCompositeTypes
@@ -344,6 +345,9 @@ type CompositeType struct {
 	// DependsOnCompositeTypes is the list of user-defined composite types referenced
 	// by this composite type's attributes, including references through array types.
 	DependsOnCompositeTypes []SchemaQualifiedName
+	// DependsOnDomains is the list of domains used as the type of at least one of this
+	// composite type's attributes, including references through array types.
+	DependsOnDomains []SchemaQualifiedName
 	// IsUsedByTable is true iff at least one table column has this composite type as its
 	// declared type. When true, attribute-level changes to the type are unsupported by the
 	// diff generator (recreating the type would require rewriting every consumer table).
@@ -1337,6 +1341,14 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", e.relOid, err)
 		}
 		e.ct.DependsOnCompositeTypes = dependsOnTypes
+
+		// Attribute type dependencies (including a domain used by an attribute) are recorded
+		// against the composite type's pg_class entry, exactly like a table column's.
+		dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_class", e.relOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnDomains(%s): %w", e.relOid, err)
+		}
+		e.ct.DependsOnDomains = dependsOnDomains
 
 		consumers, err := s.q.GetCompositeTypeTableConsumers(ctx, e.typeOid)
 		if err != nil {
