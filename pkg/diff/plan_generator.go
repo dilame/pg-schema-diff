@@ -280,7 +280,7 @@ func schemaFromTempDb(ctx context.Context, db *tempdb.Database, plan *planOption
 }
 
 // clearSkippedPrivileges returns a copy of the schema with all privileges cleared that are emitted
-// as SkipValidation statements.
+// as SkipValidation statements (table, column, schema, view, routine, and default privileges).
 // This is used during plan validation because privilege statements are skipped (roles don't exist in temp DB).
 func clearSkippedPrivileges(s schema.Schema) schema.Schema {
 	s.DefaultPrivileges = nil
@@ -295,6 +295,7 @@ func clearSkippedPrivileges(s schema.Schema) schema.Schema {
 	tables := make([]schema.Table, len(s.Tables))
 	for i, t := range s.Tables {
 		t.Privileges = nil
+		t.ColumnPrivileges = nil
 		tables[i] = t
 	}
 	s.Tables = tables

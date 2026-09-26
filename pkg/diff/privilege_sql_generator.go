@@ -17,6 +17,14 @@ var (
 	}
 )
 
+// privilegeGranteeSQL returns the SQL representation of a privilege grantee. An empty grantee means PUBLIC.
+func privilegeGranteeSQL(grantee string) string {
+	if grantee == "" {
+		return "PUBLIC"
+	}
+	return schema.EscapeIdentifier(grantee)
+}
+
 type privilegeSQLVertexGenerator struct {
 	objType   string
 	objName   schema.SchemaQualifiedName
@@ -83,14 +91,7 @@ func exactRoutinePrivilegeStatements(
 }
 
 func (psg *privilegeSQLVertexGenerator) Add(p schema.Privilege) ([]Statement, error) {
-	grantee := p.Grantee
-	if grantee == "" {
-		grantee = "PUBLIC"
-	} else {
-		grantee = schema.EscapeIdentifier(grantee)
-	}
-
-	ddl := fmt.Sprintf("GRANT %s ON %s TO %s", p.Privilege, psg.sqlTarget, grantee)
+	ddl := fmt.Sprintf("GRANT %s ON %s TO %s", p.Privilege, psg.sqlTarget, privilegeGranteeSQL(p.Grantee))
 	if p.IsGrantable {
 		ddl += " WITH GRANT OPTION"
 	}
@@ -105,14 +106,7 @@ func (psg *privilegeSQLVertexGenerator) Add(p schema.Privilege) ([]Statement, er
 }
 
 func (psg *privilegeSQLVertexGenerator) Delete(p schema.Privilege) ([]Statement, error) {
-	grantee := p.Grantee
-	if grantee == "" {
-		grantee = "PUBLIC"
-	} else {
-		grantee = schema.EscapeIdentifier(grantee)
-	}
-
-	ddl := fmt.Sprintf("REVOKE %s ON %s FROM %s", p.Privilege, psg.sqlTarget, grantee)
+	ddl := fmt.Sprintf("REVOKE %s ON %s FROM %s", p.Privilege, psg.sqlTarget, privilegeGranteeSQL(p.Grantee))
 
 	return []Statement{{
 		DDL:            ddl,

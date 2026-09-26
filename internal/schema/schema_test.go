@@ -273,8 +273,12 @@ var (
 				GRANT SELECT ON TABLES TO some_role_1;
 			-- Validate database-wide default privileges are out of scope
 			ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO some_role_1;
+
+			-- Add column privileges to test they are fetched correctly
+			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
+			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "57ad162bf0653dce",
+			expectedHash: "a00568bb3dc40aca",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -388,6 +392,11 @@ var (
 						Privileges: []TablePrivilege{
 							{Grantee: "some_role_2", Privilege: "INSERT", IsGrantable: true},
 							{Grantee: "some_role_1", Privilege: "SELECT", IsGrantable: false},
+						},
+						ColumnPrivileges: []ColumnPrivilege{
+							{ColumnName: "author", Grantee: "some_role_1", Privilege: "SELECT", IsGrantable: false},
+							{ColumnName: "content", Grantee: "some_role_1", Privilege: "SELECT", IsGrantable: false},
+							{ColumnName: "content", Grantee: "some_role_2", Privilege: "UPDATE", IsGrantable: true},
 						},
 						ReplicaIdentity: ReplicaIdentityIndex,
 						RLSEnabled:      true,
@@ -666,7 +675,7 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "c8a933d063d91c8c",
+			expectedHash: "8eed7d859261cb43",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
