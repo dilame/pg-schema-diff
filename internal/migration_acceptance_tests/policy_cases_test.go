@@ -736,6 +736,33 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 	},
+	{
+		name: "Create policy whose expression calls a function created in the same plan",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id uuid);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id uuid);
+                CREATE FUNCTION current_user_id() RETURNS uuid
+                    LANGUAGE sql STABLE
+                    AS $$ SELECT '00000000-0000-0000-0000-000000000000'::uuid $$;
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (id = current_user_id());
+			`,
+		},
+		// PostgreSQL resolves the function the USING expression calls at CREATE POLICY time, so the
+		// function must come first. Applying the plan is the assertion: the wrong order would fail
+		// with `function current_user_id() does not exist`.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
 }
 
 func TestPolicyCases(t *testing.T) {
