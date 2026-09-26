@@ -631,6 +631,123 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 	},
+	{
+		name: "create a function whose argument is a table row type",
+		oldSchemaDDL: []string{
+			``,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foo(id INTEGER, name TEXT);
+            CREATE FUNCTION takes_foo(f foo) RETURNS INTEGER
+                LANGUAGE SQL
+                IMMUTABLE
+                RETURN f.id;
+			`,
+		},
+		// The table row type is resolved at CREATE time, so the table must come first.
+		expectedPlanDDL: []string{
+			"CREATE TABLE \"public\".\"foo\" (\n\t\"id\" integer,\n\t\"name\" text COLLATE \"pg_catalog\".\"default\"\n)",
+			"ALTER TABLE \"public\".\"foo\" OWNER TO \"postgres\"",
+			"CREATE OR REPLACE FUNCTION public.takes_foo(f foo)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE\nRETURN (f).id\n",
+			"ALTER FUNCTION \"public\".\"takes_foo\"(f foo) OWNER TO \"postgres\"",
+		},
+	},
+	{
+		name: "create a function whose RETURNS TABLE column is a table row type",
+		oldSchemaDDL: []string{
+			``,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foo(id INTEGER);
+            CREATE FUNCTION returns_foo()
+                RETURNS TABLE(whole foo)
+                LANGUAGE SQL
+                IMMUTABLE
+                AS $$ SELECT f FROM foo f $$;
+			`,
+		},
+		expectedPlanDDL: []string{
+			"CREATE TABLE \"public\".\"foo\" (\n\t\"id\" integer\n)",
+			"ALTER TABLE \"public\".\"foo\" OWNER TO \"postgres\"",
+			"CREATE OR REPLACE FUNCTION public.returns_foo()\n RETURNS TABLE(whole foo)\n LANGUAGE sql\n IMMUTABLE\nAS $function$ SELECT f FROM foo f $function$\n",
+			"ALTER FUNCTION \"public\".\"returns_foo\"() OWNER TO \"postgres\"",
+		},
+	},
+	{
+		name: "create a function whose argument is a view row type",
+		oldSchemaDDL: []string{
+			``,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foo(id INTEGER);
+            CREATE VIEW foo_view AS SELECT id FROM foo;
+            CREATE FUNCTION takes_view(v foo_view) RETURNS INTEGER
+                LANGUAGE SQL
+                IMMUTABLE
+                RETURN v.id;
+			`,
+		},
+		// The view's row type is resolved at CREATE time, so the view must come first.
+		expectedPlanDDL: []string{
+			"CREATE TABLE \"public\".\"foo\" (\n\t\"id\" integer\n)",
+			"ALTER TABLE \"public\".\"foo\" OWNER TO \"postgres\"",
+			"CREATE VIEW \"public\".\"foo_view\" AS\n SELECT id\n   FROM foo;",
+			"ALTER VIEW \"public\".\"foo_view\" OWNER TO \"postgres\"",
+			"CREATE OR REPLACE FUNCTION public.takes_view(v foo_view)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE\nRETURN (v).id\n",
+			"ALTER FUNCTION \"public\".\"takes_view\"(v foo_view) OWNER TO \"postgres\"",
+		},
+	},
+	{
+		name: "drop a function before the table row type it references",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foo(id INTEGER);
+            CREATE FUNCTION takes_foo(f foo) RETURNS INTEGER
+                LANGUAGE SQL
+                IMMUTABLE
+                RETURN f.id;
+			`,
+		},
+		newSchemaDDL: []string{
+			``,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeDeletesData,
+		},
+		expectedPlanDDL: []string{
+			"DROP FUNCTION \"public\".\"takes_foo\"(f foo)",
+			"DROP TABLE \"public\".\"foo\"",
+		},
+	},
+	{
+		name: "domain CHECK calling a routine does not cycle with relation ordering",
+		oldSchemaDDL: []string{
+			``,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION public.is_nonnegative(n NUMERIC) RETURNS BOOLEAN
+                LANGUAGE plpgsql
+                IMMUTABLE
+                AS $$ BEGIN RETURN n >= 0; END; $$;
+            CREATE DOMAIN positive_amount AS NUMERIC
+                CONSTRAINT positive_amount_check CHECK (public.is_nonnegative(VALUE));
+            CREATE TABLE foo(amount positive_amount);
+			`,
+		},
+		// The routine must precede the domain (the CHECK calls it) and the domain must precede the
+		// table (the column is typed with it). The routine's signature references no relation, so
+		// ordering routines after their row-type dependencies must not add a table edge that would
+		// close the cycle routine -> table -> domain -> routine. Applying the plan is the assertion:
+		// a closing edge would order the table first and fail. This is glue between #306 and the
+		// relation row-type ordering branch, so it lives here rather than in either PR.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeHasUntrackableDependencies,
+		},
+	},
 }
 
 func TestFunctionTestCases(t *testing.T) {
