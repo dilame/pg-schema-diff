@@ -371,6 +371,13 @@ SELECT
     pg_catalog.pg_get_function_identity_arguments(
         pg_proc.oid
     ) AS func_identity_arguments,
+    -- The result type is what a `CREATE OR REPLACE` cannot change: PostgreSQL
+    -- raises SQLSTATE 42P13 when the RETURNS clause differs for the same
+    -- identity arguments, so the diff needs it to decide between replacing and
+    -- recreating a function.
+    COALESCE(
+        pg_catalog.pg_get_function_result(pg_proc.oid), ''
+    )::TEXT AS func_result,
     pg_catalog.pg_get_functiondef(pg_proc.oid) AS func_def,
     COALESCE(
         pg_catalog.obj_description(pg_proc.oid, 'pg_proc'), ''

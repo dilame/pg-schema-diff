@@ -713,7 +713,13 @@ type Function struct {
 	FunctionDef string
 	// Language is the language of the function. This is relevant in determining if we
 	// can track the dependencies of the function (or not)
-	Language           string
+	Language string
+	// ResultType is the function's result type as reported by
+	// pg_get_function_result, e.g. `integer`, `SETOF integer` or `TABLE(a integer)`.
+	// `CREATE OR REPLACE FUNCTION` cannot change it, so a difference here means
+	// the function has to be dropped and re-created rather than replaced. Empty
+	// for procedures, which have no result type.
+	ResultType         string
 	DependsOnFunctions []SchemaQualifiedName
 	// Description is the comment attached to the function (pg_description). Empty means no comment.
 	Description string
@@ -2014,6 +2020,7 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 		Owner:                   rawFunction.Owner,
 		FunctionDef:             rawFunction.FuncDef,
 		Language:                rawFunction.FuncLang,
+		ResultType:              rawFunction.FuncResult,
 		DependsOnFunctions:      dependsOnFunctions,
 		Description:             rawFunction.Description,
 		DependsOnCompositeTypes: dependsOnTypes,

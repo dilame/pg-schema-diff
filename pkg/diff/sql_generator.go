@@ -386,6 +386,17 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 				listDiff[schema.Privilege, privilegeDiff]{},
 			}, true, nil
 		}
+		// The identity arguments do not include the result type, so two functions
+		// that differ only in their result are matched as one alterable object
+		// here. `CREATE OR REPLACE` cannot change a function's result type
+		// (PostgreSQL raises SQLSTATE 42P13), so such a change has to be a
+		// drop-and-recreate of the same signature.
+		if old.ResultType != new.ResultType {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
+			}, true, nil
+		}
 		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
 		if err != nil {
 			return functionDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
@@ -863,6 +874,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving function diff: %w", err)
 	}
+	functionsPartialGraph = orderFunctionDropsBeforeFunctionCreates(functionsPartialGraph, diff.functionDiffs)
 	partialGraph = concatPartialGraphs(partialGraph, functionsPartialGraph)
 
 	procedureGenerator := newProcedureSqlVertexGenerator(diff.new)

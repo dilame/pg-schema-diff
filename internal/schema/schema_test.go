@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "d54d3ee3155f07cc",
+			expectedHash: "fa9bbe0629f6276a",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -541,6 +541,7 @@ var (
 						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"function_with_dependencies\"(a integer, b integer)", SchemaName: "public"},
 						FunctionDef:         "CREATE OR REPLACE FUNCTION public.function_with_dependencies(a integer, b integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE STRICT\nRETURN (schema_filtered_1.add(a, b) + schema_1.increment(a))\n",
 						Language:            "sql",
+						ResultType:          "integer",
 						DependsOnFunctions: []SchemaQualifiedName{
 							{EscapedName: "\"add\"(a integer, b integer)", SchemaName: "schema_filtered_1"},
 							{EscapedName: "\"increment\"(i integer)", SchemaName: "schema_1"},
@@ -551,12 +552,14 @@ var (
 						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"increment\"(i integer)", SchemaName: "schema_1"},
 						FunctionDef:         "CREATE OR REPLACE FUNCTION schema_1.increment(i integer)\n RETURNS integer\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\t\tBEGIN\n\t\t\t\t\t\t\tRETURN i + 1;\n\t\t\t\t\tEND;\n\t\t\t$function$\n",
 						Language:            "plpgsql",
+						ResultType:          "integer",
 						Privileges:          defaultExecutePrivileges,
 					},
 					{
 						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
 						FunctionDef:         "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
 						Language:            "plpgsql",
+						ResultType:          "trigger",
 						Privileges:          defaultExecutePrivileges,
 					},
 				},
@@ -683,7 +686,7 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "f43e9a4a252b1c82",
+			expectedHash: "ffe354a3f769c1ca",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -973,6 +976,7 @@ var (
 						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
 						FunctionDef:         "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
 						Language:            "plpgsql",
+						ResultType:          "trigger",
 						Privileges:          defaultExecutePrivileges,
 					},
 				},

@@ -378,6 +378,38 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name: "Alter function argument list (OUT parameter renamed) drops the old signature before creating the new one",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION identity_change(a integer, OUT x integer, OUT y integer)
+                LANGUAGE SQL
+                AS $$ SELECT a, a + 1 $$;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION identity_change(a integer, OUT z integer, OUT y integer)
+                LANGUAGE SQL
+                AS $$ SELECT a, a + 1 $$;
+		`},
+	},
+	{
+		name: "Alter function result type drops the old signature before creating the new one",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION result_change(a integer) RETURNS integer
+                LANGUAGE SQL
+                IMMUTABLE
+                AS $$ SELECT a + 1 $$;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION result_change(a integer) RETURNS text
+                LANGUAGE SQL
+                IMMUTABLE
+                AS $$ SELECT (a + 1)::text $$;
+		`},
+	},
+	{
 		name: "Alter non-sql function",
 		oldSchemaDDL: []string{
 			`
