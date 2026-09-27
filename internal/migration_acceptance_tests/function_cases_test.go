@@ -415,6 +415,47 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
+		name: "Alter a string body to a SQL-standard body whose deparse is not a fixed point converges",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION pick() RETURNS TABLE(kind TEXT, id INT)
+                LANGUAGE SQL
+                AS $$ SELECT 'a'::text AS kind, foobar.id FROM foobar UNION ALL SELECT 'b', foobar.id FROM foobar $$;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION pick() RETURNS TABLE(kind TEXT, id INT)
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT 'a'::text AS kind, foobar.id FROM foobar
+                UNION ALL
+                SELECT 'b', foobar.id FROM foobar;
+            END;
+		`},
+		// Deparsing names the second UNION branch's unnamed literal (`'b'` becomes `'b'::text AS
+		// text`), so the statement the plan emits deparses to a different text than the function it
+		// was created from. The plan is applied and the harness re-plans; comparing definitions
+		// through their canonical form is what makes the re-plan empty instead of an endless
+		// CREATE OR REPLACE. The expected database names that column explicitly, the way PostgreSQL
+		// deparses it, so the dump comparison sees the same function the migration produces.
+		expectedDBSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION pick() RETURNS TABLE(kind TEXT, id INT)
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT 'a'::text AS kind, foobar.id FROM foobar
+                UNION ALL
+                SELECT 'b'::text AS text, foobar.id FROM foobar;
+            END;
+		`},
+	},
+	{
 		name:         "A SQL-standard body function whose body reads a table created in the same plan is ordered after it",
 		oldSchemaDDL: nil,
 		newSchemaDDL: []string{

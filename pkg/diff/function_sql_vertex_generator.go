@@ -74,13 +74,19 @@ func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, erro
 	// causing a false positive diff detected.
 	//
 	// Mask everything resolved by an explicit statement below — privileges, the comment and the
-	// owner. Whatever remains can only be resolved by a `CREATE OR REPLACE`.
+	// owner — and compare the definition through its canonical form, not its text: a definition
+	// read from pg_get_functiondef is not necessarily its own output (deparsing names an output
+	// column a SQL-standard body left unnamed), so comparing texts would read two databases that
+	// hold the same function as different. Whatever the canonical comparison leaves can only be
+	// resolved by a `CREATE OR REPLACE`.
 	oldMasked := diff.old
 	oldMasked.Privileges = nil
 	oldMasked.Description = diff.new.Description
 	oldMasked.Owner = diff.new.Owner
+	maskFunctionDefinition(&oldMasked.FunctionDef, &oldMasked.FunctionDefCanonical)
 	newMasked := diff.new
 	newMasked.Privileges = nil
+	maskFunctionDefinition(&newMasked.FunctionDef, &newMasked.FunctionDefCanonical)
 	replaced := !cmp.Equal(oldMasked, newMasked)
 
 	var stmts []Statement
@@ -132,6 +138,17 @@ func (f *functionSQLVertexGenerator) GetSQLVertexId(function schema.Function, di
 
 func buildFunctionVertexId(name schema.SchemaQualifiedName, diffType diffType) sqlVertexId {
 	return buildSchemaObjVertexId("function", name.GetFQEscapedName(), diffType)
+}
+
+// maskFunctionDefinition replaces a definition and its canonical form with the one value a diff
+// compares: the canonical form, or the definition itself when the schema carries none. A fetched
+// schema always carries one; a schema built in memory, which is possible only inside this module,
+// does not, and is then compared by its text as before.
+func maskFunctionDefinition(definition, canonical *string) {
+	if *canonical == "" {
+		*canonical = *definition
+	}
+	*definition = ""
 }
 
 // buildFunctionBareNameId identifies a function by its schema and name alone,
