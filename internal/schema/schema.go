@@ -720,6 +720,16 @@ type Function struct {
 	// the function, as returned by `pg_get_functiondef`. It is a CREATE OR REPLACE
 	// statement
 	FunctionDef string
+	// FunctionDefCanonical is FunctionDef rewritten to the fixed point of
+	// pg_get_functiondef: the statement PostgreSQL returns when the statement is
+	// created and read back. Two functions with the same canonical definition are
+	// the same function, and the diff compares this field rather than FunctionDef,
+	// because a definition read from pg_get_functiondef is not necessarily its own
+	// output: deparsing names an output column a definition left unnamed, so a
+	// function created from that text can deparse to a different text than the
+	// function it was created from. Without it the differ reports a difference
+	// between two databases that hold the same function.
+	FunctionDefCanonical string
 	// Language is the language of the function. This is relevant in determining if we
 	// can track the dependencies of the function (or not)
 	Language string
@@ -1226,6 +1236,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	}
 
 	views, materializedViews, err = s.canonicalizeViewDefinitions(ctx, views, materializedViews)
+	if err != nil {
+		return Schema{}, err
+	}
+
+	functions, err = s.canonicalizeFunctionDefinitions(ctx, functions)
 	if err != nil {
 		return Schema{}, err
 	}
@@ -2598,6 +2613,125 @@ func (c *viewDefinitionCanonicalizer) canonicalize(ctx context.Context, definiti
 		return "", fmt.Errorf("dropping the temporary view: %w", err)
 	}
 	return canonical, nil
+}
+
+// canonicalizeFunctionDefinitions fills FunctionDefCanonical for every function and leaves
+// FunctionDef (the statement a plan emits) alone.
+//
+// A definition read from pg_get_functiondef is not necessarily its own output: deparsing names an
+// output column that a SQL-standard body (`BEGIN ATOMIC`) left unnamed, so a function created from
+// that text can deparse to a different text than the function it was created from. A function is
+// compared by its definition, so without a canonical form the differ reports a difference between
+// two databases that hold the same function, and validation rebuilds the current schema only to
+// disagree with itself.
+//
+// The canonical form is obtained by creating the definition as a temporary function and reading the
+// definition back: one round trip through the parser and the deparser is a fixed point. The
+// temporary function keeps the routine's name and only changes its schema, because a SQL-standard
+// body can qualify its own parameters with that name (session_state.p_session_id), and renaming the
+// routine would break that reference.
+func (s *schemaFetcher) canonicalizeFunctionDefinitions(ctx context.Context, functions []Function) ([]Function, error) {
+	if len(functions) == 0 {
+		return functions, nil
+	}
+
+	conn, release, err := s.pinnedConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	// Creating the temporary function must not require the reading role to see every object a body
+	// names. The deparser runs on the parse tree regardless of the check, so turning it off changes
+	// nothing about the canonical text.
+	if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = off"); err != nil {
+		return nil, fmt.Errorf("disabling check_function_bodies for canonicalization: %w", err)
+	}
+
+	canonicalizer := &functionDefinitionCanonicalizer{q: conn}
+	for i := range functions {
+		if functions[i].FunctionDef == "" {
+			continue
+		}
+		canonical, err := canonicalizer.canonicalize(ctx, functions[i].FunctionDef)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalizing the definition of function %s: %w", functions[i].GetFQEscapedName(), err)
+		}
+		functions[i].FunctionDefCanonical = canonical
+	}
+	return functions, nil
+}
+
+// functionDefinitionCanonicalizer rewrites function definitions through a temporary function.
+type functionDefinitionCanonicalizer struct {
+	q queries.DBTX
+}
+
+func (c *functionDefinitionCanonicalizer) canonicalize(ctx context.Context, definition string) (string, error) {
+	originalQualifiedName, temporaryDefinition, err := swapFunctionSchemaToTemp(definition)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := c.q.ExecContext(ctx, temporaryDefinition); err != nil {
+		return "", fmt.Errorf("creating a temporary function from the definition: %w", err)
+	}
+
+	// The temporary function is the only one in the session's temporary schema, so it can be found
+	// without repeating its (possibly quoted) name.
+	var canonical, dropStatement string
+	if err := c.q.QueryRowContext(ctx,
+		"SELECT pg_catalog.pg_get_functiondef(proc.oid), pg_catalog.format('DROP FUNCTION %s', proc.oid::pg_catalog.regprocedure) "+
+			"FROM pg_catalog.pg_proc AS proc "+
+			"WHERE proc.pronamespace = pg_catalog.pg_my_temp_schema()").Scan(&canonical, &dropStatement); err != nil {
+		return "", fmt.Errorf("reading the definition back: %w", err)
+	}
+	if _, err := c.q.ExecContext(ctx, dropStatement); err != nil {
+		return "", fmt.Errorf("dropping the temporary function: %w", err)
+	}
+
+	// The canonical form names the temporary function; put the original name back so the field reads
+	// as the function it describes.
+	rest := canonical[len("CREATE OR REPLACE FUNCTION "):]
+	open := strings.IndexByte(rest, '(')
+	if open < 0 {
+		return "", fmt.Errorf("canonical definition has no argument list")
+	}
+	return "CREATE OR REPLACE FUNCTION " + originalQualifiedName + rest[open:], nil
+}
+
+// swapFunctionSchemaToTemp rewrites the schema qualifier of a routine definition to pg_temp, keeping
+// the routine's name, and returns the original qualified name so it can be restored afterwards.
+func swapFunctionSchemaToTemp(definition string) (originalQualifiedName, rewritten string, err error) {
+	const prefix = "CREATE OR REPLACE FUNCTION "
+	if !strings.HasPrefix(definition, prefix) {
+		return "", "", fmt.Errorf("definition does not start with %q", prefix)
+	}
+	rest := definition[len(prefix):]
+	open := strings.IndexByte(rest, '(')
+	if open < 0 {
+		return "", "", fmt.Errorf("definition has no argument list")
+	}
+	qualifiedName := rest[:open]
+	name := qualifiedName[lastTopLevelDot(qualifiedName)+1:]
+	return qualifiedName, prefix + "pg_temp." + name + rest[open:], nil
+}
+
+// lastTopLevelDot returns the index of the last '.' in a schema-qualified, possibly quoted name that
+// is not inside double quotes, or -1 when the name has no schema qualifier.
+func lastTopLevelDot(qualifiedName string) int {
+	last, inQuotes := -1, false
+	for i := 0; i < len(qualifiedName); i++ {
+		switch qualifiedName[i] {
+		case '"':
+			inQuotes = !inQuotes
+		case '.':
+			if !inQuotes {
+				last = i
+			}
+		}
+	}
+	return last
 }
 
 // parseViewJSONTableDependencies takes an slice of JSON values with schema,

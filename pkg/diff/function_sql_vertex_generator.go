@@ -74,13 +74,19 @@ func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, erro
 	// causing a false positive diff detected.
 	//
 	// Mask everything resolved by an explicit statement below — privileges, the comment and the
-	// owner. Whatever remains can only be resolved by a `CREATE OR REPLACE`.
+	// owner — and compare the definition through its canonical form, not its text: a definition
+	// read from pg_get_functiondef is not necessarily its own output (deparsing names an output
+	// column a SQL-standard body left unnamed), so comparing texts would read two databases that
+	// hold the same function as different. Whatever the canonical comparison leaves can only be
+	// resolved by a `CREATE OR REPLACE`.
 	oldMasked := diff.old
 	oldMasked.Privileges = nil
 	oldMasked.Description = diff.new.Description
 	oldMasked.Owner = diff.new.Owner
+	maskFunctionDefinition(&oldMasked.FunctionDef, &oldMasked.FunctionDefCanonical)
 	newMasked := diff.new
 	newMasked.Privileges = nil
+	maskFunctionDefinition(&newMasked.FunctionDef, &newMasked.FunctionDefCanonical)
 	replaced := !cmp.Equal(oldMasked, newMasked)
 
 	var stmts []Statement
@@ -134,6 +140,17 @@ func buildFunctionVertexId(name schema.SchemaQualifiedName, diffType diffType) s
 	return buildSchemaObjVertexId("function", name.GetFQEscapedName(), diffType)
 }
 
+// maskFunctionDefinition replaces a definition and its canonical form with the one value a diff
+// compares: the canonical form, or the definition itself when the schema carries none. A fetched
+// schema always carries one; a schema built in memory, which is possible only inside this module,
+// does not, and is then compared by its text as before.
+func maskFunctionDefinition(definition, canonical *string) {
+	if *canonical == "" {
+		*canonical = *definition
+	}
+	*definition = ""
+}
+
 // buildFunctionBareNameId identifies a function by its schema and name alone,
 // dropping the argument list that EscapedName carries. PostgreSQL matches a
 // function, and a `CREATE OR REPLACE`, by name and input argument types, so a
@@ -179,13 +196,14 @@ func (f *functionSQLVertexGenerator) GetAddAlterDependencies(newFunction, oldFun
 	for _, depFunction := range newFunction.DependsOnFunctions {
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 	}
-	// A `LANGUAGE sql` function's body used to be ordered after every table and sequence, because
-	// PostgreSQL validated the body at CREATE time and records no body reference in pg_depend. Plans
-	// now run with check_function_bodies disabled (see plan_generator.go), so that validation no
-	// longer happens, and the blanket is both unnecessary and harmful: it closes a cycle with any
-	// table that must precede the function (a policy calling it, a domain's CHECK calling it).
-	// The row type of a relation referenced by the signature — an argument type, the RETURNS
-	// type, or a RETURNS TABLE column — is resolved at CREATE time, so the relation must exist.
+	// A `LANGUAGE sql` function's body is not ordered after the relations it reads. PostgreSQL
+	// resolves those references at CREATE time but records none of them in pg_depend for a
+	// string-body function, so the plan cannot see them; a SQL-standard body (`BEGIN ATOMIC`)
+	// records them and does get ordered. A blanket "after every table and sequence" is harmful: it
+	// closes a cycle with any table that must precede the function (a policy calling it, a domain's
+	// CHECK calling it). The row type of a relation referenced by the signature — an argument type,
+	// the RETURNS type, or a RETURNS TABLE column — is resolved at CREATE time, so the relation must
+	// exist.
 	for _, relation := range newFunction.DependsOnRelations {
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(buildRelationVertexId(relation, diffTypeAddAlter)))
 	}

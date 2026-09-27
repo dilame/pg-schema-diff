@@ -28,14 +28,15 @@ var (
 
 type (
 	planOptions struct {
-		tempDbFactory           tempdb.Factory
-		dataPackNewTables       bool
-		ignoreChangesToColOrder bool
-		logger                  log.Logger
-		validatePlan            bool
-		getSchemaOpts           []schema.GetSchemaOpt
-		randReader              io.Reader
-		noConcurrentIndexOps    bool
+		tempDbFactory              tempdb.Factory
+		dataPackNewTables          bool
+		ignoreChangesToColOrder    bool
+		logger                     log.Logger
+		validatePlan               bool
+		getSchemaOpts              []schema.GetSchemaOpt
+		randReader                 io.Reader
+		noConcurrentIndexOps       bool
+		disableCheckFunctionBodies bool
 	}
 
 	PlanOpt func(opts *planOptions)
@@ -68,6 +69,16 @@ func WithRespectColumnOrder() PlanOpt {
 func WithDoNotValidatePlan() PlanOpt {
 	return func(opts *planOptions) {
 		opts.validatePlan = false
+	}
+}
+
+// WithDisableCheckFunctionBodies runs plan validation with the check_function_bodies session setting off, so
+// PostgreSQL does not resolve the references a routine's body makes at CREATE time. The default is on, which is how
+// the migration will run; use this only when the plan creates a routine whose body names an object the plan cannot
+// order before it.
+func WithDisableCheckFunctionBodies() PlanOpt {
+	return func(opts *planOptions) {
+		opts.disableCheckFunctionBodies = true
 	}
 }
 
@@ -228,7 +239,7 @@ func assertValidPlan(ctx context.Context,
 		return fmt.Errorf("inserting schema in temporary database: %w", err)
 	}
 
-	if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements); err != nil {
+	if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements, planOptions.disableCheckFunctionBodies); err != nil {
 		return fmt.Errorf("running migration plan: %w", err)
 	}
 
@@ -269,7 +280,13 @@ func setSchemaForEmptyDatabase(ctx context.Context, emptyDb *tempdb.Database, ta
 	if err != nil {
 		return fmt.Errorf("building schema diff: %w", err)
 	}
-	if err := executeStatementsIgnoreTimeouts(ctx, emptyDb.ConnPool, statements); err != nil {
+	// This reconstructs the schema that already exists in the source database, and the tool only has
+	// to reach the same state, not the same statement order. A legacy string-body routine records no
+	// reference to the relation its body reads, so its create cannot be ordered after that relation;
+	// turn the body check off here, as pg_dump does, so a source schema that still has such routines
+	// can be reconstructed. The plan itself is still applied with the caller's setting (see
+	// assertValidPlan), which is on by default.
+	if err := executeStatementsIgnoreTimeouts(ctx, emptyDb.ConnPool, statements, true); err != nil {
 		return fmt.Errorf("executing statements: %w\n%# v", err, pretty.Formatter(statements))
 	}
 	return nil
@@ -348,7 +365,7 @@ func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema schema.Schem
 
 // executeStatementsIgnoreTimeouts executes the statements using the sql connection but ignores any provided timeouts.
 // This function is currently used to validate migration plans.
-func executeStatementsIgnoreTimeouts(ctx context.Context, connPool *sql.DB, statements []Statement) error {
+func executeStatementsIgnoreTimeouts(ctx context.Context, connPool *sql.DB, statements []Statement, disableCheckFunctionBodies bool) error {
 	conn, err := connPool.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("getting connection from pool: %w", err)
@@ -360,13 +377,16 @@ func executeStatementsIgnoreTimeouts(ctx context.Context, connPool *sql.DB, stat
 		return fmt.Errorf("setting statement timeout: %w", err)
 	}
 	// PostgreSQL validates a routine's body at CREATE time (the check_function_bodies session
-	// setting), resolving references the body makes to relations, composite types, domains, and so
-	// on. It records none of those body references in pg_depend, so a plan cannot order them.
-	// Disable the check, exactly as pg_dump does when it emits `SET check_function_bodies = false`
-	// at the start of a dump: without it, a plan that creates a relation and a routine whose body
-	// names that relation's row type cannot be ordered and fails validation.
-	if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = false"); err != nil {
-		return fmt.Errorf("disabling check_function_bodies: %w", err)
+	// setting) unless it is turned off. Set it explicitly to the caller's choice rather than only
+	// turning it off: the connection comes from a pool and keeps a previous caller's setting, so a
+	// step that reconstructed a schema with the check off would otherwise leak that into the plan
+	// apply on the same connection.
+	checkFunctionBodies := "on"
+	if disableCheckFunctionBodies {
+		checkFunctionBodies = "off"
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION check_function_bodies = %s", checkFunctionBodies)); err != nil {
+		return fmt.Errorf("setting check_function_bodies: %w", err)
 	}
 	// Due to the way *sql.Db works, when a statement_timeout is set for the session, it will NOT reset
 	// by default when it's returned to the pool.
