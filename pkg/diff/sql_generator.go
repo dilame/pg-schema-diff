@@ -397,6 +397,16 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 				listDiff[schema.Privilege, privilegeDiff]{},
 			}, true, nil
 		}
+		// A SQL-standard body (`BEGIN ATOMIC`) resolves the columns it reads at CREATE time and
+		// PostgreSQL refuses to alter or drop such a column while the function exists. Re-create the
+		// function around the change; the delete dependency orders its drop before the column change
+		// and the add dependency orders its create after.
+		if functionDependsOnAlteredColumn(old, tableDiffsByName, deletedTablesByName) {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
+			}, true, nil
+		}
 		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
 		if err != nil {
 			return functionDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
@@ -1075,6 +1085,33 @@ func dependsOnAnyRecreatedDomain(deps []schema.SchemaQualifiedName, recreated ma
 	for _, dep := range deps {
 		if recreated[dep.GetName()] {
 			return true
+		}
+	}
+	return false
+}
+
+// functionDependsOnAlteredColumn reports whether the function reads a relation column that is being
+// altered or dropped (or whose relation is being re-created). `CREATE OR REPLACE FUNCTION` leaves
+// the body's column references as they are, and PostgreSQL refuses to change such a column while
+// the function exists, so the function has to be dropped before the change and created again after.
+func functionDependsOnAlteredColumn(function schema.Function, tableDiffsByName map[string]tableDiff, deletedTablesByName map[string]schema.Table) bool {
+	for _, dep := range function.DependsOnRelationColumns {
+		if _, deleted := deletedTablesByName[dep.GetName()]; deleted {
+			return true
+		}
+		td, ok := tableDiffsByName[dep.GetName()]
+		if !ok {
+			continue
+		}
+		for _, deletedColumn := range td.columnsDiff.deletes {
+			if deletedColumn.Name == dep.Column {
+				return true
+			}
+		}
+		for _, columnDiff := range td.columnsDiff.alters {
+			if columnDiff.new.Name == dep.Column && columnDiff.old.Type != columnDiff.new.Type {
+				return true
+			}
 		}
 	}
 	return false

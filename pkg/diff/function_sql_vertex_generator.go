@@ -207,9 +207,12 @@ func (f *functionSQLVertexGenerator) GetDeleteDependencies(function schema.Funct
 	for _, depFunction := range function.DependsOnFunctions {
 		deps = append(deps, mustRun(f.GetSQLVertexId(function, diffTypeDelete)).before(buildFunctionVertexId(depFunction, diffTypeDelete)))
 	}
-	// A function must be dropped before a relation its signature refers to is dropped.
+	// A function must be dropped before a relation its signature refers to is dropped, and before
+	// the relation is altered: an alteration can change the row type the signature reads, which
+	// PostgreSQL refuses while the function exists.
 	for _, relation := range function.DependsOnRelations {
 		deps = append(deps, mustRun(f.GetSQLVertexId(function, diffTypeDelete)).before(buildRelationVertexId(relation, diffTypeDelete)))
+		deps = append(deps, mustRun(f.GetSQLVertexId(function, diffTypeDelete)).before(buildRelationVertexId(relation, diffTypeAddAlter)))
 	}
 	return deps, nil
 }

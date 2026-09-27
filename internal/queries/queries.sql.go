@@ -736,6 +736,72 @@ func (q *Queries) GetDependsOnFunctions(ctx context.Context, arg GetDependsOnFun
 	return items, nil
 }
 
+const getDependsOnRelationColumns = `-- name: GetDependsOnRelationColumns :many
+SELECT DISTINCT
+    pg_class.relname::TEXT AS relation_name,
+    relation_namespace.nspname::TEXT AS relation_schema_name,
+    pg_attribute.attname::TEXT AS column_name
+FROM pg_catalog.pg_depend AS depend
+INNER JOIN
+    pg_catalog.pg_class AS pg_class
+    ON depend.refclassid = 'pg_class'::REGCLASS AND pg_class.oid = depend.refobjid
+INNER JOIN
+    pg_catalog.pg_attribute AS pg_attribute
+    ON pg_attribute.attrelid = pg_class.oid AND pg_attribute.attnum = depend.refobjsubid
+INNER JOIN
+    pg_catalog.pg_namespace AS relation_namespace
+    ON pg_class.relnamespace = relation_namespace.oid
+WHERE
+    depend.classid = $1::REGCLASS
+    AND depend.objid = $2
+    AND depend.deptype = 'n'
+    AND depend.refobjsubid > 0
+    AND pg_class.relkind IN ('r', 'p', 'v', 'm')
+    AND relation_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND relation_namespace.nspname !~ '^pg_toast'
+    AND relation_namespace.nspname !~ '^pg_temp'
+`
+
+type GetDependsOnRelationColumnsParams struct {
+	SystemCatalog interface{}
+	ObjectID      interface{}
+}
+
+type GetDependsOnRelationColumnsRow struct {
+	RelationName       string
+	RelationSchemaName string
+	ColumnName         string
+}
+
+// Returns the individual relation columns the given object depends on. PostgreSQL records a
+// reference to a column (rather than the whole relation) for a SQL-standard body (`BEGIN ATOMIC`),
+// which resolves its references at CREATE time and writes each one to pg_depend with the column's
+// attribute number. A string-body SQL function records no such reference; nor does plpgsql, whose
+// body is not resolved at CREATE time. Used to drop and re-create a function before a column it
+// reads is altered or dropped.
+func (q *Queries) GetDependsOnRelationColumns(ctx context.Context, arg GetDependsOnRelationColumnsParams) ([]GetDependsOnRelationColumnsRow, error) {
+	rows, err := q.db.QueryContext(ctx, getDependsOnRelationColumns, arg.SystemCatalog, arg.ObjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetDependsOnRelationColumnsRow
+	for rows.Next() {
+		var i GetDependsOnRelationColumnsRow
+		if err := rows.Scan(&i.RelationName, &i.RelationSchemaName, &i.ColumnName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getDependsOnRelations = `-- name: GetDependsOnRelations :many
 SELECT DISTINCT
     pg_class.relname::TEXT AS relation_name,

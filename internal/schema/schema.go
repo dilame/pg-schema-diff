@@ -703,6 +703,15 @@ type RelationDependency struct {
 	Kind RelationKind
 }
 
+// RelationColumnDependency is one relation column an object depends on. A SQL-standard body
+// (`BEGIN ATOMIC`) resolves its references at CREATE time and PostgreSQL records each one in
+// pg_depend with the column's attribute number, so the object has to be dropped before that column
+// is altered or dropped, and re-created afterwards.
+type RelationColumnDependency struct {
+	SchemaQualifiedName
+	Column string
+}
+
 type Function struct {
 	SchemaQualifiedName
 	// Owner is the role that owns the function.
@@ -735,6 +744,11 @@ type Function struct {
 	// DependsOnRelations is the list of relations whose row type is referenced by the
 	// function's signature. The function must be created after those relations exist.
 	DependsOnRelations []RelationDependency
+	// DependsOnRelationColumns is the list of relation columns a SQL-standard body
+	// (`BEGIN ATOMIC`) reads. When one of those columns is altered or dropped, the function
+	// must be dropped before the change and re-created after it. Empty for string-body SQL
+	// functions and plpgsql, whose body references pg_depend does not record.
+	DependsOnRelationColumns []RelationColumnDependency
 }
 
 type Procedure struct {
@@ -2028,19 +2042,46 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 		return Function{}, fmt.Errorf("fetchDependsOnRelations(%s): %w", rawFunction.Oid, err)
 	}
 
+	dependsOnRelationColumns, err := s.fetchDependsOnRelationColumns(ctx, "pg_proc", rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("fetchDependsOnRelationColumns(%s): %w", rawFunction.Oid, err)
+	}
+
 	return Function{
-		SchemaQualifiedName:     buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
-		Owner:                   rawFunction.Owner,
-		FunctionDef:             rawFunction.FuncDef,
-		Language:                rawFunction.FuncLang,
-		ResultType:              rawFunction.FuncResult,
-		DependsOnFunctions:      dependsOnFunctions,
-		Description:             rawFunction.Description,
-		DependsOnCompositeTypes: dependsOnTypes,
-		DependsOnDomains:        dependsOnDomains,
-		Privileges:              privileges,
-		DependsOnRelations:      dependsOnRelations,
+		SchemaQualifiedName:      buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
+		Owner:                    rawFunction.Owner,
+		FunctionDef:              rawFunction.FuncDef,
+		Language:                 rawFunction.FuncLang,
+		ResultType:               rawFunction.FuncResult,
+		DependsOnFunctions:       dependsOnFunctions,
+		Description:              rawFunction.Description,
+		DependsOnCompositeTypes:  dependsOnTypes,
+		DependsOnDomains:         dependsOnDomains,
+		Privileges:               privileges,
+		DependsOnRelations:       dependsOnRelations,
+		DependsOnRelationColumns: dependsOnRelationColumns,
 	}, nil
+}
+
+// fetchDependsOnRelationColumns returns the relation columns the given object references, one entry
+// per (relation, column) pair. Only a SQL-standard body records those references, so the list is
+// empty for a string-body SQL function and for plpgsql.
+func (s *schemaFetcher) fetchDependsOnRelationColumns(ctx context.Context, systemCatalog string, oid any) ([]RelationColumnDependency, error) {
+	rows, err := s.q.GetDependsOnRelationColumns(ctx, queries.GetDependsOnRelationColumnsParams{
+		SystemCatalog: systemCatalog,
+		ObjectID:      oid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var dependsOnColumns []RelationColumnDependency
+	for _, row := range rows {
+		dependsOnColumns = append(dependsOnColumns, RelationColumnDependency{
+			SchemaQualifiedName: buildNameFromUnescaped(row.RelationName, row.RelationSchemaName),
+			Column:              row.ColumnName,
+		})
+	}
+	return dependsOnColumns, nil
 }
 
 func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
