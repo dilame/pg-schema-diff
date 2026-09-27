@@ -673,9 +673,8 @@ type (
 	}
 )
 
-// RelationKind is the pg_class.relkind of a relation whose row type is referenced by a routine's
-// signature. Only relation kinds that own a row type usable as a column/argument/return type are
-// modelled.
+// RelationKind is the pg_class.relkind of a relation that another schema object references — by
+// row type (a routine's signature) or by reading it (a view or materialized view).
 type RelationKind string
 
 const (
@@ -688,6 +687,12 @@ const (
 	// RelationKindMaterializedView is a materialized view.
 	RelationKindMaterializedView RelationKind = "m"
 )
+
+// IsTable reports whether the relation is a table (ordinary or partitioned), i.e., a relation whose
+// columns the schema models per column.
+func (k RelationKind) IsTable() bool {
+	return k == RelationKindTable || k == RelationKindPartitionedTable
+}
 
 // RelationDependency is a relation whose row type is referenced by a routine's signature — an
 // argument type, the RETURNS type, or a RETURNS TABLE column. PostgreSQL validates those references
@@ -809,9 +814,13 @@ func (t Trigger) GetName() string {
 	return t.OwningTable.GetFQEscapedName() + "-" + t.EscapedName
 }
 
-// TableDependency represents a (view's) dependency on a table.
 type TableDependency struct {
 	SchemaQualifiedName
+	// Kind is the dependency's pg_class.relkind. A view or materialized view reads tables, views,
+	// and materialized views alike; the kind says which generator owns the dependency's statement.
+	Kind RelationKind
+	// Columns are the dependency's columns that the view reads. Empty for a non-table dependency,
+	// whose columns are not tracked per column.
 	Columns []string
 }
 
@@ -2382,6 +2391,7 @@ func parseJSONTableDependencies(vals []string) ([]TableDependency, error) {
 		var s struct {
 			Schema  string   `json:"schema"`
 			Name    string   `json:"name"`
+			Kind    string   `json:"kind"`
 			Columns []string `json:"columns"`
 		}
 		if err := json.Unmarshal([]byte(v), &s); err != nil {
@@ -2389,6 +2399,7 @@ func parseJSONTableDependencies(vals []string) ([]TableDependency, error) {
 		}
 		out = append(out, TableDependency{
 			SchemaQualifiedName: buildNameFromUnescaped(s.Name, s.Schema),
+			Kind:                RelationKind(s.Kind),
 			Columns:             s.Columns,
 		})
 	}

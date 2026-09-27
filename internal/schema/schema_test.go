@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "f6b3adc13769fa40",
+			expectedHash: "57f0f3adf9ac59b",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -600,10 +600,12 @@ var (
 						TableDependencies: []TableDependency{
 							{
 								SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: `"foo_fk"`},
+								Kind:                RelationKindTable,
 								Columns:             []string{"id"},
 							},
 							{
 								SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: `"foo"`},
+								Kind:                RelationKindTable,
 								Columns:             []string{"author", "id"},
 							},
 						},

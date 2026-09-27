@@ -39,6 +39,11 @@ func buildViewDiff(
 	// - For some table X, it is currently not possible to create a SQL statement outside the table sql generator
 	// that comes before a column Y's delete statement but after a column Z's add statement.
 	for _, t := range old.TableDependencies {
+		if !t.Kind.IsTable() {
+			// A view reads other views and materialized views too, but only a table's columns are
+			// modelled per column, and a non-table dependency's recreation is not cascaded yet.
+			continue
+		}
 		if _, ok := deletedTablesByName[t.GetName()]; ok {
 			// Recreate if a dependent table was deleted (or recreated).
 			return viewDiff{}, true, nil
@@ -131,10 +136,10 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 	// Run after re-create (if recreated).
 	deps = append(deps, mustRun(addVertexId).after(buildViewVertexId(v.SchemaQualifiedName, diffTypeDelete)))
 
-	// Run after any dependent tables are added/altered.
+	// Run after any dependent relations are added/altered.
 	for _, t := range v.TableDependencies {
-		deps = append(deps, mustRun(addVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(addVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		deps = append(deps, mustRun(addVertexId).after(buildDependencyVertexId(t, diffTypeDelete)))
+		deps = append(deps, mustRun(addVertexId).after(buildDependencyVertexId(t, diffTypeAddAlter)))
 	}
 
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("VIEW", v.SchemaQualifiedName), v.Owner)...)
@@ -156,8 +161,8 @@ func (vsg *viewSQLGenerator) Delete(v schema.View) (partialSQLGraph, error) {
 	// Run before any dependent tables are deleted or added/altered.
 	var deps []dependency
 	for _, t := range v.TableDependencies {
-		deps = append(deps, mustRun(deleteVertexId).before(buildTableVertexId(t.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(deleteVertexId).before(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		deps = append(deps, mustRun(deleteVertexId).before(buildDependencyVertexId(t, diffTypeDelete)))
+		deps = append(deps, mustRun(deleteVertexId).before(buildDependencyVertexId(t, diffTypeAddAlter)))
 	}
 
 	return partialSQLGraph{
