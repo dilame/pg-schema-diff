@@ -183,12 +183,20 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 	// Mask Privileges (handled by the privilege generator below), Description and Owner (handled
 	// by explicit COMMENT / OWNER TO statements) so the structural-equality check below only
 	// triggers ErrNotImplemented when something we cannot alter changed.
+	//
+	// The definition is compared through its canonical form, not through its
+	// text: a view holds whatever pg_get_viewdef returned for it, and that text is
+	// not necessarily its own output, so two databases can hold the same view
+	// under two texts. Text equality would read that as a change and re-create the
+	// view, whose new text would differ again from the one it was created from.
 	oldMasked := vd.old
 	oldMasked.Privileges = nil
 	oldMasked.Description = vd.new.Description
 	oldMasked.Owner = vd.new.Owner
+	maskViewDefinition(&oldMasked.ViewDefinition, &oldMasked.ViewDefinitionCanonical)
 	newMasked := vd.new
 	newMasked.Privileges = nil
+	maskViewDefinition(&newMasked.ViewDefinition, &newMasked.ViewDefinitionCanonical)
 
 	if !cmp.Equal(oldMasked, newMasked) {
 		return partialSQLGraph{}, ErrNotImplemented
@@ -211,6 +219,18 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 	}
 
 	return privilegesPartialGraph, nil
+}
+
+// maskViewDefinition replaces a definition and its canonical form with the one
+// value a diff compares: the canonical form, or the definition itself when the
+// schema carries none. A fetched schema always carries one; a schema built in
+// memory, which is possible only inside this module, does not, and is then
+// compared by its text as before.
+func maskViewDefinition(definition, canonical *string) {
+	if *canonical == "" {
+		*canonical = *definition
+	}
+	*definition = ""
 }
 
 func buildViewVertexId(n schema.SchemaQualifiedName, d diffType) sqlVertexId {

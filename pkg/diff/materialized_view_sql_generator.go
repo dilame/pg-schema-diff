@@ -166,10 +166,16 @@ func (mvsg *materializedViewSQLGenerator) Delete(mv schema.MaterializedView) (pa
 
 func (mvsg *materializedViewSQLGenerator) Alter(mvd materializedViewDiff) (partialSQLGraph, error) {
 	// Mask Description and Owner: both are altered via explicit statements below.
+	//
+	// The definition is compared through its canonical form; see
+	// viewSQLGenerator.Alter.
 	oldCopy := mvd.old
 	oldCopy.Description = mvd.new.Description
 	oldCopy.Owner = mvd.new.Owner
-	if !cmp.Equal(oldCopy, mvd.new) {
+	maskViewDefinition(&oldCopy.ViewDefinition, &oldCopy.ViewDefinitionCanonical)
+	newCopy := mvd.new
+	maskViewDefinition(&newCopy.ViewDefinition, &newCopy.ViewDefinitionCanonical)
+	if !cmp.Equal(oldCopy, newCopy) {
 		// In the initial MVP, we don't support altering anything other than the comment and the owner.
 		return partialSQLGraph{}, ErrNotImplemented
 	}

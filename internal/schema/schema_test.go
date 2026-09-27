@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "784961f96bbad6ce",
+			expectedHash: "d54d3ee3155f07cc",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -598,7 +598,8 @@ var (
 							SchemaName:  "schema_2",
 							EscapedName: "\"foo_view\"",
 						},
-						ViewDefinition: " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
+						ViewDefinition:          " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
+						ViewDefinitionCanonical: " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
 						Options: map[string]string{
 							"security_barrier": "true",
 						},
