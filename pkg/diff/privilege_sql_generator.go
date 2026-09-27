@@ -31,8 +31,11 @@ type privilegeSQLVertexGenerator struct {
 	sqlTarget string
 }
 
+// tablePrivilegeObjType is the vertex id prefix of a privilege on a relation.
+const tablePrivilegeObjType = "privilege"
+
 func newPrivilegeSQLVertexGenerator(tableName schema.SchemaQualifiedName) sqlVertexGenerator[schema.TablePrivilege, privilegeDiff] {
-	return newPrivilegeSQLVertexGeneratorForObject("privilege", tableName, tableName.GetFQEscapedName())
+	return newPrivilegeSQLVertexGeneratorForObject(tablePrivilegeObjType, tableName, tableName.GetFQEscapedName())
 }
 
 func newPrivilegeSQLVertexGeneratorForObject(
@@ -126,7 +129,22 @@ func (psg *privilegeSQLVertexGenerator) Alter(diff privilegeDiff) ([]Statement, 
 }
 
 func (psg *privilegeSQLVertexGenerator) GetSQLVertexId(p schema.Privilege, diffType diffType) sqlVertexId {
-	return buildSchemaObjVertexId(psg.objType, fmt.Sprintf("%s.%s", psg.objName.GetFQEscapedName(), p.GetName()), diffType)
+	return privilegeSQLVertexId(psg.objType, psg.objName, p, diffType)
+}
+
+// privilegeSQLVertexId names the vertex that carries the statements for one
+// privilege. A generator that has to order its own statements against a
+// privilege on another object builds the same id through this.
+func privilegeSQLVertexId(objType string, objName schema.SchemaQualifiedName, p schema.Privilege, d diffType) sqlVertexId {
+	return buildSchemaObjVertexId(objType, fmt.Sprintf("%s.%s", objName.GetFQEscapedName(), p.GetName()), d)
+}
+
+// tablePrivilegeRevokeVertexId names the vertex that carries the REVOKE of one
+// privilege on a table. A table-level REVOKE removes that privilege from every
+// column that holds it, so a column grant of the same privilege has to run after
+// this vertex.
+func tablePrivilegeRevokeVertexId(table schema.SchemaQualifiedName, p schema.Privilege) sqlVertexId {
+	return privilegeSQLVertexId(tablePrivilegeObjType, table, p, diffTypeDelete)
 }
 
 func (psg *privilegeSQLVertexGenerator) GetAddAlterDependencies(newPriv, _ schema.Privilege) ([]dependency, error) {

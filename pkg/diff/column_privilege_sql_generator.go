@@ -67,11 +67,19 @@ func (cpg *columnPrivilegeSQLVertexGenerator) GetSQLVertexId(p schema.ColumnPriv
 }
 
 func (cpg *columnPrivilegeSQLVertexGenerator) GetAddAlterDependencies(newPriv, _ schema.ColumnPrivilege) ([]dependency, error) {
+	grantVertex := cpg.GetSQLVertexId(newPriv, diffTypeAddAlter)
 	return []dependency{
 		// Ensure delete runs before add/alter (for recreate scenarios)
-		mustRun(cpg.GetSQLVertexId(newPriv, diffTypeDelete)).before(cpg.GetSQLVertexId(newPriv, diffTypeAddAlter)),
+		mustRun(cpg.GetSQLVertexId(newPriv, diffTypeDelete)).before(grantVertex),
 		// The column must exist before a privilege can be granted on it
-		mustRun(buildColumnVertexId(newPriv.ColumnName, diffTypeAddAlter)).before(cpg.GetSQLVertexId(newPriv, diffTypeAddAlter)),
+		mustRun(buildColumnVertexId(newPriv.ColumnName, diffTypeAddAlter)).before(grantVertex),
+		// A REVOKE of the privilege on the whole table takes it away from every
+		// column that holds it. Priorities alone put this grant first (a grant
+		// runs sooner, a revoke later) and the revoke then silently removes it.
+		mustRun(tablePrivilegeRevokeVertexId(cpg.tableName, schema.Privilege{
+			Grantee:   newPriv.Grantee,
+			Privilege: newPriv.Privilege,
+		})).before(grantVertex),
 	}, nil
 }
 

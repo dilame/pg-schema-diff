@@ -224,6 +224,32 @@ var columnPrivilegeAcceptanceTestCases = []acceptanceTestCase{
 		},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
 	},
+	{
+		name:  "Replace a table privilege with the same privilege on a column",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+				CREATE TABLE foobar(id INT, data TEXT);
+				GRANT SELECT ON foobar TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+				CREATE TABLE foobar(id INT, data TEXT);
+				GRANT SELECT (data) ON foobar TO app_user;
+			`,
+		},
+		// The REVOKE of the table privilege has to come first: revoking a
+		// privilege on the table removes it from every column that holds it, so
+		// the column grant emitted after it would be taken away silently.
+		expectedPlanDDL: []string{
+			`REVOKE SELECT ON "public"."foobar" FROM "app_user"`,
+			`GRANT SELECT ("data") ON "public"."foobar" TO "app_user"`,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
 }
 
 func TestColumnPrivilegeCases(t *testing.T) {
