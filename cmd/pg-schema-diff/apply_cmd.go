@@ -80,7 +80,7 @@ func buildApplyCmd() *cobra.Command {
 			}
 		}
 
-		if err := runPlan(cmd.Context(), cmd, connConfig, plan); err != nil {
+		if err := runPlan(cmd.Context(), cmd, connConfig, plan, planOptsFlags.disableCheckFunctionBodies); err != nil {
 			return err
 		}
 		cmdPrintln(cmd, "Schema applied successfully")
@@ -120,7 +120,7 @@ func failIfHazardsNotAllowed(plan diff.Plan, allowedHazardsTypesStrs []string) e
 	return nil
 }
 
-func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig, plan diff.Plan) error {
+func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig, plan diff.Plan, disableCheckFunctionBodies bool) error {
 	connPool, err := openDbWithPgxConfig(connConfig)
 	if err != nil {
 		return err
@@ -133,12 +133,14 @@ func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig
 	}
 	defer conn.Close()
 
-	// PostgreSQL validates a routine's body at CREATE time, resolving references the body makes to
-	// relations and types. None of those body references are recorded in pg_depend, so a plan cannot
-	// order them; disable the check for the session, as pg_dump does when it emits
-	// `SET check_function_bodies = false` at the start of a dump.
-	if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = false"); err != nil {
-		return fmt.Errorf("disabling check_function_bodies: %w", err)
+	// PostgreSQL validates a routine's body at CREATE time unless the check is turned off. The
+	// default leaves it on, so the migration runs the way the plan was validated. Turn it off only
+	// when the caller asks, for a plan whose routine body names an object the plan cannot order
+	// before it.
+	if disableCheckFunctionBodies {
+		if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = false"); err != nil {
+			return fmt.Errorf("disabling check_function_bodies: %w", err)
+		}
 	}
 
 	// Due to the way *sql.Db works, when a statement_timeout is set for the session, it will NOT reset

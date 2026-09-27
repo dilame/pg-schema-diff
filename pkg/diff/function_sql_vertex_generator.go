@@ -179,13 +179,14 @@ func (f *functionSQLVertexGenerator) GetAddAlterDependencies(newFunction, oldFun
 	for _, depFunction := range newFunction.DependsOnFunctions {
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 	}
-	// A `LANGUAGE sql` function's body used to be ordered after every table and sequence, because
-	// PostgreSQL validated the body at CREATE time and records no body reference in pg_depend. Plans
-	// now run with check_function_bodies disabled (see plan_generator.go), so that validation no
-	// longer happens, and the blanket is both unnecessary and harmful: it closes a cycle with any
-	// table that must precede the function (a policy calling it, a domain's CHECK calling it).
-	// The row type of a relation referenced by the signature — an argument type, the RETURNS
-	// type, or a RETURNS TABLE column — is resolved at CREATE time, so the relation must exist.
+	// A `LANGUAGE sql` function's body is not ordered after the relations it reads. PostgreSQL
+	// resolves those references at CREATE time but records none of them in pg_depend for a
+	// string-body function, so the plan cannot see them; a SQL-standard body (`BEGIN ATOMIC`)
+	// records them and does get ordered. A blanket "after every table and sequence" is harmful: it
+	// closes a cycle with any table that must precede the function (a policy calling it, a domain's
+	// CHECK calling it). The row type of a relation referenced by the signature — an argument type,
+	// the RETURNS type, or a RETURNS TABLE column — is resolved at CREATE time, so the relation must
+	// exist.
 	for _, relation := range newFunction.DependsOnRelations {
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(buildRelationVertexId(relation, diffTypeAddAlter)))
 	}

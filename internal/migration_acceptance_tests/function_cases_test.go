@@ -73,7 +73,7 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
-		name:         "Create sql function after table referenced by body",
+		name:         "Create sql function whose body references a table created in the same plan fails validation",
 		oldSchemaDDL: nil,
 		newSchemaDDL: []string{
 			`
@@ -85,6 +85,11 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 			AS $$ INSERT INTO app.dead_letter(id) VALUES (1) $$;
 			`,
 		},
+		// PostgreSQL resolves the body at CREATE time, and a string-body function records no
+		// reference to the relation it reads, so the plan cannot order the function after the table.
+		// With the body check on (the default) the plan is rejected rather than applied in the wrong
+		// order; a SQL-standard body records the reference and orders correctly.
+		expectedPlanErrorContains: "does not exist",
 	},
 	{
 		name:         "Create functions with quoted names (with conflicting names)",
@@ -407,6 +412,20 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
                 LANGUAGE SQL
                 IMMUTABLE
                 AS $$ SELECT (a + 1)::text $$;
+		`},
+	},
+	{
+		name:         "A SQL-standard body function whose body reads a table created in the same plan is ordered after it",
+		oldSchemaDDL: nil,
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION row_count() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE id > 0;
+            END;
 		`},
 	},
 	{
@@ -779,9 +798,13 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
                 $$;
 			`,
 		},
-		// A routine body's reference to a relation's row type is resolved at CREATE time but is not
-		// recorded in pg_depend, so the plan cannot order it. Like pg_dump, the plan is applied with
-		// check_function_bodies disabled, so the function may precede the table it names in its body.
+		// plpgsql resolves a body variable declared as a relation's row type at CREATE time, and that
+		// reference is not recorded in pg_depend, so the plan cannot order the function after the
+		// table. Turn the body check off for this plan, the way pg_dump does, so it is applied rather
+		// than rejected; the default is to check.
+		planOpts: []diff.PlanOpt{
+			diff.WithDisableCheckFunctionBodies(),
+		},
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeHasUntrackableDependencies,
 		},
