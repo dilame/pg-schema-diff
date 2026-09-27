@@ -293,6 +293,81 @@ func buildPolicyVertexId(owningTable schema.SchemaQualifiedName, policyEscapedNa
 	return buildSchemaObjVertexId("policy", fmt.Sprintf("%s.%s", owningTable.GetFQEscapedName(), policyEscapedName), diffType)
 }
 
+// newTablePoliciesSQLVertexGenerator emits, for tables being created, their policies as a vertex
+// separate from the table's own.
+//
+// A policy expression can call a function whose SQL-standard body reads the policy's table. The
+// real order is table → function → policy, which is acyclic, but a policy created inside the
+// table's vertex makes it table → function (a policy calls it) and function → table (its body
+// reads the table), which the topological sort rejects as a cycle.
+type newTablePoliciesSQLVertexGenerator struct{}
+
+func newNewTablePoliciesSQLVertexGenerator() *newTablePoliciesSQLVertexGenerator {
+	return &newTablePoliciesSQLVertexGenerator{}
+}
+
+// AddAll returns one policy vertex per new table that has policies.
+func (g *newTablePoliciesSQLVertexGenerator) AddAll(tables []schema.Table) (partialSQLGraph, error) {
+	var graph partialSQLGraph
+	for _, table := range tables {
+		tableGraph, err := g.add(table)
+		if err != nil {
+			return partialSQLGraph{}, err
+		}
+		graph = concatPartialGraphs(graph, tableGraph)
+	}
+	return graph, nil
+}
+
+func (g *newTablePoliciesSQLVertexGenerator) add(table schema.Table) (partialSQLGraph, error) {
+	if len(table.Policies) == 0 {
+		return partialSQLGraph{}, nil
+	}
+	policyGenerator, err := newPolicySQLVertexGenerator(nil, table)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("creating policy sql vertex generator: %w", err)
+	}
+	var stmts []Statement
+	for _, policy := range table.Policies {
+		addPolicyPartialGraph, err := policyGenerator.Add(policy)
+		if err != nil {
+			return partialSQLGraph{}, fmt.Errorf("generating add policy statements for policy %s: %w", policy.EscapedName, err)
+		}
+		// Remove hazards from statements since the table is brand new
+		stmts = append(stmts, stripMigrationHazards(addPolicyPartialGraph.statements()...)...)
+	}
+
+	vertexId := buildTablePoliciesVertexId(table.SchemaQualifiedName)
+	// The table must exist first, and its policies are resolved against the functions they call.
+	deps := []dependency{
+		mustRun(vertexId).after(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)),
+	}
+	for _, policy := range table.Policies {
+		for _, depFunction := range policy.DependsOnFunctions {
+			deps = append(deps, mustRun(vertexId).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
+		}
+		for _, depRelation := range policy.DependsOnRelations {
+			if depRelation.GetName() == table.SchemaQualifiedName.GetName() {
+				continue
+			}
+			deps = append(deps, mustRun(vertexId).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
+		}
+	}
+
+	return partialSQLGraph{
+		vertices: []sqlVertex{{
+			id:         vertexId,
+			priority:   sqlPrioritySooner,
+			statements: stmts,
+		}},
+		dependencies: deps,
+	}, nil
+}
+
+func buildTablePoliciesVertexId(tableName schema.SchemaQualifiedName) sqlVertexId {
+	return buildSchemaObjVertexId("table_policies", tableName.GetFQEscapedName(), diffTypeAddAlter)
+}
+
 func (psg *policySQLVertexGenerator) GetAddAlterDependencies(newPolicy, oldPolicy schema.Policy) ([]dependency, error) {
 	deps := []dependency{
 		mustRun(psg.GetSQLVertexId(newPolicy, diffTypeDelete)).before(psg.GetSQLVertexId(newPolicy, diffTypeAddAlter)),

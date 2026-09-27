@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/google/go-cmp/cmp"
@@ -98,23 +99,8 @@ func newViewSQLVertexGenerator() sqlVertexGenerator[schema.View, viewDiff] {
 }
 
 func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
-	viewSb := strings.Builder{}
-	viewSb.WriteString(fmt.Sprintf("CREATE VIEW %s", v.GetFQEscapedName()))
-	if len(v.Options) > 0 {
-		var kvs []string
-		for k, v := range v.Options {
-			kvs = append(kvs, fmt.Sprintf("%s=%s", k, v))
-		}
-		// Sort kvs so the generated DDL is deterministic. This is unnecessarily verbose because the slices
-		// package is not yet available.
-		slices.Sort(kvs)
-		viewSb.WriteString(fmt.Sprintf(" WITH (%s)", strings.Join(kvs, ", ")))
-	}
-	viewSb.WriteString(" AS\n")
-	viewSb.WriteString(v.ViewDefinition)
-
 	stmts := []Statement{{
-		DDL:         viewSb.String(),
+		DDL:         buildViewDefinitionDDL(v, false),
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}
@@ -181,8 +167,9 @@ func (vsg *viewSQLGenerator) Delete(v schema.View) (partialSQLGraph, error) {
 
 func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 	// Mask Privileges (handled by the privilege generator below), Description and Owner (handled
-	// by explicit COMMENT / OWNER TO statements) so the structural-equality check below only
-	// triggers ErrNotImplemented when something we cannot alter changed.
+	// by explicit COMMENT / OWNER TO statements) and the output columns (they follow from the
+	// definition) so the structural-equality check below only triggers ErrNotImplemented when
+	// something we cannot alter with a statement here changed.
 	//
 	// The definition is compared through its canonical form, not through its
 	// text: a view holds whatever pg_get_viewdef returned for it, and that text is
@@ -193,12 +180,28 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 	oldMasked.Privileges = nil
 	oldMasked.Description = vd.new.Description
 	oldMasked.Owner = vd.new.Owner
+	oldMasked.Columns = nil
 	maskViewDefinition(&oldMasked.ViewDefinition, &oldMasked.ViewDefinitionCanonical)
 	newMasked := vd.new
 	newMasked.Privileges = nil
+	newMasked.Columns = nil
 	maskViewDefinition(&newMasked.ViewDefinition, &newMasked.ViewDefinitionCanonical)
 
-	if !cmp.Equal(oldMasked, newMasked) {
+	// Everything but the definition has to be resolvable by the explicit statements below; an
+	// option change, for instance, has no statement here and forces a recreation.
+	oldWithoutDefinition := oldMasked
+	oldWithoutDefinition.ViewDefinitionCanonical = ""
+	newWithoutDefinition := newMasked
+	newWithoutDefinition.ViewDefinitionCanonical = ""
+	if !cmp.Equal(oldWithoutDefinition, newWithoutDefinition) {
+		return partialSQLGraph{}, ErrNotImplemented
+	}
+
+	definitionChanged := oldMasked.ViewDefinitionCanonical != newMasked.ViewDefinitionCanonical
+	if definitionChanged && !viewColumnsCompatible(vd.old.Columns, vd.new.Columns) {
+		// Replacing the view in place is allowed only while every existing output column keeps its
+		// name and type, in order. A removed, reordered, or retyped column needs a drop and a
+		// re-create (and a re-create of the views that read this one).
 		return partialSQLGraph{}, ErrNotImplemented
 	}
 
@@ -208,17 +211,68 @@ func (vsg *viewSQLGenerator) Alter(vd viewDiff) (partialSQLGraph, error) {
 		return partialSQLGraph{}, fmt.Errorf("resolving privilege sql: %w", err)
 	}
 
-	metadataStmts := ownerDDLForAlter(ownershipTarget("VIEW", vd.new.SchemaQualifiedName), vd.old.Owner, vd.new.Owner)
-	metadataStmts = append(metadataStmts, commentDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Description, vd.new.Description)...)
-	if len(metadataStmts) > 0 {
+	var stmts []Statement
+	if definitionChanged {
+		// A definition change that keeps the output columns is replaced in place. A drop-and-create
+		// would fail outright whenever an unchanged view reads this one.
+		stmts = append(stmts, Statement{
+			DDL:         buildViewDefinitionDDL(vd.new, true),
+			Timeout:     statementTimeoutDefault,
+			LockTimeout: lockTimeoutDefault,
+		})
+	}
+	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("VIEW", vd.new.SchemaQualifiedName), vd.old.Owner, vd.new.Owner)...)
+	stmts = append(stmts, commentDDLForAlter(commentTargetView(vd.new.SchemaQualifiedName), vd.old.Description, vd.new.Description)...)
+	if len(stmts) > 0 {
 		privilegesPartialGraph.vertices = append(privilegesPartialGraph.vertices, sqlVertex{
 			id:         buildTableVertexId(vd.new.SchemaQualifiedName, diffTypeAddAlter),
 			priority:   sqlPrioritySooner,
-			statements: metadataStmts,
+			statements: stmts,
 		})
 	}
 
 	return privilegesPartialGraph, nil
+}
+
+// buildViewDefinitionDDL renders the statement that creates a view from its definition. A plain
+// create is used for a new view; `CREATE OR REPLACE` replaces an existing one whose output columns
+// are compatible (see viewColumnsCompatible).
+func buildViewDefinitionDDL(v schema.View, orReplace bool) string {
+	sb := strings.Builder{}
+	if orReplace {
+		sb.WriteString("CREATE OR REPLACE VIEW ")
+	} else {
+		sb.WriteString("CREATE VIEW ")
+	}
+	sb.WriteString(v.GetFQEscapedName())
+	if len(v.Options) > 0 {
+		var kvs []string
+		for k, val := range v.Options {
+			kvs = append(kvs, fmt.Sprintf("%s=%s", k, val))
+		}
+		// Sort kvs so the generated DDL is deterministic.
+		slices.Sort(kvs)
+		sb.WriteString(fmt.Sprintf(" WITH (%s)", strings.Join(kvs, ", ")))
+	}
+	sb.WriteString(" AS\n")
+	sb.WriteString(v.ViewDefinition)
+	return sb.String()
+}
+
+// viewColumnsCompatible reports whether `CREATE OR REPLACE VIEW` can replace a view with the old
+// output columns by one with the new ones. PostgreSQL allows it while every existing column keeps
+// its name and type, in order, with new columns appended; anything else — a removed, reordered, or
+// retyped column — is rejected.
+func viewColumnsCompatible(oldColumns, newColumns []schema.ViewColumn) bool {
+	if len(newColumns) < len(oldColumns) {
+		return false
+	}
+	for i, oldColumn := range oldColumns {
+		if newColumns[i] != oldColumn {
+			return false
+		}
+	}
+	return true
 }
 
 // maskViewDefinition replaces a definition and its canonical form with the one
@@ -235,4 +289,78 @@ func maskViewDefinition(definition, canonical *string) {
 
 func buildViewVertexId(n schema.SchemaQualifiedName, d diffType) sqlVertexId {
 	return buildSchemaObjVertexId("view", n.GetFQEscapedName(), d)
+}
+
+// cascadeRecreatedRelationViews re-creates every view and materialized view that reads a view or
+// materialized view already being re-created. A re-created view is dropped and created again, and
+// PostgreSQL refuses the drop while a dependent still reads it, so the dependent has to be dropped
+// first and created again afterwards. The view and materialized view SQL generators already order a
+// dependent's drop before, and its create after, the relation it reads; this only has to mark the
+// dependents for re-creation, transitively (a view that reads a view that reads the re-created one).
+func cascadeRecreatedRelationViews(
+	viewDiffs listDiff[schema.View, viewDiff],
+	materializedViewDiffs listDiff[schema.MaterializedView, materializedViewDiff],
+) (listDiff[schema.View, viewDiff], listDiff[schema.MaterializedView, materializedViewDiff]) {
+	recreated := make(map[string]bool)
+	for _, v := range viewDiffs.deletes {
+		recreated[v.GetName()] = true
+	}
+	for _, mv := range materializedViewDiffs.deletes {
+		recreated[mv.GetName()] = true
+	}
+
+	for {
+		progressed := false
+
+		var remainingViewAlters []viewDiff
+		for _, alter := range viewDiffs.alters {
+			if readsRecreatedRelation(alter.old.TableDependencies, recreated) {
+				viewDiffs.deletes = append(viewDiffs.deletes, alter.old)
+				viewDiffs.adds = append(viewDiffs.adds, alter.new)
+				recreated[alter.new.GetName()] = true
+				progressed = true
+				continue
+			}
+			remainingViewAlters = append(remainingViewAlters, alter)
+		}
+		viewDiffs.alters = remainingViewAlters
+
+		var remainingMaterializedViewAlters []materializedViewDiff
+		for _, alter := range materializedViewDiffs.alters {
+			if readsRecreatedRelation(alter.old.TableDependencies, recreated) {
+				materializedViewDiffs.deletes = append(materializedViewDiffs.deletes, alter.old)
+				materializedViewDiffs.adds = append(materializedViewDiffs.adds, alter.new)
+				recreated[alter.new.GetName()] = true
+				progressed = true
+				continue
+			}
+			remainingMaterializedViewAlters = append(remainingMaterializedViewAlters, alter)
+		}
+		materializedViewDiffs.alters = remainingMaterializedViewAlters
+
+		if !progressed {
+			break
+		}
+	}
+
+	// diffLists returns deletes sorted by name, and the SQL generator emits them in that order; keep
+	// the order after appending the cascaded ones.
+	sort.Slice(viewDiffs.deletes, func(i, j int) bool {
+		return viewDiffs.deletes[i].GetName() < viewDiffs.deletes[j].GetName()
+	})
+	sort.Slice(materializedViewDiffs.deletes, func(i, j int) bool {
+		return materializedViewDiffs.deletes[i].GetName() < materializedViewDiffs.deletes[j].GetName()
+	})
+
+	return viewDiffs, materializedViewDiffs
+}
+
+// readsRecreatedRelation reports whether any of the relations a view reads is being re-created.
+func readsRecreatedRelation(dependencies []schema.TableDependency, recreated map[string]bool) bool {
+	for _, dependency := range dependencies {
+		if recreated[dependency.GetName()] {
+			return true
+		}
+	}
+	return false
 }

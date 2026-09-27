@@ -605,6 +605,67 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
 		expectEmptyPlan: true,
 	},
 	{
+		name: "change a view definition in place when an unchanged view reads it",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW foobar_view AS
+                SELECT id, foo
+                FROM foobar;
+
+            CREATE VIEW foobar_view_view AS
+                SELECT id
+                FROM foobar_view;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW foobar_view AS
+                SELECT id, foo + 0 AS foo
+                FROM foobar;
+
+            CREATE VIEW foobar_view_view AS
+                SELECT id
+                FROM foobar_view;
+		`},
+		// The outer view is unchanged and reads the inner one, so the inner view's change has to be
+		// applied with CREATE OR REPLACE VIEW: a DROP would fail while the outer view depends on it.
+		expectedPlanDDL: []string{
+			"CREATE OR REPLACE VIEW \"public\".\"foobar_view\" AS\n SELECT id,\n    foo + 0 AS foo\n   FROM foobar;",
+		},
+	},
+	{
+		name: "re-create a view and the unchanged view that reads it when its columns change",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT, bar INT);
+
+            CREATE VIEW foobar_view AS
+                SELECT id, foo, bar
+                FROM foobar;
+
+            CREATE VIEW foobar_view_view AS
+                SELECT id
+                FROM foobar_view;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT, bar INT);
+
+            CREATE VIEW foobar_view AS
+                SELECT id, foo
+                FROM foobar;
+
+            CREATE VIEW foobar_view_view AS
+                SELECT id
+                FROM foobar_view;
+		`},
+		// A removed output column forces the inner view to be dropped and created again, so the
+		// unchanged outer view that reads it has to be dropped first and created again afterwards.
+	},
+	{
 		name: "no-op - recursive view",
 		oldSchemaDDL: []string{
 			`

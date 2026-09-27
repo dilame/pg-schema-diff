@@ -515,6 +515,32 @@ var domainAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name: "drop a domain a view casts to before dropping the view",
+		oldSchemaDDL: []string{
+			`
+            CREATE DOMAIN purpose_code AS TEXT;
+            CREATE TABLE some_table(val text);
+            CREATE VIEW some_view AS SELECT val::purpose_code AS code FROM some_table;
+		`},
+		newSchemaDDL: []string{
+			``,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeDeletesData},
+	},
+	{
+		name: "drop a domain a materialized view casts to before dropping the view",
+		oldSchemaDDL: []string{
+			`
+            CREATE DOMAIN purpose_code AS TEXT;
+            CREATE TABLE some_table(val text);
+            CREATE MATERIALIZED VIEW some_view AS SELECT val::purpose_code AS code FROM some_table;
+		`},
+		newSchemaDDL: []string{
+			``,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeDeletesData},
+	},
+	{
 		name: "recreate a domain used by a composite type",
 		oldSchemaDDL: []string{
 			`

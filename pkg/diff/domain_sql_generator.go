@@ -73,7 +73,7 @@ func (d *domainSQLVertexGenerator) Delete(domain schema.Domain) (partialSQLGraph
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
 			id:       deleteVertexId,
-			priority: sqlPriorityLater,
+			priority: sqlPriorityDropsLast,
 			statements: []Statement{{
 				DDL:         fmt.Sprintf("DROP DOMAIN %s", domain.GetFQEscapedName()),
 				Timeout:     statementTimeoutDefault,

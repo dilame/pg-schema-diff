@@ -386,6 +386,27 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 				listDiff[schema.Privilege, privilegeDiff]{},
 			}, true, nil
 		}
+		// The identity arguments do not include the result type, so two functions
+		// that differ only in their result are matched as one alterable object
+		// here. `CREATE OR REPLACE` cannot change a function's result type
+		// (PostgreSQL raises SQLSTATE 42P13), so such a change has to be a
+		// drop-and-recreate of the same signature.
+		if old.ResultType != new.ResultType {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
+			}, true, nil
+		}
+		// A SQL-standard body (`BEGIN ATOMIC`) resolves the columns it reads at CREATE time and
+		// PostgreSQL refuses to alter or drop such a column while the function exists. Re-create the
+		// function around the change; the delete dependency orders its drop before the column change
+		// and the add dependency orders its create after.
+		if functionDependsOnAlteredColumn(old, tableDiffsByName, deletedTablesByName) {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
+			}, true, nil
+		}
 		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
 		if err != nil {
 			return functionDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
@@ -450,6 +471,8 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing materialized views: %w", err)
 	}
+
+	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs)
 
 	return schemaDiff{
 		oldAndNew: oldAndNew[schema.Schema]{
@@ -762,6 +785,12 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, tablePartialGraph)
 
+	newTablePoliciesPartialGraph, err := newNewTablePoliciesSQLVertexGenerator().AddAll(diff.tableDiffs.adds)
+	if err != nil {
+		return nil, fmt.Errorf("resolving new table policies: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, newTablePoliciesPartialGraph)
+
 	defaultPrivilegeStatements, err := diff.defaultPrivilegeDiffs.resolveToSQLGroupedByEffect(&defaultPrivilegeSQLGenerator{})
 	if err != nil {
 		return nil, fmt.Errorf("resolving default privilege sql statements: %w", err)
@@ -863,6 +892,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving function diff: %w", err)
 	}
+	functionsPartialGraph = orderFunctionDropsBeforeFunctionCreates(functionsPartialGraph, diff.functionDiffs)
 	partialGraph = concatPartialGraphs(partialGraph, functionsPartialGraph)
 
 	procedureGenerator := newProcedureSqlVertexGenerator(diff.new)
@@ -1066,6 +1096,33 @@ func dependsOnAnyRecreatedDomain(deps []schema.SchemaQualifiedName, recreated ma
 	return false
 }
 
+// functionDependsOnAlteredColumn reports whether the function reads a relation column that is being
+// altered or dropped (or whose relation is being re-created). `CREATE OR REPLACE FUNCTION` leaves
+// the body's column references as they are, and PostgreSQL refuses to change such a column while
+// the function exists, so the function has to be dropped before the change and created again after.
+func functionDependsOnAlteredColumn(function schema.Function, tableDiffsByName map[string]tableDiff, deletedTablesByName map[string]schema.Table) bool {
+	for _, dep := range function.DependsOnRelationColumns {
+		if _, deleted := deletedTablesByName[dep.GetName()]; deleted {
+			return true
+		}
+		td, ok := tableDiffsByName[dep.GetName()]
+		if !ok {
+			continue
+		}
+		for _, deletedColumn := range td.columnsDiff.deletes {
+			if deletedColumn.Name == dep.Column {
+				return true
+			}
+		}
+		for _, columnDiff := range td.columnsDiff.alters {
+			if columnDiff.new.Name == dep.Column && columnDiff.old.Type != columnDiff.new.Type {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func buildDiffByNameMap[S schema.Object, D diff[S]](d []D) map[string]D {
 	return buildMap(d, func(d D) string {
 		return d.GetNew().GetName()
@@ -1171,18 +1228,9 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		stmts = append(stmts, alterReplicaIdentityStmt)
 	}
 
-	policyGenerator, err := newPolicySQLVertexGenerator(nil, table)
-	if err != nil {
-		return nil, fmt.Errorf("creating policy sql vertex generator: %w", err)
-	}
-	for _, policy := range table.Policies {
-		addPolicyPartialGraph, err := policyGenerator.Add(policy)
-		if err != nil {
-			return nil, fmt.Errorf("generating add policy statements for policy %s: %w", policy.EscapedName, err)
-		}
-		// Remove hazards from statements since the table is brand new
-		stmts = append(stmts, stripMigrationHazards(addPolicyPartialGraph.statements()...)...)
-	}
+	// A new table's policies are emitted by newTablePoliciesSQLVertexGenerator as a vertex separate
+	// from the table's own. See the generator for why. RLS enable/force stays in this vertex, before
+	// that one, because enabling RLS first is harmless on a table that has just been created.
 
 	if table.RLSEnabled {
 		stmts = append(stmts, stripMigrationHazards(enableRLSForTable(table))...)
@@ -1544,7 +1592,7 @@ func buildDependencyVertexId(dep schema.TableDependency, diffType diffType) sqlV
 	return buildRelationKindVertexId(dep.Kind, dep.SchemaQualifiedName, diffType)
 }
 
-func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, _ schema.Table) ([]dependency, error) {
+func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, oldTable schema.Table) ([]dependency, error) {
 	deps := []dependency{
 		mustRun(t.GetSQLVertexId(table, diffTypeAddAlter)).after(t.GetSQLVertexId(table, diffTypeDelete)),
 	}
@@ -1554,7 +1602,14 @@ func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, _ schema.Table)
 			mustRun(t.GetSQLVertexId(table, diffTypeAddAlter)).after(buildTableVertexId(*table.ParentTable, diffTypeAddAlter)),
 		)
 	}
-	deps = append(deps, consumerPolicyFunctionDependencies(table)...)
+	// A new table's policies have their own vertex, which carries the dependency on the functions
+	// they call. On an existing table the policies are appended to this vertex, so they need the
+	// dependency here — but only the ones this migration adds or alters: an unchanged policy is not
+	// re-created, and its dependency would make table → function (policy) and function → table (a
+	// SQL-standard body reads the table) a cycle even though neither statement does anything.
+	if !cmp.Equal(oldTable, schema.Table{}) {
+		deps = append(deps, consumerPolicyFunctionDependencies(oldTable, table)...)
+	}
 	return deps, nil
 }
 
@@ -1627,22 +1682,26 @@ func (t *tableSQLVertexGenerator) GetDeleteDependencies(table schema.Table) ([]d
 	return deps, nil
 }
 
-// consumerPolicyFunctionDependencies orders a table's add/alter after every function its policies
-// call. A table's policies are created in the same vertex as the table — inside the CREATE TABLE
-// statement list for a new table, appended by the table's alter otherwise — and PostgreSQL resolves
-// the functions named in a policy expression at CREATE POLICY time.
-func consumerPolicyFunctionDependencies(table schema.Table) []dependency {
+// consumerPolicyFunctionDependencies orders an altered table's vertex after every function a
+// policy it adds or alters calls. PostgreSQL resolves the functions named in a policy expression at
+// CREATE / ALTER POLICY time, so the table's statement stream, which carries those policies, has to
+// run after them. A policy that is unchanged is not re-created and needs no such dependency.
+func consumerPolicyFunctionDependencies(oldTable, newTable schema.Table) []dependency {
+	oldPoliciesByName := buildSchemaObjByNameMap(oldTable.Policies)
 	var deps []dependency
-	for _, policy := range table.Policies {
+	for _, policy := range newTable.Policies {
+		if old, existed := oldPoliciesByName[policy.GetName()]; existed && cmp.Equal(old, policy) {
+			continue
+		}
 		for _, depFunction := range policy.DependsOnFunctions {
-			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 		}
 		for _, depRelation := range policy.DependsOnRelations {
-			if depRelation.GetName() == table.SchemaQualifiedName.GetName() {
+			if depRelation.GetName() == newTable.SchemaQualifiedName.GetName() {
 				// The policy's own table; the table vertex already precedes its policies.
 				continue
 			}
-			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
 		}
 	}
 	return deps

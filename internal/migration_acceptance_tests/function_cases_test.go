@@ -378,6 +378,112 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name: "Alter function argument list (OUT parameter renamed) drops the old signature before creating the new one",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION identity_change(a integer, OUT x integer, OUT y integer)
+                LANGUAGE SQL
+                AS $$ SELECT a, a + 1 $$;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION identity_change(a integer, OUT z integer, OUT y integer)
+                LANGUAGE SQL
+                AS $$ SELECT a, a + 1 $$;
+		`},
+	},
+	{
+		name: "Alter function result type drops the old signature before creating the new one",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION result_change(a integer) RETURNS integer
+                LANGUAGE SQL
+                IMMUTABLE
+                AS $$ SELECT a + 1 $$;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION result_change(a integer) RETURNS text
+                LANGUAGE SQL
+                IMMUTABLE
+                AS $$ SELECT (a + 1)::text $$;
+		`},
+	},
+	{
+		name: "Alter a SQL-standard body (BEGIN ATOMIC) emits CREATE OR REPLACE",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE FUNCTION count_positive_foo() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE foo > 0;
+            END;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE FUNCTION count_positive_foo() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE id > 0;
+            END;
+		`},
+	},
+	{
+		name: "Alter a column type a SQL-standard body function reads re-creates the function",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE FUNCTION count_positive_foo() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE foo > 0;
+            END;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo BIGINT);
+
+            CREATE FUNCTION count_positive_foo() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE foo > 0;
+            END;
+		`},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+			diff.MigrationHazardTypeImpactsDatabasePerformance,
+		},
+	},
+	{
+		name: "Drop a column a SQL-standard body function reads re-creates the function",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE FUNCTION count_positive_foo() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE foo > 0;
+            END;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION count_positive_foo() RETURNS BIGINT
+                LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT count(*) FROM foobar WHERE id > 0;
+            END;
+		`},
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeDeletesData},
+	},
+	{
 		name: "Alter non-sql function",
 		oldSchemaDDL: []string{
 			`

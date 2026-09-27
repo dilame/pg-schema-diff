@@ -22,6 +22,14 @@ const (
 	sqlPriorityUnset sqlPriority = 0
 	// Indicates a statement should run as late as possible. Usually, most deletes will have this priority.
 	sqlPriorityLater sqlPriority = -1
+	// sqlPriorityDropsLast is for a statement that must run after every other statement that does not
+	// explicitly depend on it. A type's DROP is one: PostgreSQL refuses it while any dependent object
+	// still references the type, and the consumers this tool does not model — a view's cast, an index
+	// expression, a column default — would otherwise have to be enumerated as edges. The topological
+	// sort is greedy by priority over the currently available statements, so a priority below every
+	// other statement's runs the drop after all of them. The magnitude dwarfs any statement count, so
+	// the number-of-statements weighting cannot lift it back up.
+	sqlPriorityDropsLast sqlPriority = -(1 << 30)
 )
 
 // schemaObjSqlVertexId is a vertex id for a standard schema object node, i.e., indicating the creation/deletiion

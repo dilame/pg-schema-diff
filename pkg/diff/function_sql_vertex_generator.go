@@ -2,6 +2,7 @@ package diff
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stripe/pg-schema-diff/internal/schema"
@@ -133,10 +134,47 @@ func buildFunctionVertexId(name schema.SchemaQualifiedName, diffType diffType) s
 	return buildSchemaObjVertexId("function", name.GetFQEscapedName(), diffType)
 }
 
+// buildFunctionBareNameId identifies a function by its schema and name alone,
+// dropping the argument list that EscapedName carries. PostgreSQL matches a
+// function, and a `CREATE OR REPLACE`, by name and input argument types, so a
+// change to the argument list or the result type appears in the diff as a delete
+// of one signature and an add of another. Both are the same function to a
+// reader, and the drop has to precede the create.
+func buildFunctionBareNameId(name schema.SchemaQualifiedName) string {
+	bare := name.EscapedName
+	if i := strings.IndexByte(bare, '('); i >= 0 {
+		bare = bare[:i]
+	}
+	return name.SchemaName + "." + bare
+}
+
+// orderFunctionDropsBeforeFunctionCreates makes the drop of a function's old
+// signature run before the create of a new one with the same schema and name. A
+// function whose argument list changed is a delete of the old signature and an
+// add of the new one; one whose result type changed is a recreation (see
+// buildSchemaDiff). In both cases PostgreSQL rejects the create while the old
+// signature is still present (SQLSTATE 42P13), so the drop must be ordered first.
+func orderFunctionDropsBeforeFunctionCreates(graph partialSQLGraph, diffs listDiff[schema.Function, functionDiff]) partialSQLGraph {
+	deletesByBareName := make(map[string][]schema.Function)
+	for _, deleted := range diffs.deletes {
+		key := buildFunctionBareNameId(deleted.SchemaQualifiedName)
+		deletesByBareName[key] = append(deletesByBareName[key], deleted)
+	}
+	for _, added := range diffs.adds {
+		for _, deleted := range deletesByBareName[buildFunctionBareNameId(added.SchemaQualifiedName)] {
+			graph.dependencies = append(graph.dependencies,
+				mustRun(buildFunctionVertexId(deleted.SchemaQualifiedName, diffTypeDelete)).
+					before(buildFunctionVertexId(added.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	return graph
+}
+
 func (f *functionSQLVertexGenerator) GetAddAlterDependencies(newFunction, oldFunction schema.Function) ([]dependency, error) {
-	// Since functions can just be `CREATE OR REPLACE`, there will never be a case where a function is
-	// added and dropped in the same migration. Thus, we don't need a dependency on the delete vertex of a function
-	// because there won't be one if it is being added/altered
+	// A function whose argument list or result type changed is a delete of the
+	// old signature plus an add of the new one. The dependency that orders the
+	// drop before the create is added at the schema level, where both the add
+	// and the delete are in scope (see orderFunctionDropsBeforeFunctionCreates).
 	var deps []dependency
 	for _, depFunction := range newFunction.DependsOnFunctions {
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
@@ -169,9 +207,12 @@ func (f *functionSQLVertexGenerator) GetDeleteDependencies(function schema.Funct
 	for _, depFunction := range function.DependsOnFunctions {
 		deps = append(deps, mustRun(f.GetSQLVertexId(function, diffTypeDelete)).before(buildFunctionVertexId(depFunction, diffTypeDelete)))
 	}
-	// A function must be dropped before a relation its signature refers to is dropped.
+	// A function must be dropped before a relation its signature refers to is dropped, and before
+	// the relation is altered: an alteration can change the row type the signature reads, which
+	// PostgreSQL refuses while the function exists.
 	for _, relation := range function.DependsOnRelations {
 		deps = append(deps, mustRun(f.GetSQLVertexId(function, diffTypeDelete)).before(buildRelationVertexId(relation, diffTypeDelete)))
+		deps = append(deps, mustRun(f.GetSQLVertexId(function, diffTypeDelete)).before(buildRelationVertexId(relation, diffTypeAddAlter)))
 	}
 	return deps, nil
 }

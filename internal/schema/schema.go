@@ -703,6 +703,15 @@ type RelationDependency struct {
 	Kind RelationKind
 }
 
+// RelationColumnDependency is one relation column an object depends on. A SQL-standard body
+// (`BEGIN ATOMIC`) resolves its references at CREATE time and PostgreSQL records each one in
+// pg_depend with the column's attribute number, so the object has to be dropped before that column
+// is altered or dropped, and re-created afterwards.
+type RelationColumnDependency struct {
+	SchemaQualifiedName
+	Column string
+}
+
 type Function struct {
 	SchemaQualifiedName
 	// Owner is the role that owns the function.
@@ -713,7 +722,13 @@ type Function struct {
 	FunctionDef string
 	// Language is the language of the function. This is relevant in determining if we
 	// can track the dependencies of the function (or not)
-	Language           string
+	Language string
+	// ResultType is the function's result type as reported by
+	// pg_get_function_result, e.g. `integer`, `SETOF integer` or `TABLE(a integer)`.
+	// `CREATE OR REPLACE FUNCTION` cannot change it, so a difference here means
+	// the function has to be dropped and re-created rather than replaced. Empty
+	// for procedures, which have no result type.
+	ResultType         string
 	DependsOnFunctions []SchemaQualifiedName
 	// Description is the comment attached to the function (pg_description). Empty means no comment.
 	Description string
@@ -729,6 +744,11 @@ type Function struct {
 	// DependsOnRelations is the list of relations whose row type is referenced by the
 	// function's signature. The function must be created after those relations exist.
 	DependsOnRelations []RelationDependency
+	// DependsOnRelationColumns is the list of relation columns a SQL-standard body
+	// (`BEGIN ATOMIC`) reads. When one of those columns is altered or dropped, the function
+	// must be dropped before the change and re-created after it. Empty for string-body SQL
+	// functions and plpgsql, whose body references pg_depend does not record.
+	DependsOnRelationColumns []RelationColumnDependency
 }
 
 type Procedure struct {
@@ -845,11 +865,24 @@ type View struct {
 	// Options represents key value map of view options, i.e., pg_class.reloptions.
 	Options map[string]string
 
+	// Columns is the view's output columns, in order. A view's definition can be replaced in place
+	// (`CREATE OR REPLACE VIEW`) only while these columns are unchanged or extended; a removed,
+	// reordered, or retyped column forces the view to be dropped and re-created. The diff compares
+	// them to choose between the two.
+	Columns []ViewColumn
+
 	// TableDependencies is a list of tables the view depends on.
 	TableDependencies []TableDependency
 	Privileges        []TablePrivilege
 	// Description is the comment attached to the view (pg_description). Empty means no comment.
 	Description string
+}
+
+// ViewColumn is one output column of a view: its name and its type as formatted by
+// pg_catalog.format_type.
+type ViewColumn struct {
+	Name string
+	Type string
 }
 
 type MaterializedView struct {
@@ -2009,18 +2042,46 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 		return Function{}, fmt.Errorf("fetchDependsOnRelations(%s): %w", rawFunction.Oid, err)
 	}
 
+	dependsOnRelationColumns, err := s.fetchDependsOnRelationColumns(ctx, "pg_proc", rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("fetchDependsOnRelationColumns(%s): %w", rawFunction.Oid, err)
+	}
+
 	return Function{
-		SchemaQualifiedName:     buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
-		Owner:                   rawFunction.Owner,
-		FunctionDef:             rawFunction.FuncDef,
-		Language:                rawFunction.FuncLang,
-		DependsOnFunctions:      dependsOnFunctions,
-		Description:             rawFunction.Description,
-		DependsOnCompositeTypes: dependsOnTypes,
-		DependsOnDomains:        dependsOnDomains,
-		Privileges:              privileges,
-		DependsOnRelations:      dependsOnRelations,
+		SchemaQualifiedName:      buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
+		Owner:                    rawFunction.Owner,
+		FunctionDef:              rawFunction.FuncDef,
+		Language:                 rawFunction.FuncLang,
+		ResultType:               rawFunction.FuncResult,
+		DependsOnFunctions:       dependsOnFunctions,
+		Description:              rawFunction.Description,
+		DependsOnCompositeTypes:  dependsOnTypes,
+		DependsOnDomains:         dependsOnDomains,
+		Privileges:               privileges,
+		DependsOnRelations:       dependsOnRelations,
+		DependsOnRelationColumns: dependsOnRelationColumns,
 	}, nil
+}
+
+// fetchDependsOnRelationColumns returns the relation columns the given object references, one entry
+// per (relation, column) pair. Only a SQL-standard body records those references, so the list is
+// empty for a string-body SQL function and for plpgsql.
+func (s *schemaFetcher) fetchDependsOnRelationColumns(ctx context.Context, systemCatalog string, oid any) ([]RelationColumnDependency, error) {
+	rows, err := s.q.GetDependsOnRelationColumns(ctx, queries.GetDependsOnRelationColumnsParams{
+		SystemCatalog: systemCatalog,
+		ObjectID:      oid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var dependsOnColumns []RelationColumnDependency
+	for _, row := range rows {
+		dependsOnColumns = append(dependsOnColumns, RelationColumnDependency{
+			SchemaQualifiedName: buildNameFromUnescaped(row.RelationName, row.RelationSchemaName),
+			Column:              row.ColumnName,
+		})
+	}
+	return dependsOnColumns, nil
 }
 
 func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
@@ -2364,6 +2425,7 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 			Owner:               v.Owner,
 			ViewDefinition:      v.ViewDefinition,
 			Options:             options,
+			Columns:             buildViewColumns(v.ColumnNames, v.ColumnTypes),
 
 			TableDependencies: tableDependencies,
 			Privileges:        privilegesByView[schemaQualifiedName.GetFQEscapedName()],
@@ -2380,6 +2442,21 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 	)
 
 	return views, nil
+}
+
+// buildViewColumns zips the parallel name and type arrays a view query returns into the ordered
+// column list a View carries. Both arrays come from the same attribute query, so they have equal
+// length; the shorter one bounds the loop defensively.
+func buildViewColumns(names, types []string) []ViewColumn {
+	n := len(names)
+	if len(types) < n {
+		n = len(types)
+	}
+	columns := make([]ViewColumn, 0, n)
+	for i := 0; i < n; i++ {
+		columns = append(columns, ViewColumn{Name: names[i], Type: types[i]})
+	}
+	return columns
 }
 
 func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]MaterializedView, error) {
