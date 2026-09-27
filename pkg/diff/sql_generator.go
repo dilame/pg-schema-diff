@@ -785,6 +785,12 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, tablePartialGraph)
 
+	newTablePoliciesPartialGraph, err := newNewTablePoliciesSQLVertexGenerator().AddAll(diff.tableDiffs.adds)
+	if err != nil {
+		return nil, fmt.Errorf("resolving new table policies: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, newTablePoliciesPartialGraph)
+
 	defaultPrivilegeStatements, err := diff.defaultPrivilegeDiffs.resolveToSQLGroupedByEffect(&defaultPrivilegeSQLGenerator{})
 	if err != nil {
 		return nil, fmt.Errorf("resolving default privilege sql statements: %w", err)
@@ -1222,18 +1228,9 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		stmts = append(stmts, alterReplicaIdentityStmt)
 	}
 
-	policyGenerator, err := newPolicySQLVertexGenerator(nil, table)
-	if err != nil {
-		return nil, fmt.Errorf("creating policy sql vertex generator: %w", err)
-	}
-	for _, policy := range table.Policies {
-		addPolicyPartialGraph, err := policyGenerator.Add(policy)
-		if err != nil {
-			return nil, fmt.Errorf("generating add policy statements for policy %s: %w", policy.EscapedName, err)
-		}
-		// Remove hazards from statements since the table is brand new
-		stmts = append(stmts, stripMigrationHazards(addPolicyPartialGraph.statements()...)...)
-	}
+	// A new table's policies are emitted by newTablePoliciesSQLVertexGenerator as a vertex separate
+	// from the table's own. See the generator for why. RLS enable/force stays in this vertex, before
+	// that one, because enabling RLS first is harmless on a table that has just been created.
 
 	if table.RLSEnabled {
 		stmts = append(stmts, stripMigrationHazards(enableRLSForTable(table))...)
@@ -1595,7 +1592,7 @@ func buildDependencyVertexId(dep schema.TableDependency, diffType diffType) sqlV
 	return buildRelationKindVertexId(dep.Kind, dep.SchemaQualifiedName, diffType)
 }
 
-func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, _ schema.Table) ([]dependency, error) {
+func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, oldTable schema.Table) ([]dependency, error) {
 	deps := []dependency{
 		mustRun(t.GetSQLVertexId(table, diffTypeAddAlter)).after(t.GetSQLVertexId(table, diffTypeDelete)),
 	}
@@ -1605,7 +1602,14 @@ func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, _ schema.Table)
 			mustRun(t.GetSQLVertexId(table, diffTypeAddAlter)).after(buildTableVertexId(*table.ParentTable, diffTypeAddAlter)),
 		)
 	}
-	deps = append(deps, consumerPolicyFunctionDependencies(table)...)
+	// A new table's policies have their own vertex, which carries the dependency on the functions
+	// they call. On an existing table the policies are appended to this vertex, so they need the
+	// dependency here — but only the ones this migration adds or alters: an unchanged policy is not
+	// re-created, and its dependency would make table → function (policy) and function → table (a
+	// SQL-standard body reads the table) a cycle even though neither statement does anything.
+	if !cmp.Equal(oldTable, schema.Table{}) {
+		deps = append(deps, consumerPolicyFunctionDependencies(oldTable, table)...)
+	}
 	return deps, nil
 }
 
@@ -1678,22 +1682,26 @@ func (t *tableSQLVertexGenerator) GetDeleteDependencies(table schema.Table) ([]d
 	return deps, nil
 }
 
-// consumerPolicyFunctionDependencies orders a table's add/alter after every function its policies
-// call. A table's policies are created in the same vertex as the table — inside the CREATE TABLE
-// statement list for a new table, appended by the table's alter otherwise — and PostgreSQL resolves
-// the functions named in a policy expression at CREATE POLICY time.
-func consumerPolicyFunctionDependencies(table schema.Table) []dependency {
+// consumerPolicyFunctionDependencies orders an altered table's vertex after every function a
+// policy it adds or alters calls. PostgreSQL resolves the functions named in a policy expression at
+// CREATE / ALTER POLICY time, so the table's statement stream, which carries those policies, has to
+// run after them. A policy that is unchanged is not re-created and needs no such dependency.
+func consumerPolicyFunctionDependencies(oldTable, newTable schema.Table) []dependency {
+	oldPoliciesByName := buildSchemaObjByNameMap(oldTable.Policies)
 	var deps []dependency
-	for _, policy := range table.Policies {
+	for _, policy := range newTable.Policies {
+		if old, existed := oldPoliciesByName[policy.GetName()]; existed && cmp.Equal(old, policy) {
+			continue
+		}
 		for _, depFunction := range policy.DependsOnFunctions {
-			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 		}
 		for _, depRelation := range policy.DependsOnRelations {
-			if depRelation.GetName() == table.SchemaQualifiedName.GetName() {
+			if depRelation.GetName() == newTable.SchemaQualifiedName.GetName() {
 				// The policy's own table; the table vertex already precedes its policies.
 				continue
 			}
-			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
 		}
 	}
 	return deps

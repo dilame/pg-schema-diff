@@ -789,6 +789,27 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 	},
+	{
+		name:         "Create a policy calling a function whose SQL-standard body reads the policy's own table",
+		oldSchemaDDL: nil,
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT);
+                CREATE FUNCTION row_count() RETURNS bigint
+                    LANGUAGE SQL
+                BEGIN ATOMIC
+                    SELECT count(*) FROM foobar WHERE id > 0;
+                END;
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (row_count() > 0);
+		`},
+		// The real order is table → function → policy: the function's body reads the table, and the
+		// policy calls the function. Keeping the policy inside the table's vertex would make it
+		// table → function and function → table, a cycle that fails plan generation.
+	},
 }
 
 func TestPolicyCases(t *testing.T) {
