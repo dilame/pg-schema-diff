@@ -851,11 +851,24 @@ type View struct {
 	// Options represents key value map of view options, i.e., pg_class.reloptions.
 	Options map[string]string
 
+	// Columns is the view's output columns, in order. A view's definition can be replaced in place
+	// (`CREATE OR REPLACE VIEW`) only while these columns are unchanged or extended; a removed,
+	// reordered, or retyped column forces the view to be dropped and re-created. The diff compares
+	// them to choose between the two.
+	Columns []ViewColumn
+
 	// TableDependencies is a list of tables the view depends on.
 	TableDependencies []TableDependency
 	Privileges        []TablePrivilege
 	// Description is the comment attached to the view (pg_description). Empty means no comment.
 	Description string
+}
+
+// ViewColumn is one output column of a view: its name and its type as formatted by
+// pg_catalog.format_type.
+type ViewColumn struct {
+	Name string
+	Type string
 }
 
 type MaterializedView struct {
@@ -2371,6 +2384,7 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 			Owner:               v.Owner,
 			ViewDefinition:      v.ViewDefinition,
 			Options:             options,
+			Columns:             buildViewColumns(v.ColumnNames, v.ColumnTypes),
 
 			TableDependencies: tableDependencies,
 			Privileges:        privilegesByView[schemaQualifiedName.GetFQEscapedName()],
@@ -2387,6 +2401,21 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 	)
 
 	return views, nil
+}
+
+// buildViewColumns zips the parallel name and type arrays a view query returns into the ordered
+// column list a View carries. Both arrays come from the same attribute query, so they have equal
+// length; the shorter one bounds the loop defensively.
+func buildViewColumns(names, types []string) []ViewColumn {
+	n := len(names)
+	if len(types) < n {
+		n = len(types)
+	}
+	columns := make([]ViewColumn, 0, n)
+	for i := 0; i < n; i++ {
+		columns = append(columns, ViewColumn{Name: names[i], Type: types[i]})
+	}
+	return columns
 }
 
 func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]MaterializedView, error) {

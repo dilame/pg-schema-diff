@@ -2186,6 +2186,20 @@ SELECT
     -- rules of every other view that reads this one, which would report those readers as
     -- dependencies of this object.
     WHERE d.refobjid = c.oid AND r.ev_class = c.oid AND dep_c.oid != c.oid)::TEXT [] AS table_dependencies,
+    -- The view's output columns, in attribute order. The diff uses them to decide whether a
+    -- changed definition can be replaced in place or has to be dropped and re-created.
+    ARRAY(
+        SELECT a.attname::TEXT
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_names,
+    ARRAY(
+        SELECT pg_catalog.format_type(a.atttypid, a.atttypmod)
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_types,
     PG_GET_VIEWDEF(c.oid, true) AS view_definition,
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
@@ -2214,6 +2228,8 @@ type GetViewsRow struct {
 	Owner             string
 	RelOptions        []string
 	TableDependencies []string
+	ColumnNames       []string
+	ColumnTypes       []string
 	ViewDefinition    string
 	Description       string
 }
@@ -2233,6 +2249,8 @@ func (q *Queries) GetViews(ctx context.Context) ([]GetViewsRow, error) {
 			&i.Owner,
 			pq.Array(&i.RelOptions),
 			pq.Array(&i.TableDependencies),
+			pq.Array(&i.ColumnNames),
+			pq.Array(&i.ColumnTypes),
 			&i.ViewDefinition,
 			&i.Description,
 		); err != nil {

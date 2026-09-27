@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "fa9bbe0629f6276a",
+			expectedHash: "ac7b4d0b5e2cdcb6",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -605,6 +605,10 @@ var (
 						ViewDefinitionCanonical: " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
 						Options: map[string]string{
 							"security_barrier": "true",
+						},
+						Columns: []ViewColumn{
+							{Name: "id", Type: "integer"},
+							{Name: "author", Type: "text"},
 						},
 						TableDependencies: []TableDependency{
 							{
