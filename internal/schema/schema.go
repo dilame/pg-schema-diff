@@ -172,6 +172,7 @@ func normalizeTable(t Table) Table {
 			return s
 		})
 		p.DependsOnFunctions = sortSchemaObjectsByName(p.DependsOnFunctions)
+		p.DependsOnRelations = sortSchemaObjectsByName(p.DependsOnRelations)
 		normPolicies = append(normPolicies, p)
 	}
 	t.Policies = normPolicies
@@ -792,6 +793,9 @@ type Policy struct {
 	// expressions. PostgreSQL resolves those references at CREATE POLICY time, so the table that
 	// carries the policy must be created after the functions exist and dropped before they are.
 	DependsOnFunctions []SchemaQualifiedName
+	// DependsOnRelations is the list of relations referenced by the policy's USING and WITH CHECK
+	// expressions, on the same terms as DependsOnFunctions.
+	DependsOnRelations []RelationDependency
 }
 
 func (p Policy) GetName() string {
@@ -2154,6 +2158,20 @@ func (s *schemaFetcher) fetchPolicies(ctx context.Context) ([]policyAndTable, er
 		if err != nil {
 			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rp.Oid, err)
 		}
+		dependsOnRelations, err := s.fetchDependsOnRelations(ctx, "pg_policy", rp.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnRelations(%s): %w", rp.Oid, err)
+		}
+		// A policy always depends on the table it is attached to (its expressions read that table's
+		// columns). That dependency is implied — the policy is emitted with the table — so drop it.
+		owningTable := buildNameFromUnescaped(rp.OwningTableName, rp.OwningTableSchemaName)
+		var policyRelations []RelationDependency
+		for _, relation := range dependsOnRelations {
+			if relation.GetName() == owningTable.GetName() {
+				continue
+			}
+			policyRelations = append(policyRelations, relation)
+		}
 		policies = append(policies, policyAndTable{
 			policy: Policy{
 				EscapedName:        EscapeIdentifier(rp.PolicyName),
@@ -2165,8 +2183,9 @@ func (s *schemaFetcher) fetchPolicies(ctx context.Context) ([]policyAndTable, er
 				Columns:            rp.ColumnNames,
 				Description:        rp.Description,
 				DependsOnFunctions: dependsOnFunctions,
+				DependsOnRelations: policyRelations,
 			},
-			table: buildNameFromUnescaped(rp.OwningTableName, rp.OwningTableSchemaName),
+			table: owningTable,
 		})
 	}
 

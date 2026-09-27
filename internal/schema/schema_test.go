@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "57f0f3adf9ac59b",
+			expectedHash: "784961f96bbad6ce",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -570,6 +570,11 @@ var (
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: "\"some_insert_procedure\"(IN a integer, IN b integer)"},
 						Def:                 "CREATE OR REPLACE PROCEDURE schema_2.some_insert_procedure(IN a integer, IN b integer)\n LANGUAGE sql\nBEGIN ATOMIC\n INSERT INTO schema_2.foo DEFAULT VALUES;\nEND\n",
 						Privileges:          defaultExecutePrivileges,
+						// A SQL-standard (BEGIN ATOMIC) body records the relations it reads in pg_depend,
+						// unlike a string body.
+						DependsOnRelations: []RelationDependency{
+							{SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: `"foo"`}, Kind: RelationKindTable},
+						},
 					},
 				},
 				Triggers: []Trigger{

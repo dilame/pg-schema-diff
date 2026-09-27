@@ -763,6 +763,32 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 	},
+	{
+		name: "Create policy reading a table created in the same plan",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE TABLE foobar_grant(id INT, grantee UUID);
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar_grant g WHERE g.id = foobar.grant_id
+                    ));
+			`,
+		},
+		// PostgreSQL resolves the relation the USING expression reads at CREATE POLICY time, and the
+		// policy is emitted with its table, so the table must come after that relation.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
 }
 
 func TestPolicyCases(t *testing.T) {
