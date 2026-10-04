@@ -709,6 +709,146 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
 		},
 		expectEmptyPlan: true,
 	},
+	{
+		name:  "replace a view in place when it moves onto a view created in the same plan",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE SCHEMA a_door;
+            CREATE SCHEMA z_projection;
+            CREATE TABLE foobar(id INT, foo INT, hidden INT);
+
+            CREATE VIEW a_door.foobar WITH (security_barrier = true) AS
+                SELECT id, foo
+                FROM foobar;
+            GRANT SELECT ON a_door.foobar TO reader;
+            COMMENT ON VIEW a_door.foobar IS 'the door';
+            COMMENT ON COLUMN a_door.foobar.foo IS 'the foo';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE SCHEMA a_door;
+            CREATE SCHEMA z_projection;
+            CREATE TABLE foobar(id INT, foo INT, hidden INT);
+
+            CREATE VIEW z_projection.foobar AS
+                SELECT id, foo
+                FROM foobar;
+
+            CREATE VIEW a_door.foobar WITH (security_barrier = true) AS
+                SELECT id, foo
+                FROM z_projection.foobar;
+            GRANT SELECT ON a_door.foobar TO reader;
+            COMMENT ON VIEW a_door.foobar IS 'the door';
+            COMMENT ON COLUMN a_door.foobar.foo IS 'the foo';
+		`},
+		// The door keeps its output columns, so it is replaced in place even though the relation it
+		// reads changed: its grant, comments and options are untouched and no reader of the door sees
+		// it missing. The projection it now reads is created first, although the door's schema sorts
+		// before the projection's.
+		expectedPlanDDL: []string{
+			"CREATE VIEW \"z_projection\".\"foobar\" AS\n SELECT id,\n    foo\n   FROM foobar;",
+			"ALTER VIEW \"z_projection\".\"foobar\" OWNER TO \"postgres\"",
+			"CREATE OR REPLACE VIEW \"a_door\".\"foobar\" WITH (security_barrier=true) AS\n SELECT id,\n    foo\n   FROM z_projection.foobar;",
+		},
+	},
+	{
+		name:  "replace a view in place when it stops reading a view dropped in the same plan",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW z_projection AS
+                SELECT id, foo
+                FROM foobar;
+
+            CREATE VIEW a_door AS
+                SELECT id, foo
+                FROM z_projection;
+            GRANT SELECT ON a_door TO reader;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW a_door AS
+                SELECT id, foo
+                FROM foobar;
+            GRANT SELECT ON a_door TO reader;
+		`},
+		// The door is replaced in place before the view it used to read is dropped.
+		expectedPlanDDL: []string{
+			"CREATE OR REPLACE VIEW \"public\".\"a_door\" AS\n SELECT id,\n    foo\n   FROM foobar;",
+			"DROP VIEW \"public\".\"z_projection\"",
+		},
+	},
+	{
+		name:  "re-create a view whose column type changes with its grants, comment, options and owner, and the view that reads it with its own",
+		roles: []string{"reader", "view_owner"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW inner_view WITH (security_barrier = true, security_invoker = true) AS
+                SELECT id, foo
+                FROM foobar;
+            ALTER VIEW inner_view OWNER TO view_owner;
+            GRANT SELECT ON inner_view TO reader;
+            COMMENT ON VIEW inner_view IS 'inner';
+            COMMENT ON COLUMN inner_view.id IS 'the id';
+
+            CREATE VIEW outer_view WITH (security_barrier = true) AS
+                SELECT id
+                FROM inner_view;
+            ALTER VIEW outer_view OWNER TO view_owner;
+            GRANT SELECT ON outer_view TO reader;
+            COMMENT ON VIEW outer_view IS 'outer';
+            COMMENT ON COLUMN outer_view.id IS 'the outer id';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW inner_view WITH (security_barrier = true, security_invoker = true) AS
+                SELECT id::BIGINT AS id, foo
+                FROM foobar;
+            ALTER VIEW inner_view OWNER TO view_owner;
+            GRANT SELECT ON inner_view TO reader;
+            COMMENT ON VIEW inner_view IS 'inner';
+            COMMENT ON COLUMN inner_view.id IS 'the id';
+
+            CREATE VIEW outer_view WITH (security_barrier = true) AS
+                SELECT id
+                FROM inner_view;
+            ALTER VIEW outer_view OWNER TO view_owner;
+            GRANT SELECT ON outer_view TO reader;
+            COMMENT ON VIEW outer_view IS 'outer';
+            COMMENT ON COLUMN outer_view.id IS 'the outer id';
+		`},
+		// A retyped column cannot be replaced in place, so both views are dropped and created again,
+		// and each comes back with everything it carried: the database after the plan matches the
+		// target's dump, grants, comments, options and owners included.
+	},
+	{
+		name: "comment on a view column",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+            CREATE VIEW foobar_view AS SELECT id, foo FROM foobar;
+            COMMENT ON COLUMN foobar_view.id IS 'old';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+            CREATE VIEW foobar_view AS SELECT id, foo FROM foobar;
+            COMMENT ON COLUMN foobar_view.foo IS 'new';
+		`},
+		expectedPlanDDL: []string{
+			"COMMENT ON COLUMN \"public\".\"foobar_view\".\"id\" IS NULL",
+			"COMMENT ON COLUMN \"public\".\"foobar_view\".\"foo\" IS 'new'",
+		},
+	},
 }
 
 func TestViewTestCases(t *testing.T) {

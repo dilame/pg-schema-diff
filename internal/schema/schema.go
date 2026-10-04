@@ -192,6 +192,7 @@ func normalizeView(v View) View {
 	v.TableDependencies = normTableDeps
 
 	v.Privileges = sortSchemaObjectsByName(v.Privileges)
+	v.DependsOnFunctions = sortSchemaObjectsByName(v.DependsOnFunctions)
 
 	return v
 }
@@ -203,6 +204,8 @@ func normalizeMaterializedView(mv MaterializedView) MaterializedView {
 		normTableDeps = append(normTableDeps, d)
 	}
 	mv.TableDependencies = normTableDeps
+	mv.DependsOnFunctions = sortSchemaObjectsByName(mv.DependsOnFunctions)
+	mv.Privileges = sortSchemaObjectsByName(mv.Privileges)
 	return mv
 }
 
@@ -883,16 +886,22 @@ type View struct {
 
 	// TableDependencies is a list of tables the view depends on.
 	TableDependencies []TableDependency
-	Privileges        []TablePrivilege
+	// DependsOnFunctions is the list of functions the view's definition calls. PostgreSQL records
+	// them against the view's rewrite rule and refuses to drop such a function while the view
+	// exists, so the view is created after them and dropped before them.
+	DependsOnFunctions []SchemaQualifiedName
+	Privileges         []TablePrivilege
 	// Description is the comment attached to the view (pg_description). Empty means no comment.
 	Description string
 }
 
-// ViewColumn is one output column of a view: its name and its type as formatted by
-// pg_catalog.format_type.
+// ViewColumn is one output column of a view: its name, its type as formatted by
+// pg_catalog.format_type, and its comment.
 type ViewColumn struct {
 	Name string
 	Type string
+	// Description is the comment attached to the column (pg_description). Empty means no comment.
+	Description string
 }
 
 type MaterializedView struct {
@@ -908,9 +917,17 @@ type MaterializedView struct {
 	Options map[string]string
 	// Tablespace is the tablespace where the materialized view is stored. Empty string means default tablespace.
 	Tablespace string
+	// Columns is the materialized view's output columns, in order. They follow from the definition;
+	// the diff reads them for the comments on them.
+	Columns []ViewColumn
 
 	// TableDependencies is a list of tables the materialized view depends on.
 	TableDependencies []TableDependency
+	// DependsOnFunctions is the list of functions the materialized view's definition calls. See
+	// View.DependsOnFunctions.
+	DependsOnFunctions []SchemaQualifiedName
+	// Privileges are the grants on the materialized view.
+	Privileges []TablePrivilege
 	// Description is the comment attached to the materialized view (pg_description). Empty means no comment.
 	Description string
 }
@@ -2434,17 +2451,23 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 			return nil, fmt.Errorf("parsing schema qualified names JSON: %w", err)
 		}
 
+		dependsOnFunctions, err := s.fetchDependsOnFunctions(ctx, "pg_rewrite", v.RuleOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", v.ViewName, err)
+		}
+
 		schemaQualifiedName := buildNameFromUnescaped(v.ViewName, v.SchemaName)
 		views = append(views, View{
 			SchemaQualifiedName: schemaQualifiedName,
 			Owner:               v.Owner,
 			ViewDefinition:      v.ViewDefinition,
 			Options:             options,
-			Columns:             buildViewColumns(v.ColumnNames, v.ColumnTypes),
+			Columns:             buildViewColumns(v.ColumnNames, v.ColumnTypes, v.ColumnDescriptions),
 
-			TableDependencies: tableDependencies,
-			Privileges:        privilegesByView[schemaQualifiedName.GetFQEscapedName()],
-			Description:       v.Description,
+			TableDependencies:  tableDependencies,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			Privileges:         privilegesByView[schemaQualifiedName.GetFQEscapedName()],
+			Description:        v.Description,
 		})
 	}
 
@@ -2462,14 +2485,17 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 // buildViewColumns zips the parallel name and type arrays a view query returns into the ordered
 // column list a View carries. Both arrays come from the same attribute query, so they have equal
 // length; the shorter one bounds the loop defensively.
-func buildViewColumns(names, types []string) []ViewColumn {
+func buildViewColumns(names, types, descriptions []string) []ViewColumn {
 	n := len(names)
 	if len(types) < n {
 		n = len(types)
 	}
+	if len(descriptions) < n {
+		n = len(descriptions)
+	}
 	columns := make([]ViewColumn, 0, n)
 	for i := 0; i < n; i++ {
-		columns = append(columns, ViewColumn{Name: names[i], Type: types[i]})
+		columns = append(columns, ViewColumn{Name: names[i], Type: types[i], Description: descriptions[i]})
 	}
 	return columns
 }
@@ -2478,6 +2504,15 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 	rawMaterializedViews, err := s.q.GetMaterializedViews(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetMaterializedViews: %w", err)
+	}
+
+	privileges, err := s.fetchPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetchPrivileges(): %w", err)
+	}
+	privilegesByMaterializedView := make(map[string][]TablePrivilege)
+	for _, p := range privileges {
+		privilegesByMaterializedView[p.table.GetFQEscapedName()] = append(privilegesByMaterializedView[p.table.GetFQEscapedName()], p.privilege)
 	}
 
 	var materializedViews []MaterializedView
@@ -2492,15 +2527,24 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 			return nil, fmt.Errorf("parsing schema qualified names JSON: %w", err)
 		}
 
+		dependsOnFunctions, err := s.fetchDependsOnFunctions(ctx, "pg_rewrite", mv.RuleOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", mv.ViewName, err)
+		}
+
+		schemaQualifiedName := buildNameFromUnescaped(mv.ViewName, mv.SchemaName)
 		materializedViews = append(materializedViews, MaterializedView{
-			SchemaQualifiedName: buildNameFromUnescaped(mv.ViewName, mv.SchemaName),
+			SchemaQualifiedName: schemaQualifiedName,
 			Owner:               mv.Owner,
 			ViewDefinition:      mv.ViewDefinition,
 			Options:             options,
 			Tablespace:          mv.TablespaceName,
+			Columns:             buildViewColumns(mv.ColumnNames, mv.ColumnTypes, mv.ColumnDescriptions),
 
-			TableDependencies: tableDependencies,
-			Description:       mv.Description,
+			TableDependencies:  tableDependencies,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			Privileges:         privilegesByMaterializedView[schemaQualifiedName.GetFQEscapedName()],
+			Description:        mv.Description,
 		})
 	}
 

@@ -990,13 +990,25 @@ SELECT
         WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
         ORDER BY a.attnum
     )::TEXT [] AS column_types,
+    -- The comments on the view's output columns, in attribute order; empty for none.
+    ARRAY(
+        SELECT COALESCE(pg_catalog.col_description(c.oid, a.attnum), '')
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_descriptions,
     PG_GET_VIEWDEF(c.oid, true) AS view_definition,
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- The view's rewrite rule: pg_depend records the functions the definition calls against it.
+    view_rule.oid AS rule_oid
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
 INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
+INNER JOIN
+    pg_catalog.pg_rewrite AS view_rule
+    ON view_rule.ev_class = c.oid AND view_rule.rulename = '_RETURN'
 WHERE
     c.relkind = 'v'
     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -1018,6 +1030,25 @@ SELECT
     owner_role.rolname::TEXT AS owner,
     c.reloptions::TEXT [] AS rel_options,
     COALESCE(ts.spcname, '')::TEXT AS tablespace_name,
+    -- The materialized view's output columns and their comments, in attribute order.
+    ARRAY(
+        SELECT a.attname::TEXT
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_names,
+    ARRAY(
+        SELECT pg_catalog.format_type(a.atttypid, a.atttypmod)
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_types,
+    ARRAY(
+        SELECT COALESCE(pg_catalog.col_description(c.oid, a.attnum), '')
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_descriptions,
     (SELECT
         ARRAY_AGG(DISTINCT JSONB_BUILD_OBJECT(
             'schema', dep_ns.nspname,
@@ -1073,10 +1104,16 @@ SELECT
     PG_GET_VIEWDEF(c.oid, true) AS view_definition,
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- The materialized view's rewrite rule: pg_depend records the functions the definition calls
+    -- against it.
+    view_rule.oid AS rule_oid
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
 INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
+INNER JOIN
+    pg_catalog.pg_rewrite AS view_rule
+    ON view_rule.ev_class = c.oid AND view_rule.rulename = '_RETURN'
 LEFT JOIN pg_catalog.pg_tablespace AS ts ON c.reltablespace = ts.oid
 WHERE
     c.relkind = 'm'
@@ -1108,9 +1145,9 @@ WITH parsed_acl AS (
         n.nspname NOT IN ('pg_catalog', 'information_schema')
         AND n.nspname !~ '^pg_toast'
         AND n.nspname !~ '^pg_temp'
-        AND (c.relkind = 'r' OR c.relkind = 'p' OR c.relkind = 'v')
+        AND c.relkind IN ('r', 'p', 'v', 'm')
         AND c.relacl IS NOT null
-        -- Exclude tables/views owned by extensions
+        -- Exclude tables/views/materialized views owned by extensions
         AND NOT EXISTS (
             SELECT depend.objid
             FROM pg_catalog.pg_depend AS depend

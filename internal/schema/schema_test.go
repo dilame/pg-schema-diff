@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "54e65a69d60eb184",
+			expectedHash: "8867f7404dd9fd8c",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,

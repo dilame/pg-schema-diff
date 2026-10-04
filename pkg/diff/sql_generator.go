@@ -472,7 +472,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing materialized views: %w", err)
 	}
 
-	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs)
+	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs, functionDiffs)
 
 	return schemaDiff{
 		oldAndNew: oldAndNew[schema.Schema]{
