@@ -39,7 +39,7 @@ var commentAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
-		name: "schema: create with comment",
+		name:         "schema: create with comment",
 		oldSchemaDDL: []string{},
 		newSchemaDDL: []string{`
 			CREATE SCHEMA app;
@@ -80,7 +80,7 @@ var commentAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
-		name: "table: create with comment + column comment",
+		name:         "table: create with comment + column comment",
 		oldSchemaDDL: []string{},
 		newSchemaDDL: []string{`
 			CREATE TABLE foo (id INT, name TEXT);
@@ -154,7 +154,7 @@ var commentAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
-		name: "enum: create with comment",
+		name:         "enum: create with comment",
 		oldSchemaDDL: []string{},
 		newSchemaDDL: []string{`
 			CREATE TYPE color AS ENUM ('red', 'green');
@@ -195,7 +195,7 @@ var commentAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
-		name: "function: create with comment",
+		name:         "function: create with comment",
 		oldSchemaDDL: []string{},
 		newSchemaDDL: []string{`
 			CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';

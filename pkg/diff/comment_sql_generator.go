@@ -91,6 +91,11 @@ func commentTargetIndex(name schema.SchemaQualifiedName) string {
 	return fmt.Sprintf("INDEX %s", name.GetFQEscapedName())
 }
 
+// commentTargetDomain formats `DOMAIN <fq>`.
+func commentTargetDomain(name schema.SchemaQualifiedName) string {
+	return fmt.Sprintf("DOMAIN %s", name.GetFQEscapedName())
+}
+
 // commentTargetSchema formats `SCHEMA <name>`.
 func commentTargetSchema(unescapedName string) string {
 	return fmt.Sprintf("SCHEMA %s", schema.EscapeIdentifier(unescapedName))

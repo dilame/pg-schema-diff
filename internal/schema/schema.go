@@ -53,9 +53,11 @@ func (o SchemaQualifiedName) IsEmpty() bool {
 // Schema is the schema of the database, not just a single Postgres schema.
 type Schema struct {
 	NamedSchemas          []NamedSchema
+	DefaultPrivileges     []DefaultPrivilege
 	Extensions            []Extension
 	Enums                 []Enum
 	CompositeTypes        []CompositeType
+	Domains               []Domain
 	Tables                []Table
 	Indexes               []Index
 	ForeignKeyConstraints []ForeignKeyConstraint
@@ -70,7 +72,13 @@ type Schema struct {
 // Normalize normalizes the schema (alphabetically sorts tables and columns in tables).
 // Useful for hashing and testing.
 func (s Schema) Normalize() Schema {
-	s.NamedSchemas = sortSchemaObjectsByName(s.NamedSchemas)
+	var normNamedSchemas []NamedSchema
+	for _, namedSchema := range sortSchemaObjectsByName(s.NamedSchemas) {
+		namedSchema.Privileges = sortSchemaObjectsByName(namedSchema.Privileges)
+		normNamedSchemas = append(normNamedSchemas, namedSchema)
+	}
+	s.NamedSchemas = normNamedSchemas
+	s.DefaultPrivileges = sortSchemaObjectsByName(s.DefaultPrivileges)
 	s.Extensions = sortSchemaObjectsByName(s.Extensions)
 	s.Enums = sortSchemaObjectsByName(s.Enums)
 
@@ -79,9 +87,20 @@ func (s Schema) Normalize() Schema {
 	var normCompositeTypes []CompositeType
 	for _, compositeType := range sortSchemaObjectsByName(s.CompositeTypes) {
 		compositeType.DependsOnCompositeTypes = sortSchemaObjectsByName(compositeType.DependsOnCompositeTypes)
+		compositeType.DependsOnDomains = sortSchemaObjectsByName(compositeType.DependsOnDomains)
 		normCompositeTypes = append(normCompositeTypes, compositeType)
 	}
 	s.CompositeTypes = normCompositeTypes
+	var normDomains []Domain
+	for _, d := range sortSchemaObjectsByName(s.Domains) {
+		// Domain constraints are un-ordered in Postgres (they are all evaluated for every
+		// value), so sorting them by name is safe and makes the schema deterministic.
+		d.Constraints = sortSchemaObjectsByName(d.Constraints)
+		d.DependsOnFunctions = sortSchemaObjectsByName(d.DependsOnFunctions)
+		d.DependsOnDomains = sortSchemaObjectsByName(d.DependsOnDomains)
+		normDomains = append(normDomains, d)
+	}
+	s.Domains = normDomains
 
 	var normTables []Table
 	for _, t := range sortSchemaObjectsByName(s.Tables) {
@@ -97,11 +116,22 @@ func (s Schema) Normalize() Schema {
 	for _, function := range sortSchemaObjectsByName(s.Functions) {
 		function.DependsOnFunctions = sortSchemaObjectsByName(function.DependsOnFunctions)
 		function.DependsOnCompositeTypes = sortSchemaObjectsByName(function.DependsOnCompositeTypes)
+		function.Privileges = sortSchemaObjectsByName(function.Privileges)
+		function.DependsOnDomains = sortSchemaObjectsByName(function.DependsOnDomains)
+		function.DependsOnRelations = sortSchemaObjectsByName(function.DependsOnRelations)
 		normFunctions = append(normFunctions, function)
 	}
 	s.Functions = normFunctions
 
-	s.Procedures = sortSchemaObjectsByName(s.Procedures)
+	var normProcedures []Procedure
+	for _, procedure := range sortSchemaObjectsByName(s.Procedures) {
+		procedure.Privileges = sortSchemaObjectsByName(procedure.Privileges)
+		procedure.DependsOnDomains = sortSchemaObjectsByName(procedure.DependsOnDomains)
+		procedure.DependsOnRelations = sortSchemaObjectsByName(procedure.DependsOnRelations)
+		normProcedures = append(normProcedures, procedure)
+	}
+	s.Procedures = normProcedures
+
 	s.Triggers = sortSchemaObjectsByName(s.Triggers)
 
 	var normViews []View
@@ -120,6 +150,7 @@ func (s Schema) Normalize() Schema {
 }
 
 func normalizeTable(t Table) Table {
+	t.DependsOnDomains = sortSchemaObjectsByName(t.DependsOnDomains)
 	// Don't normalize columns order. their order is derived from the postgres catalogs
 	// (relevant to data packing)
 	var normCheckConstraints []CheckConstraint
@@ -140,11 +171,14 @@ func normalizeTable(t Table) Table {
 		p.Columns = sortByKey(p.Columns, func(s string) string {
 			return s
 		})
+		p.DependsOnFunctions = sortSchemaObjectsByName(p.DependsOnFunctions)
+		p.DependsOnRelations = sortSchemaObjectsByName(p.DependsOnRelations)
 		normPolicies = append(normPolicies, p)
 	}
 	t.Policies = normPolicies
 
 	t.Privileges = sortSchemaObjectsByName(t.Privileges)
+	t.ColumnPrivileges = sortSchemaObjectsByName(t.ColumnPrivileges)
 
 	return t
 }
@@ -158,6 +192,7 @@ func normalizeView(v View) View {
 	v.TableDependencies = normTableDeps
 
 	v.Privileges = sortSchemaObjectsByName(v.Privileges)
+	v.DependsOnFunctions = sortSchemaObjectsByName(v.DependsOnFunctions)
 
 	return v
 }
@@ -169,6 +204,8 @@ func normalizeMaterializedView(mv MaterializedView) MaterializedView {
 		normTableDeps = append(normTableDeps, d)
 	}
 	mv.TableDependencies = normTableDeps
+	mv.DependsOnFunctions = sortSchemaObjectsByName(mv.DependsOnFunctions)
+	mv.Privileges = sortSchemaObjectsByName(mv.Privileges)
 	return mv
 }
 
@@ -212,10 +249,69 @@ type NamedSchema struct {
 	Name string
 	// Description is the comment attached to the schema (pg_description). Empty means no comment.
 	Description string
+	// Owner is used for ownership diffs and for filtering the owner's implicit schema privileges.
+	Owner      string
+	Privileges []SchemaPrivilege
 }
 
 func (n NamedSchema) GetName() string {
 	return n.Name
+}
+
+// SchemaPrivilege represents a privilege granted on a schema.
+type SchemaPrivilege struct {
+	// Grantee is the role that has the privilege. Empty string means PUBLIC.
+	Grantee string
+	// Privilege is the type of privilege (USAGE, CREATE)
+	Privilege string
+	// IsGrantable indicates if the grantee can grant this privilege to others (WITH GRANT OPTION)
+	IsGrantable bool
+}
+
+func (p SchemaPrivilege) GetName() string {
+	grantee := p.Grantee
+	if grantee == "" {
+		grantee = "PUBLIC"
+	}
+	return fmt.Sprintf("%s:%s", grantee, p.Privilege)
+}
+
+// DefaultPrivilege is one privilege of an `ALTER DEFAULT PRIVILEGES ... IN SCHEMA ...` rule,
+// i.e. one aclitem of one schema-scoped `pg_default_acl` row.
+//
+// Database-wide default privileges (`ALTER DEFAULT PRIVILEGES` without `IN SCHEMA`) are out of
+// scope: they are not attached to any schema, so a schema-scoped declarative source cannot
+// express them.
+type DefaultPrivilege struct {
+	// TargetRole is the role whose newly created objects the rule applies to (`FOR ROLE`).
+	TargetRole string
+	// SchemaName is the schema the rule is scoped to (`IN SCHEMA`).
+	SchemaName string
+	// ObjectType is the object class the rule applies to: TABLES, SEQUENCES, FUNCTIONS or TYPES.
+	ObjectType string
+	// Grantee is the role that receives the privilege. Empty string means PUBLIC.
+	Grantee string
+	// Privilege is the type of privilege, e.g. SELECT, USAGE, EXECUTE.
+	Privilege string
+	// IsGrantable indicates if the grantee can grant this privilege to others (WITH GRANT OPTION).
+	IsGrantable bool
+}
+
+func (p DefaultPrivilege) GetName() string {
+	grantee := p.Grantee
+	if grantee == "" {
+		grantee = "PUBLIC"
+	}
+	return fmt.Sprintf("%s:%s:%s:%s:%s", p.TargetRole, p.SchemaName, p.ObjectType, grantee, p.Privilege)
+}
+
+// defaultACLObjectTypes maps a `pg_default_acl.defaclobjtype` char to the keyword used by
+// `ALTER DEFAULT PRIVILEGES ... ON <object type>`.
+var defaultACLObjectTypes = map[string]string{
+	"r": "TABLES",
+	"S": "SEQUENCES",
+	"f": "FUNCTIONS",
+	"T": "TYPES",
 }
 
 type Extension struct {
@@ -227,6 +323,8 @@ type Extension struct {
 
 type Enum struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the enum type.
+	Owner  string
 	Labels []string
 	// Description is the comment attached to the enum type (pg_description). Empty means no comment.
 	Description string
@@ -256,18 +354,63 @@ type CompositeType struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the type (pg_description). Empty means no comment.
 	Description string
+	// DependsOnDomains is the list of domains used as the type of at least one of this
+	// composite type's attributes, including references through array types.
+	DependsOnDomains []SchemaQualifiedName
 	// IsUsedByTable is true iff at least one table column has this composite type as its
 	// declared type. When true, attribute-level changes to the type are unsupported by the
 	// diff generator (recreating the type would require rewriting every consumer table).
 	IsUsedByTable bool
 }
 
+// DomainConstraint is a CHECK constraint attached to a domain.
+type DomainConstraint struct {
+	Name string
+	// Def is the constraint definition taken verbatim from `pg_get_constraintdef`, e.g.
+	// `CHECK ((VALUE > (0)::numeric))` or `CHECK (some_schema.is_valid(VALUE)) NOT VALID`.
+	// It is kept verbatim so that expressions calling user-defined functions round-trip
+	// exactly as Postgres deparses them.
+	Def string
+}
+
+func (c DomainConstraint) GetName() string {
+	return c.Name
+}
+
+// Domain represents a user-defined domain (`CREATE DOMAIN foo AS numeric CHECK (VALUE > 0)`).
+type Domain struct {
+	SchemaQualifiedName
+	// BaseType is the underlying type formatted by `pg_catalog.format_type`, including the
+	// type modifier, e.g. `numeric(10,2)`.
+	BaseType string
+	// IsNotNull is the domain-level NOT NULL constraint.
+	IsNotNull bool
+	// Default is the SQL string of the domain's default value. Empty means no default.
+	Default string
+	// Collation is only set if the domain's collation differs from its base type's collation.
+	Collation   SchemaQualifiedName
+	Constraints []DomainConstraint
+	// DependsOnFunctions is the list of functions referenced by the domain's CHECK
+	// expressions and default value. The domain must be created after them and dropped
+	// before them.
+	DependsOnFunctions []SchemaQualifiedName
+	// DependsOnDomains is the list of domains this domain is built on top of (a domain
+	// may have another domain as its base type).
+	DependsOnDomains []SchemaQualifiedName
+	// Description is the comment attached to the domain (pg_description). Empty means no comment.
+	Description string
+}
+
 type Table struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the table.
+	Owner            string
 	Columns          []Column
 	CheckConstraints []CheckConstraint
 	Policies         []Policy
 	Privileges       []TablePrivilege
+	ColumnPrivileges []ColumnPrivilege
+	IsUnlogged       bool
 	ReplicaIdentity  ReplicaIdentity
 	RLSEnabled       bool
 	RLSForced        bool
@@ -282,6 +425,9 @@ type Table struct {
 
 	// Description is the comment attached to the table (pg_description). Empty means no comment.
 	Description string
+	// DependsOnDomains is the list of domains used as the type of at least one of the
+	// table's columns. The table must be created/altered after those domains exist.
+	DependsOnDomains []SchemaQualifiedName
 }
 
 func (t Table) IsPartitioned() bool {
@@ -295,22 +441,45 @@ func (t Table) IsPartition() bool {
 	return t.ParentTable != nil
 }
 
-// TablePrivilege represents a privilege granted on a table
-type TablePrivilege struct {
+// Privilege represents a privilege granted on a schema object.
+type Privilege struct {
 	// Grantee is the role that has the privilege. Empty string means PUBLIC.
 	Grantee string
-	// Privilege is the type of privilege (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER)
+	// Privilege is the type of privilege (SELECT, EXECUTE, etc.)
 	Privilege string
 	// IsGrantable indicates if the grantee can grant this privilege to others (WITH GRANT OPTION)
 	IsGrantable bool
 }
 
-func (p TablePrivilege) GetName() string {
+func (p Privilege) GetName() string {
 	grantee := p.Grantee
 	if grantee == "" {
 		grantee = "PUBLIC"
 	}
 	return fmt.Sprintf("%s:%s", grantee, p.Privilege)
+}
+
+// TablePrivilege represents a privilege granted on a table.
+type TablePrivilege = Privilege
+
+// ColumnPrivilege represents a privilege granted on a single column of a table.
+type ColumnPrivilege struct {
+	// ColumnName is the name of the column the privilege is granted on.
+	ColumnName string
+	// Grantee is the role that has the privilege. Empty string means PUBLIC.
+	Grantee string
+	// Privilege is the type of privilege (SELECT, INSERT, UPDATE, REFERENCES)
+	Privilege string
+	// IsGrantable indicates if the grantee can grant this privilege to others (WITH GRANT OPTION)
+	IsGrantable bool
+}
+
+func (p ColumnPrivilege) GetName() string {
+	grantee := p.Grantee
+	if grantee == "" {
+		grantee = "PUBLIC"
+	}
+	return fmt.Sprintf("%s:%s:%s", p.ColumnName, grantee, p.Privilege)
 }
 
 type ColumnIdentityType string
@@ -358,6 +527,9 @@ type (
 		Identity *ColumnIdentity
 		// Description is the comment attached to the column (pg_description). Empty means no comment.
 		Description string
+		// DefaultDependsOnFunctions is the list of functions the column's default calls. PostgreSQL
+		// refuses to drop such a function while the default exists.
+		DefaultDependsOnFunctions []SchemaQualifiedName
 	}
 )
 
@@ -429,6 +601,10 @@ type (
 		// Note: when the index backs a constraint (PRIMARY KEY / UNIQUE), the comment lives on the
 		// constraint instead — see IndexConstraint.Description.
 		Description string
+
+		// DependsOnFunctions is the list of functions the index's expressions or predicate call.
+		// PostgreSQL refuses to drop such a function while the index exists.
+		DependsOnFunctions []SchemaQualifiedName
 	}
 )
 
@@ -494,6 +670,9 @@ type (
 
 	Sequence struct {
 		SchemaQualifiedName
+		// RoleOwner is the role that owns the sequence. Owner is already used for
+		// the sequence's OWNED BY table/column dependency.
+		RoleOwner  string
 		Owner      *SequenceOwner
 		Type       string
 		StartValue int64
@@ -507,15 +686,71 @@ type (
 	}
 )
 
+// RelationKind is the pg_class.relkind of a relation that another schema object references — by
+// row type (a routine's signature) or by reading it (a view or materialized view).
+type RelationKind string
+
+const (
+	// RelationKindTable is an ordinary table ('r') or a partitioned table ('p').
+	RelationKindTable RelationKind = "r"
+	// RelationKindPartitionedTable is a partitioned table, which owns its own row type.
+	RelationKindPartitionedTable RelationKind = "p"
+	// RelationKindView is a view.
+	RelationKindView RelationKind = "v"
+	// RelationKindMaterializedView is a materialized view.
+	RelationKindMaterializedView RelationKind = "m"
+)
+
+// IsTable reports whether the relation is a table (ordinary or partitioned), i.e., a relation whose
+// columns the schema models per column.
+func (k RelationKind) IsTable() bool {
+	return k == RelationKindTable || k == RelationKindPartitionedTable
+}
+
+// RelationDependency is a relation whose row type is referenced by a routine's signature — an
+// argument type, the RETURNS type, or a RETURNS TABLE column. PostgreSQL validates those references
+// at CREATE time, so the relation (and therefore its row type) must exist first.
+type RelationDependency struct {
+	SchemaQualifiedName
+	Kind RelationKind
+}
+
+// RelationColumnDependency is one relation column an object depends on. A SQL-standard body
+// (`BEGIN ATOMIC`) resolves its references at CREATE time and PostgreSQL records each one in
+// pg_depend with the column's attribute number, so the object has to be dropped before that column
+// is altered or dropped, and re-created afterwards.
+type RelationColumnDependency struct {
+	SchemaQualifiedName
+	Column string
+}
+
 type Function struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the function.
+	Owner string
 	// FunctionDef is the statement required to completely (re)create
 	// the function, as returned by `pg_get_functiondef`. It is a CREATE OR REPLACE
 	// statement
 	FunctionDef string
+	// FunctionDefCanonical is FunctionDef rewritten to the fixed point of
+	// pg_get_functiondef: the statement PostgreSQL returns when the statement is
+	// created and read back. Two functions with the same canonical definition are
+	// the same function, and the diff compares this field rather than FunctionDef,
+	// because a definition read from pg_get_functiondef is not necessarily its own
+	// output: deparsing names an output column a definition left unnamed, so a
+	// function created from that text can deparse to a different text than the
+	// function it was created from. Without it the differ reports a difference
+	// between two databases that hold the same function.
+	FunctionDefCanonical string
 	// Language is the language of the function. This is relevant in determining if we
 	// can track the dependencies of the function (or not)
-	Language           string
+	Language string
+	// ResultType is the function's result type as reported by
+	// pg_get_function_result, e.g. `integer`, `SETOF integer` or `TABLE(a integer)`.
+	// `CREATE OR REPLACE FUNCTION` cannot change it, so a difference here means
+	// the function has to be dropped and re-created rather than replaced. Empty
+	// for procedures, which have no result type.
+	ResultType         string
 	DependsOnFunctions []SchemaQualifiedName
 	// DependsOnCompositeTypes is the list of user-defined composite types referenced
 	// (by argument, return, or body resolution) by this function. When any of those
@@ -524,10 +759,24 @@ type Function struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the function (pg_description). Empty means no comment.
 	Description string
+	Privileges              []Privilege
+	// DependsOnDomains is the list of domains referenced by the function's signature
+	// (argument or return types). The function must be created after those domains exist.
+	DependsOnDomains []SchemaQualifiedName
+	// DependsOnRelations is the list of relations whose row type is referenced by the
+	// function's signature. The function must be created after those relations exist.
+	DependsOnRelations []RelationDependency
+	// DependsOnRelationColumns is the list of relation columns a SQL-standard body
+	// (`BEGIN ATOMIC`) reads. When one of those columns is altered or dropped, the function
+	// must be dropped before the change and re-created after it. Empty for string-body SQL
+	// functions and plpgsql, whose body references pg_depend does not record.
+	DependsOnRelationColumns []RelationColumnDependency
 }
 
 type Procedure struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the procedure.
+	Owner string
 	// Def is the statement required to completely (re)create
 	// the procedure, as returned by `pg_get_functiondef`. It is a CREATE OR REPLACE
 	// statement.
@@ -536,6 +785,11 @@ type Procedure struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the procedure (pg_description). Empty means no comment.
 	Description string
+	Privileges              []Privilege
+	// DependsOnDomains — see Function.DependsOnDomains.
+	DependsOnDomains []SchemaQualifiedName
+	// DependsOnRelations — see Function.DependsOnRelations.
+	DependsOnRelations []RelationDependency
 }
 
 var (
@@ -577,6 +831,13 @@ type Policy struct {
 	Columns []string
 	// Description is the comment attached to the policy (pg_description). Empty means no comment.
 	Description string
+	// DependsOnFunctions is the list of functions referenced by the policy's USING and WITH CHECK
+	// expressions. PostgreSQL resolves those references at CREATE POLICY time, so the table that
+	// carries the policy must be created after the functions exist and dropped before they are.
+	DependsOnFunctions []SchemaQualifiedName
+	// DependsOnRelations is the list of relations referenced by the policy's USING and WITH CHECK
+	// expressions, on the same terms as DependsOnFunctions.
+	DependsOnRelations []RelationDependency
 }
 
 func (p Policy) GetName() string {
@@ -593,43 +854,95 @@ type Trigger struct {
 	IsConstraint      bool
 	// Description is the comment attached to the trigger (pg_description). Empty means no comment.
 	Description string
+	// Enabled is pg_trigger.tgenabled: O (fires in origin and local mode), D (disabled), R (fires in
+	// replica mode only) or A (fires always). A created trigger starts as O.
+	Enabled string
+	// DependsOnFunctions is the list of functions the trigger calls: its own function and the ones
+	// its WHEN condition calls. PostgreSQL refuses to drop such a function while the trigger exists.
+	DependsOnFunctions []SchemaQualifiedName
 }
 
 func (t Trigger) GetName() string {
 	return t.OwningTable.GetFQEscapedName() + "-" + t.EscapedName
 }
 
-// TableDependency represents a (view's) dependency on a table.
 type TableDependency struct {
 	SchemaQualifiedName
+	// Kind is the dependency's pg_class.relkind. A view or materialized view reads tables, views,
+	// and materialized views alike; the kind says which generator owns the dependency's statement.
+	Kind RelationKind
+	// Columns are the dependency's columns that the view reads. Empty for a non-table dependency,
+	// whose columns are not tracked per column.
 	Columns []string
 }
 
 type View struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the view.
+	Owner string
 	// ViewDefinition is the select query that defines the view. It is derived from pg_get_viewdef.
 	ViewDefinition string
+	// ViewDefinitionCanonical is ViewDefinition rewritten to the fixed point of
+	// pg_get_viewdef: the definition PostgreSQL returns when the view is created
+	// from ViewDefinition and read back. Two views with the same canonical
+	// definition are the same view, and the diff compares this field rather than
+	// ViewDefinition, because a text that is an output of pg_get_viewdef is not
+	// necessarily its own output: deparsing names an output column the definition
+	// left unnamed, so re-creating a view from that text can change it.
+	ViewDefinitionCanonical string
 	// Options represents key value map of view options, i.e., pg_class.reloptions.
 	Options map[string]string
 
+	// Columns is the view's output columns, in order. A view's definition can be replaced in place
+	// (`CREATE OR REPLACE VIEW`) only while these columns are unchanged or extended; a removed,
+	// reordered, or retyped column forces the view to be dropped and re-created. The diff compares
+	// them to choose between the two.
+	Columns []ViewColumn
+
 	// TableDependencies is a list of tables the view depends on.
 	TableDependencies []TableDependency
-	Privileges        []TablePrivilege
+	// DependsOnFunctions is the list of functions the view's definition calls. PostgreSQL records
+	// them against the view's rewrite rule and refuses to drop such a function while the view
+	// exists, so the view is created after them and dropped before them.
+	DependsOnFunctions []SchemaQualifiedName
+	Privileges         []TablePrivilege
 	// Description is the comment attached to the view (pg_description). Empty means no comment.
+	Description string
+}
+
+// ViewColumn is one output column of a view: its name, its type as formatted by
+// pg_catalog.format_type, and its comment.
+type ViewColumn struct {
+	Name string
+	Type string
+	// Description is the comment attached to the column (pg_description). Empty means no comment.
 	Description string
 }
 
 type MaterializedView struct {
 	SchemaQualifiedName
+	// Owner is the role that owns the materialized view.
+	Owner string
 	// ViewDefinition is the select query that defines the materialized view. It is derived from pg_get_viewdef.
 	ViewDefinition string
+	// ViewDefinitionCanonical is ViewDefinition rewritten to the fixed point of
+	// pg_get_viewdef. See View.ViewDefinitionCanonical.
+	ViewDefinitionCanonical string
 	// Options represents key value map of materialized view options, i.e., pg_class.reloptions.
 	Options map[string]string
 	// Tablespace is the tablespace where the materialized view is stored. Empty string means default tablespace.
 	Tablespace string
+	// Columns is the materialized view's output columns, in order. They follow from the definition;
+	// the diff reads them for the comments on them.
+	Columns []ViewColumn
 
 	// TableDependencies is a list of tables the materialized view depends on.
 	TableDependencies []TableDependency
+	// DependsOnFunctions is the list of functions the materialized view's definition calls. See
+	// View.DependsOnFunctions.
+	DependsOnFunctions []SchemaQualifiedName
+	// Privileges are the grants on the materialized view.
+	Privileges []TablePrivilege
 	// Description is the comment attached to the materialized view (pg_description). Empty means no comment.
 	Description string
 }
@@ -689,6 +1002,7 @@ func GetSchema(ctx context.Context, db queries.DBTX, opts ...GetSchemaOpt) (Sche
 
 	return (&schemaFetcher{
 		q:                      queries.New(db),
+		db:                     db,
 		goroutineRunnerFactory: goroutineRunnerFactory,
 		nameFilter:             nameFilter,
 	}).getSchema(ctx)
@@ -749,6 +1063,10 @@ func buildExcludeSchemasFilter(schemas []string) nameFilter {
 type (
 	schemaFetcher struct {
 		q *queries.Queries
+		// db is the connection the fetcher was given. It is used to acquire a
+		// single connection for canonicalizing view definitions, which needs
+		// temporary objects and therefore one session.
+		db queries.DBTX
 		// goroutineRunnerFactory is a factory function that returns a GoroutineRunner. We need to be able to construct
 		// multiple GoroutineRunners to avoid deadlock created by circular dependencies of submitted go routines.
 		goroutineRunnerFactory func() concurrent.GoroutineRunner
@@ -776,6 +1094,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("starting named schemas future: %w", err)
 	}
 
+	defaultPrivilegesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]DefaultPrivilege, error) {
+		return s.fetchDefaultPrivileges(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting default privileges future: %w", err)
+	}
+
 	extensionsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Extension, error) {
 		return s.fetchExtensions(ctx)
 	})
@@ -795,6 +1120,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	})
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting composite types future: %w", err)
+	}
+
+	domainsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Domain, error) {
+		return s.fetchDomains(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting domains future: %w", err)
 	}
 
 	tablesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Table, error) {
@@ -865,6 +1197,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("getting named schemas: %w", err)
 	}
 
+	defaultPrivileges, err := defaultPrivilegesFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting default privileges: %w", err)
+	}
+
 	extensions, err := extensionsFuture.Get(ctx)
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting extensions: %w", err)
@@ -878,6 +1215,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	compositeTypes, err := compositeTypesFuture.Get(ctx)
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting composite types: %w", err)
+	}
+
+	domains, err := domainsFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting domains: %w", err)
 	}
 
 	tables, err := tablesFuture.Get(ctx)
@@ -925,11 +1267,23 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("getting materialized views: %w", err)
 	}
 
+	views, materializedViews, err = s.canonicalizeViewDefinitions(ctx, views, materializedViews)
+	if err != nil {
+		return Schema{}, err
+	}
+
+	functions, err = s.canonicalizeFunctionDefinitions(ctx, functions)
+	if err != nil {
+		return Schema{}, err
+	}
+
 	return Schema{
 		NamedSchemas:          schemas,
+		DefaultPrivileges:     defaultPrivileges,
 		Extensions:            extensions,
 		Enums:                 enums,
 		CompositeTypes:        compositeTypes,
+		Domains:               domains,
 		Tables:                tables,
 		Indexes:               indexes,
 		ForeignKeyConstraints: fkCons,
@@ -942,17 +1296,71 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	}, nil
 }
 
+func (s *schemaFetcher) fetchDefaultPrivileges(ctx context.Context) ([]DefaultPrivilege, error) {
+	rawPrivileges, err := s.q.GetDefaultPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetDefaultPrivileges: %w", err)
+	}
+
+	var privileges []DefaultPrivilege
+	for _, rawPrivilege := range rawPrivileges {
+		objectType, ok := defaultACLObjectTypes[rawPrivilege.ObjectType]
+		if !ok {
+			return nil, fmt.Errorf("unknown pg_default_acl object type %q", rawPrivilege.ObjectType)
+		}
+
+		// sqlc types ACLEXPLODE's is_grantable as interface{}.
+		isGrantable := false
+		if b, ok := rawPrivilege.IsGrantable.(bool); ok {
+			isGrantable = b
+		}
+
+		privileges = append(privileges, DefaultPrivilege{
+			TargetRole:  rawPrivilege.TargetRole,
+			SchemaName:  rawPrivilege.SchemaName,
+			ObjectType:  objectType,
+			Grantee:     rawPrivilege.Grantee,
+			Privilege:   rawPrivilege.Privilege,
+			IsGrantable: isGrantable,
+		})
+	}
+
+	privileges = filterSliceByName(
+		privileges,
+		func(p DefaultPrivilege) SchemaQualifiedName {
+			return SchemaQualifiedName{
+				SchemaName:  p.SchemaName,
+				EscapedName: EscapeIdentifier(p.SchemaName),
+			}
+		},
+		s.nameFilter,
+	)
+
+	return privileges, nil
+}
+
 func (s *schemaFetcher) fetchNamedSchemas(ctx context.Context) ([]NamedSchema, error) {
-	rawSchemas, err := s.q.GetSchemas(ctx)
+	schemaRows, err := s.q.GetSchemas(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetSchemas(): %w", err)
 	}
 
+	schemaPrivileges, err := s.fetchSchemaPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetchSchemaPrivileges(): %w", err)
+	}
+	privilegesBySchema := make(map[string][]SchemaPrivilege)
+	for _, p := range schemaPrivileges {
+		privilegesBySchema[p.schemaName] = append(privilegesBySchema[p.schemaName], p.privilege)
+	}
+
 	var schemas []NamedSchema
-	for _, rs := range rawSchemas {
+	for _, schemaRow := range schemaRows {
 		schemas = append(schemas, NamedSchema{
-			Name:        rs.SchemaName,
-			Description: rs.Description,
+			Name:        schemaRow.SchemaName,
+			Description: schemaRow.Description,
+			Owner:       schemaRow.Owner,
+			Privileges:  privilegesBySchema[schemaRow.SchemaName],
 		})
 	}
 
@@ -1012,6 +1420,7 @@ func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
 				SchemaName:  rawEnum.EnumSchemaName,
 				EscapedName: EscapeIdentifier(rawEnum.EnumName),
 			},
+			Owner:       rawEnum.Owner,
 			Labels:      rawEnum.EnumLabels,
 			Description: rawEnum.Description,
 		})
@@ -1084,6 +1493,14 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 		}
 		e.ct.DependsOnCompositeTypes = dependsOnTypes
 
+		// Attribute type dependencies (including a domain used by an attribute) are recorded
+		// against the composite type's pg_class entry, exactly like a table column's.
+		dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_class", e.relOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnDomains(%s): %w", e.relOid, err)
+		}
+		e.ct.DependsOnDomains = dependsOnDomains
+
 		consumers, err := s.q.GetCompositeTypeTableConsumers(ctx, e.typeOid)
 		if err != nil {
 			return nil, fmt.Errorf("GetCompositeTypeTableConsumers: %w", err)
@@ -1101,6 +1518,134 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 	)
 
 	return compositeTypes, nil
+}
+
+func (s *schemaFetcher) fetchDomains(ctx context.Context) ([]Domain, error) {
+	rawDomains, err := s.q.GetDomains(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetDomains: %w", err)
+	}
+
+	var domains []Domain
+	for _, rawDomain := range rawDomains {
+		rawConstraints, err := s.q.GetDomainConstraints(ctx, rawDomain.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("GetDomainConstraints(%s): %w", rawDomain.Oid, err)
+		}
+
+		// The domain's default expression records its function dependencies against the
+		// pg_type entry, while each CHECK expression records them against its own
+		// pg_constraint entry, so both catalogs must be probed.
+		dependsOnFunctions, err := s.fetchDependsOnFunctions(ctx, "pg_type", rawDomain.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rawDomain.Oid, err)
+		}
+
+		var constraints []DomainConstraint
+		for _, rawConstraint := range rawConstraints {
+			constraints = append(constraints, DomainConstraint{
+				Name: rawConstraint.ConstraintName,
+				Def:  rawConstraint.ConstraintDef,
+			})
+			constraintDeps, err := s.fetchDependsOnFunctions(ctx, "pg_constraint", rawConstraint.Oid)
+			if err != nil {
+				return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rawConstraint.Oid, err)
+			}
+			dependsOnFunctions = append(dependsOnFunctions, constraintDeps...)
+		}
+
+		dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_type", rawDomain.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnDomains(%s): %w", rawDomain.Oid, err)
+		}
+
+		collation := SchemaQualifiedName{}
+		if rawDomain.CollationName != "" {
+			collation = SchemaQualifiedName{
+				EscapedName: EscapeIdentifier(rawDomain.CollationName),
+				SchemaName:  rawDomain.CollationSchemaName,
+			}
+		}
+
+		domains = append(domains, Domain{
+			SchemaQualifiedName: SchemaQualifiedName{
+				SchemaName:  rawDomain.DomainSchemaName,
+				EscapedName: EscapeIdentifier(rawDomain.DomainName),
+			},
+			BaseType:           rawDomain.BaseType,
+			IsNotNull:          rawDomain.IsNotNull,
+			Default:            rawDomain.DefaultValue,
+			Collation:          collation,
+			Constraints:        constraints,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			DependsOnDomains:   dependsOnDomains,
+			Description:        rawDomain.Description,
+		})
+	}
+
+	domains = filterSliceByName(
+		domains,
+		func(d Domain) SchemaQualifiedName {
+			return d.SchemaQualifiedName
+		},
+		s.nameFilter,
+	)
+
+	return domains, nil
+}
+
+func (s *schemaFetcher) fetchDependsOnDomains(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
+	rows, err := s.q.GetDependsOnDomains(ctx, queries.GetDependsOnDomainsParams{
+		SystemCatalog: systemCatalog,
+		ObjectID:      oid,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var names []SchemaQualifiedName
+	for _, row := range rows {
+		names = append(names, SchemaQualifiedName{
+			SchemaName:  row.DomainSchemaName,
+			EscapedName: EscapeIdentifier(row.DomainName),
+		})
+	}
+	return names, nil
+}
+
+func dedupeSchemaQualifiedNames(names []SchemaQualifiedName) []SchemaQualifiedName {
+	seen := make(map[string]bool, len(names))
+	var deduped []SchemaQualifiedName
+	for _, n := range names {
+		if seen[n.GetName()] {
+			continue
+		}
+		seen[n.GetName()] = true
+		deduped = append(deduped, n)
+	}
+	return deduped
+}
+
+func (s *schemaFetcher) fetchDependsOnRelations(ctx context.Context, systemCatalog string, oid any) ([]RelationDependency, error) {
+	rows, err := s.q.GetDependsOnRelations(ctx, queries.GetDependsOnRelationsParams{
+		SystemCatalog: systemCatalog,
+		ObjectID:      oid,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var relations []RelationDependency
+	for _, row := range rows {
+		relations = append(relations, RelationDependency{
+			SchemaQualifiedName: SchemaQualifiedName{
+				SchemaName:  row.RelationSchemaName,
+				EscapedName: EscapeIdentifier(row.RelationName),
+			},
+			Kind: RelationKind(row.RelationKind),
+		})
+	}
+	return relations, nil
 }
 
 func (s *schemaFetcher) fetchTables(ctx context.Context) ([]Table, error) {
@@ -1136,12 +1681,21 @@ func (s *schemaFetcher) fetchTables(ctx context.Context) ([]Table, error) {
 		privilegesByTable[p.table.GetFQEscapedName()] = append(privilegesByTable[p.table.GetFQEscapedName()], p.privilege)
 	}
 
+	columnPrivileges, err := s.fetchColumnPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetchColumnPrivileges(): %w", err)
+	}
+	columnPrivilegesByTable := make(map[string][]ColumnPrivilege)
+	for _, p := range columnPrivileges {
+		columnPrivilegesByTable[p.table.GetFQEscapedName()] = append(columnPrivilegesByTable[p.table.GetFQEscapedName()], p.privilege)
+	}
+
 	goroutineRunner := s.goroutineRunnerFactory()
 	var tableFutures []concurrent.Future[Table]
 	for _, _rawTable := range rawTables {
 		rawTable := _rawTable // Capture loop variables for go routine
 		tableFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() (Table, error) {
-			return s.buildTable(ctx, rawTable, checkConsByTable, policiesByTable, privilegesByTable)
+			return s.buildTable(ctx, rawTable, checkConsByTable, policiesByTable, privilegesByTable, columnPrivilegesByTable)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("starting table future: %w", err)
@@ -1170,13 +1724,22 @@ func (s *schemaFetcher) buildTable(
 	checkConsByTable map[string][]CheckConstraint,
 	policiesByTable map[string][]Policy,
 	privilegesByTable map[string][]TablePrivilege,
+	columnPrivilegesByTable map[string][]ColumnPrivilege,
 ) (Table, error) {
 	rawColumns, err := s.q.GetColumnsForTable(ctx, table.Oid)
 	if err != nil {
 		return Table{}, fmt.Errorf("GetColumnsForTable(%s): %w", table.Oid, err)
 	}
+	dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_class", table.Oid)
+	if err != nil {
+		return Table{}, fmt.Errorf("fetchDependsOnDomains(%s): %w", table.Oid, err)
+	}
 	var columns []Column
 	for _, column := range rawColumns {
+		defaultDependsOnFunctions, err := parseJSONFunctionNames(column.DefaultDependsOnFunctions)
+		if err != nil {
+			return Table{}, fmt.Errorf("parsing the functions the default of column %q calls: %w", column.ColumnName, err)
+		}
 		collation := SchemaQualifiedName{}
 		if len(column.CollationName) > 0 {
 			collation = SchemaQualifiedName{
@@ -1216,6 +1779,8 @@ func (s *schemaFetcher) buildTable(
 			Size:                 int(column.ColumnSize),
 			Identity:             identity,
 			Description:          column.Description,
+
+			DefaultDependsOnFunctions: defaultDependsOnFunctions,
 		})
 	}
 
@@ -1232,10 +1797,14 @@ func (s *schemaFetcher) buildTable(
 	}
 	return Table{
 		SchemaQualifiedName: schemaQualifiedName,
+		Owner:               table.Owner,
 		Columns:             columns,
+		DependsOnDomains:    dependsOnDomains,
 		CheckConstraints:    checkConsByTable[schemaQualifiedName.GetFQEscapedName()],
 		Policies:            policiesByTable[schemaQualifiedName.GetFQEscapedName()],
 		Privileges:          privilegesByTable[schemaQualifiedName.GetFQEscapedName()],
+		ColumnPrivileges:    columnPrivilegesByTable[schemaQualifiedName.GetFQEscapedName()],
+		IsUnlogged:          table.IsUnlogged,
 		ReplicaIdentity:     ReplicaIdentity(table.ReplicaIdentity),
 		RLSEnabled:          table.RlsEnabled,
 		RLSForced:           table.RlsForced,
@@ -1325,7 +1894,11 @@ func (s *schemaFetcher) fetchIndexes(ctx context.Context) ([]Index, error) {
 
 	var idxs []Index
 	for _, idx := range rawIndexes {
-		idxs = append(idxs, s.buildIndex(idx))
+		builtIdx, err := s.buildIndex(idx)
+		if err != nil {
+			return nil, err
+		}
+		idxs = append(idxs, builtIdx)
 	}
 
 	idxs = filterSliceByName(
@@ -1339,7 +1912,12 @@ func (s *schemaFetcher) fetchIndexes(ctx context.Context) ([]Index, error) {
 	return idxs, nil
 }
 
-func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) Index {
+func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) (Index, error) {
+	dependsOnFunctions, err := parseJSONFunctionNames(rawIndex.DependsOnFunctions)
+	if err != nil {
+		return Index{}, fmt.Errorf("parsing the functions index %q calls: %w", rawIndex.IndexName, err)
+	}
+
 	var indexConstraint *IndexConstraint
 	if rawIndex.ConstraintName != "" {
 		indexConstraint = &IndexConstraint{
@@ -1376,7 +1954,9 @@ func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) Index {
 		ParentIdx: parentIdx,
 
 		Description: rawIndex.Description,
-	}
+
+		DependsOnFunctions: dependsOnFunctions,
+	}, nil
 }
 
 func (s *schemaFetcher) fetchForeignKeyCons(ctx context.Context) ([]ForeignKeyConstraint, error) {
@@ -1440,6 +2020,7 @@ func (s *schemaFetcher) fetchSequences(ctx context.Context) ([]Sequence, error) 
 				SchemaName:  rawSeq.SequenceSchemaName,
 				EscapedName: EscapeIdentifier(rawSeq.SequenceName),
 			},
+			RoleOwner:   rawSeq.Owner,
 			Owner:       owner,
 			Type:        rawSeq.DataType,
 			StartValue:  rawSeq.StartValue,
@@ -1511,14 +2092,61 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 		return Function{}, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", rawFunction.Oid, err)
 	}
 
+	privileges, err := parseJSONPrivileges(rawFunction.Privileges)
+	if err != nil {
+		return Function{}, fmt.Errorf("parseJSONPrivileges(%s): %w", rawFunction.Oid, err)
+	}
+
+	dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_proc", rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("fetchDependsOnDomains(%s): %w", rawFunction.Oid, err)
+	}
+
+	dependsOnRelations, err := s.fetchDependsOnRelations(ctx, "pg_proc", rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("fetchDependsOnRelations(%s): %w", rawFunction.Oid, err)
+	}
+
+	dependsOnRelationColumns, err := s.fetchDependsOnRelationColumns(ctx, "pg_proc", rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("fetchDependsOnRelationColumns(%s): %w", rawFunction.Oid, err)
+	}
+
 	return Function{
-		SchemaQualifiedName:     buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
-		FunctionDef:             rawFunction.FuncDef,
-		Language:                rawFunction.FuncLang,
-		DependsOnFunctions:      dependsOnFunctions,
-		DependsOnCompositeTypes: dependsOnTypes,
-		Description:             rawFunction.Description,
+		SchemaQualifiedName:      buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
+		Owner:                    rawFunction.Owner,
+		FunctionDef:              rawFunction.FuncDef,
+		Language:                 rawFunction.FuncLang,
+		ResultType:               rawFunction.FuncResult,
+		DependsOnFunctions:       dependsOnFunctions,
+		Description:              rawFunction.Description,
+		DependsOnCompositeTypes:  dependsOnTypes,
+		DependsOnDomains:         dependsOnDomains,
+		Privileges:               privileges,
+		DependsOnRelations:       dependsOnRelations,
+		DependsOnRelationColumns: dependsOnRelationColumns,
 	}, nil
+}
+
+// fetchDependsOnRelationColumns returns the relation columns the given object references, one entry
+// per (relation, column) pair. Only a SQL-standard body records those references, so the list is
+// empty for a string-body SQL function and for plpgsql.
+func (s *schemaFetcher) fetchDependsOnRelationColumns(ctx context.Context, systemCatalog string, oid any) ([]RelationColumnDependency, error) {
+	rows, err := s.q.GetDependsOnRelationColumns(ctx, queries.GetDependsOnRelationColumnsParams{
+		SystemCatalog: systemCatalog,
+		ObjectID:      oid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var dependsOnColumns []RelationColumnDependency
+	for _, row := range rows {
+		dependsOnColumns = append(dependsOnColumns, RelationColumnDependency{
+			SchemaQualifiedName: buildNameFromUnescaped(row.RelationName, row.RelationSchemaName),
+			Column:              row.ColumnName,
+		})
+	}
+	return dependsOnColumns, nil
 }
 
 func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
@@ -1569,11 +2197,27 @@ func (s *schemaFetcher) fetchProcedures(ctx context.Context) ([]Procedure, error
 		if err != nil {
 			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", rawProcedure.Oid, err)
 		}
+		privileges, err := parseJSONPrivileges(rawProcedure.Privileges)
+		if err != nil {
+			return nil, fmt.Errorf("parseJSONPrivileges(%s): %w", rawProcedure.Oid, err)
+		}
+		dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_proc", rawProcedure.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnDomains(%s): %w", rawProcedure.Oid, err)
+		}
+		dependsOnRelations, err := s.fetchDependsOnRelations(ctx, "pg_proc", rawProcedure.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnRelations(%s): %w", rawProcedure.Oid, err)
+		}
 		p := Procedure{
 			SchemaQualifiedName:     buildProcName(rawProcedure.FuncName, rawProcedure.FuncIdentityArguments, rawProcedure.FuncSchemaName),
+			Owner:                   rawProcedure.Owner,
 			Def:                     rawProcedure.FuncDef,
-			DependsOnCompositeTypes: dependsOnTypes,
 			Description:             rawProcedure.Description,
+			DependsOnCompositeTypes: dependsOnTypes,
+			DependsOnDomains:        dependsOnDomains,
+			Privileges:              privileges,
+			DependsOnRelations:      dependsOnRelations,
 		}
 		procedures = append(procedures, p)
 	}
@@ -1599,6 +2243,56 @@ type privilegeAndTable struct {
 	table     SchemaQualifiedName
 }
 
+type privilegeAndSchema struct {
+	privilege  SchemaPrivilege
+	schemaName string
+}
+
+func (s *schemaFetcher) fetchSchemaPrivileges(ctx context.Context) ([]privilegeAndSchema, error) {
+	rawPrivileges, err := s.q.GetSchemaPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetSchemaPrivileges: %w", err)
+	}
+
+	var privileges []privilegeAndSchema
+	for _, rp := range rawPrivileges {
+		// Handle the is_grantable field which may be returned as interface{}
+		isGrantable := false
+		if rp.IsGrantable != nil {
+			if b, ok := rp.IsGrantable.(bool); ok {
+				isGrantable = b
+			}
+		}
+
+		privileges = append(privileges, privilegeAndSchema{
+			privilege: SchemaPrivilege{
+				Grantee:     rp.Grantee,
+				Privilege:   rp.Privilege,
+				IsGrantable: isGrantable,
+			},
+			schemaName: rp.SchemaName,
+		})
+	}
+
+	privileges = filterSliceByName(
+		privileges,
+		func(p privilegeAndSchema) SchemaQualifiedName {
+			return SchemaQualifiedName{
+				SchemaName:  p.schemaName,
+				EscapedName: EscapeIdentifier(p.schemaName),
+			}
+		},
+		s.nameFilter,
+	)
+
+	return privileges, nil
+}
+
+type columnPrivilegeAndTable struct {
+	privilege ColumnPrivilege
+	table     SchemaQualifiedName
+}
+
 func (s *schemaFetcher) fetchPolicies(ctx context.Context) ([]policyAndTable, error) {
 	rawPolicies, err := s.q.GetPolicies(ctx)
 	if err != nil {
@@ -1607,18 +2301,38 @@ func (s *schemaFetcher) fetchPolicies(ctx context.Context) ([]policyAndTable, er
 
 	var policies []policyAndTable
 	for _, rp := range rawPolicies {
+		dependsOnFunctions, err := s.fetchDependsOnFunctions(ctx, "pg_policy", rp.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rp.Oid, err)
+		}
+		dependsOnRelations, err := s.fetchDependsOnRelations(ctx, "pg_policy", rp.Oid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnRelations(%s): %w", rp.Oid, err)
+		}
+		// A policy always depends on the table it is attached to (its expressions read that table's
+		// columns). That dependency is implied — the policy is emitted with the table — so drop it.
+		owningTable := buildNameFromUnescaped(rp.OwningTableName, rp.OwningTableSchemaName)
+		var policyRelations []RelationDependency
+		for _, relation := range dependsOnRelations {
+			if relation.GetName() == owningTable.GetName() {
+				continue
+			}
+			policyRelations = append(policyRelations, relation)
+		}
 		policies = append(policies, policyAndTable{
 			policy: Policy{
-				EscapedName:     EscapeIdentifier(rp.PolicyName),
-				IsPermissive:    rp.IsPermissive,
-				AppliesTo:       rp.AppliesTo,
-				Cmd:             PolicyCmd(rp.Cmd),
-				CheckExpression: rp.CheckExpression,
-				UsingExpression: rp.UsingExpression,
-				Columns:         rp.ColumnNames,
-				Description:     rp.Description,
+				EscapedName:        EscapeIdentifier(rp.PolicyName),
+				IsPermissive:       rp.IsPermissive,
+				AppliesTo:          rp.AppliesTo,
+				Cmd:                PolicyCmd(rp.Cmd),
+				CheckExpression:    rp.CheckExpression,
+				UsingExpression:    rp.UsingExpression,
+				Columns:            rp.ColumnNames,
+				Description:        rp.Description,
+				DependsOnFunctions: dependsOnFunctions,
+				DependsOnRelations: policyRelations,
 			},
-			table: buildNameFromUnescaped(rp.OwningTableName, rp.OwningTableSchemaName),
+			table: owningTable,
 		})
 	}
 
@@ -1673,6 +2387,44 @@ func (s *schemaFetcher) fetchPrivileges(ctx context.Context) ([]privilegeAndTabl
 	return privileges, nil
 }
 
+func (s *schemaFetcher) fetchColumnPrivileges(ctx context.Context) ([]columnPrivilegeAndTable, error) {
+	rawPrivileges, err := s.q.GetColumnPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetColumnPrivileges: %w", err)
+	}
+
+	var privileges []columnPrivilegeAndTable
+	for _, rp := range rawPrivileges {
+		// Handle the is_grantable field which may be returned as interface{}
+		isGrantable := false
+		if rp.IsGrantable != nil {
+			if b, ok := rp.IsGrantable.(bool); ok {
+				isGrantable = b
+			}
+		}
+
+		privileges = append(privileges, columnPrivilegeAndTable{
+			privilege: ColumnPrivilege{
+				ColumnName:  rp.PaColumnName,
+				Grantee:     rp.Grantee,
+				Privilege:   rp.Privilege,
+				IsGrantable: isGrantable,
+			},
+			table: buildNameFromUnescaped(rp.PaTableName, rp.PaTableSchemaName),
+		})
+	}
+
+	privileges = filterSliceByName(
+		privileges,
+		func(p columnPrivilegeAndTable) SchemaQualifiedName {
+			return p.table
+		},
+		s.nameFilter,
+	)
+
+	return privileges, nil
+}
+
 func (s *schemaFetcher) fetchTriggers(ctx context.Context) ([]Trigger, error) {
 	rawTriggers, err := s.q.GetTriggers(ctx)
 	if err != nil {
@@ -1681,6 +2433,10 @@ func (s *schemaFetcher) fetchTriggers(ctx context.Context) ([]Trigger, error) {
 
 	var triggers []Trigger
 	for _, rawTrigger := range rawTriggers {
+		dependsOnFunctions, err := parseJSONFunctionNames(rawTrigger.DependsOnFunctions)
+		if err != nil {
+			return nil, fmt.Errorf("parsing the functions trigger %q calls: %w", rawTrigger.TriggerName, err)
+		}
 		triggers = append(triggers, Trigger{
 			EscapedName:       EscapeIdentifier(rawTrigger.TriggerName),
 			OwningTable:       buildNameFromUnescaped(rawTrigger.OwningTableName, rawTrigger.OwningTableSchemaName),
@@ -1688,6 +2444,9 @@ func (s *schemaFetcher) fetchTriggers(ctx context.Context) ([]Trigger, error) {
 			GetTriggerDefStmt: GetTriggerDefStatement(rawTrigger.TriggerDef),
 			IsConstraint:      rawTrigger.IsConstraint,
 			Description:       rawTrigger.Description,
+			Enabled:           rawTrigger.Enabled,
+
+			DependsOnFunctions: dependsOnFunctions,
 		})
 	}
 
@@ -1732,15 +2491,23 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 			return nil, fmt.Errorf("parsing schema qualified names JSON: %w", err)
 		}
 
+		dependsOnFunctions, err := s.fetchDependsOnFunctions(ctx, "pg_rewrite", v.RuleOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", v.ViewName, err)
+		}
+
 		schemaQualifiedName := buildNameFromUnescaped(v.ViewName, v.SchemaName)
 		views = append(views, View{
 			SchemaQualifiedName: schemaQualifiedName,
+			Owner:               v.Owner,
 			ViewDefinition:      v.ViewDefinition,
 			Options:             options,
+			Columns:             buildViewColumns(v.ColumnNames, v.ColumnTypes, v.ColumnDescriptions),
 
-			TableDependencies: tableDependencies,
-			Privileges:        privilegesByView[schemaQualifiedName.GetFQEscapedName()],
-			Description:       v.Description,
+			TableDependencies:  tableDependencies,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			Privileges:         privilegesByView[schemaQualifiedName.GetFQEscapedName()],
+			Description:        v.Description,
 		})
 	}
 
@@ -1755,10 +2522,37 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 	return views, nil
 }
 
+// buildViewColumns zips the parallel name and type arrays a view query returns into the ordered
+// column list a View carries. Both arrays come from the same attribute query, so they have equal
+// length; the shorter one bounds the loop defensively.
+func buildViewColumns(names, types, descriptions []string) []ViewColumn {
+	n := len(names)
+	if len(types) < n {
+		n = len(types)
+	}
+	if len(descriptions) < n {
+		n = len(descriptions)
+	}
+	columns := make([]ViewColumn, 0, n)
+	for i := 0; i < n; i++ {
+		columns = append(columns, ViewColumn{Name: names[i], Type: types[i], Description: descriptions[i]})
+	}
+	return columns
+}
+
 func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]MaterializedView, error) {
 	rawMaterializedViews, err := s.q.GetMaterializedViews(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetMaterializedViews: %w", err)
+	}
+
+	privileges, err := s.fetchPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetchPrivileges(): %w", err)
+	}
+	privilegesByMaterializedView := make(map[string][]TablePrivilege)
+	for _, p := range privileges {
+		privilegesByMaterializedView[p.table.GetFQEscapedName()] = append(privilegesByMaterializedView[p.table.GetFQEscapedName()], p.privilege)
 	}
 
 	var materializedViews []MaterializedView
@@ -1773,14 +2567,24 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 			return nil, fmt.Errorf("parsing schema qualified names JSON: %w", err)
 		}
 
+		dependsOnFunctions, err := s.fetchDependsOnFunctions(ctx, "pg_rewrite", mv.RuleOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", mv.ViewName, err)
+		}
+
+		schemaQualifiedName := buildNameFromUnescaped(mv.ViewName, mv.SchemaName)
 		materializedViews = append(materializedViews, MaterializedView{
-			SchemaQualifiedName: buildNameFromUnescaped(mv.ViewName, mv.SchemaName),
+			SchemaQualifiedName: schemaQualifiedName,
+			Owner:               mv.Owner,
 			ViewDefinition:      mv.ViewDefinition,
 			Options:             options,
 			Tablespace:          mv.TablespaceName,
+			Columns:             buildViewColumns(mv.ColumnNames, mv.ColumnTypes, mv.ColumnDescriptions),
 
-			TableDependencies: tableDependencies,
-			Description:       mv.Description,
+			TableDependencies:  tableDependencies,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			Privileges:         privilegesByMaterializedView[schemaQualifiedName.GetFQEscapedName()],
+			Description:        mv.Description,
 		})
 	}
 
@@ -1795,6 +2599,225 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 	return materializedViews, nil
 }
 
+// canonicalizeViewDefinitions fills ViewDefinitionCanonical for every view and
+// materialized view, and leaves ViewDefinition (the text a plan emits) alone.
+//
+// A definition read from pg_get_viewdef is not necessarily its own output:
+// deparsing names an output column that the definition left unnamed, so a view
+// created from that text can deparse to a different text than the view it was
+// created from. A view is compared by its definition, so without a canonical
+// form the differ reports a difference between two databases that hold the same
+// view, and validation rebuilds the current schema only to disagree with itself.
+//
+// The canonical form is obtained by creating the definition as a temporary view
+// and reading the definition back: one round trip through the parser and the
+// deparser is a fixed point (the second round trip returns the same text).
+// Materialized views go through a temporary view for the same reason — a
+// materialized view cannot be created in pg_temp.
+func (s *schemaFetcher) canonicalizeViewDefinitions(ctx context.Context, views []View, materializedViews []MaterializedView) ([]View, []MaterializedView, error) {
+	if len(views) == 0 && len(materializedViews) == 0 {
+		return views, materializedViews, nil
+	}
+
+	conn, release, err := s.pinnedConnection(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+
+	canonicalizer := &viewDefinitionCanonicalizer{q: conn}
+	for i := range views {
+		if views[i].ViewDefinition == "" {
+			continue
+		}
+		canonical, err := canonicalizer.canonicalize(ctx, views[i].ViewDefinition)
+		if err != nil {
+			return nil, nil, fmt.Errorf("canonicalizing the definition of view %s: %w", views[i].GetFQEscapedName(), err)
+		}
+		views[i].ViewDefinitionCanonical = canonical
+	}
+	for i := range materializedViews {
+		if materializedViews[i].ViewDefinition == "" {
+			continue
+		}
+		canonical, err := canonicalizer.canonicalize(ctx, materializedViews[i].ViewDefinition)
+		if err != nil {
+			return nil, nil, fmt.Errorf("canonicalizing the definition of materialized view %s: %w", materializedViews[i].GetFQEscapedName(), err)
+		}
+		materializedViews[i].ViewDefinitionCanonical = canonical
+	}
+	return views, materializedViews, nil
+}
+
+// pinnedConnection returns a connection that will serve every statement of the
+// caller. Temporary objects live in a session, so a pool cannot be used: two
+// statements of one canonicalization could otherwise land on two connections.
+func (s *schemaFetcher) pinnedConnection(ctx context.Context) (queries.DBTX, func(), error) {
+	if pool, ok := s.db.(interface {
+		Conn(context.Context) (*sql.Conn, error)
+	}); ok {
+		conn, err := pool.Conn(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("acquiring a connection for canonicalizing view definitions: %w", err)
+		}
+		return conn, func() { _ = conn.Close() }, nil
+	}
+	// Anything that is not a pool is a single connection: GetSchema disables
+	// concurrency for those, and its callers pass a *sql.Conn or a driver
+	// connection.
+	return s.db, func() {}, nil
+}
+
+// viewDefinitionCanonicalizer rewrites view definitions through a temporary view.
+type viewDefinitionCanonicalizer struct {
+	q       queries.DBTX
+	created int
+}
+
+// temporaryViewPrefix names the temporary views in pg_temp. They collide with
+// nothing (a stored view cannot live in pg_temp) and disappear with the session.
+const temporaryViewPrefix = "pg_temp.__pg_schema_diff_canonical_"
+
+func (c *viewDefinitionCanonicalizer) canonicalize(ctx context.Context, definition string) (string, error) {
+	c.created++
+	// PostgreSQL accepts a definition that ends in a semicolon, which is what
+	// pg_get_viewdef returns.
+	name := fmt.Sprintf("%s%d", temporaryViewPrefix, c.created)
+
+	if _, err := c.q.ExecContext(ctx, fmt.Sprintf("CREATE TEMP VIEW %s AS %s", name, definition)); err != nil {
+		return "", fmt.Errorf("creating a temporary view from the definition: %w", err)
+	}
+
+	var canonical string
+	if err := c.q.QueryRowContext(ctx, fmt.Sprintf("SELECT pg_catalog.pg_get_viewdef(%s::regclass, true)", EscapeLiteral(name))).Scan(&canonical); err != nil {
+		return "", fmt.Errorf("reading the definition back: %w", err)
+	}
+
+	if _, err := c.q.ExecContext(ctx, "DROP VIEW "+name); err != nil {
+		return "", fmt.Errorf("dropping the temporary view: %w", err)
+	}
+	return canonical, nil
+}
+
+// canonicalizeFunctionDefinitions fills FunctionDefCanonical for every function and leaves
+// FunctionDef (the statement a plan emits) alone.
+//
+// A definition read from pg_get_functiondef is not necessarily its own output: deparsing names an
+// output column that a SQL-standard body (`BEGIN ATOMIC`) left unnamed, so a function created from
+// that text can deparse to a different text than the function it was created from. A function is
+// compared by its definition, so without a canonical form the differ reports a difference between
+// two databases that hold the same function, and validation rebuilds the current schema only to
+// disagree with itself.
+//
+// The canonical form is obtained by creating the definition as a temporary function and reading the
+// definition back: one round trip through the parser and the deparser is a fixed point. The
+// temporary function keeps the routine's name and only changes its schema, because a SQL-standard
+// body can qualify its own parameters with that name (session_state.p_session_id), and renaming the
+// routine would break that reference.
+func (s *schemaFetcher) canonicalizeFunctionDefinitions(ctx context.Context, functions []Function) ([]Function, error) {
+	if len(functions) == 0 {
+		return functions, nil
+	}
+
+	conn, release, err := s.pinnedConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	// Creating the temporary function must not require the reading role to see every object a body
+	// names. The deparser runs on the parse tree regardless of the check, so turning it off changes
+	// nothing about the canonical text.
+	if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = off"); err != nil {
+		return nil, fmt.Errorf("disabling check_function_bodies for canonicalization: %w", err)
+	}
+
+	canonicalizer := &functionDefinitionCanonicalizer{q: conn}
+	for i := range functions {
+		if functions[i].FunctionDef == "" {
+			continue
+		}
+		canonical, err := canonicalizer.canonicalize(ctx, functions[i].FunctionDef)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalizing the definition of function %s: %w", functions[i].GetFQEscapedName(), err)
+		}
+		functions[i].FunctionDefCanonical = canonical
+	}
+	return functions, nil
+}
+
+// functionDefinitionCanonicalizer rewrites function definitions through a temporary function.
+type functionDefinitionCanonicalizer struct {
+	q queries.DBTX
+}
+
+func (c *functionDefinitionCanonicalizer) canonicalize(ctx context.Context, definition string) (string, error) {
+	originalQualifiedName, temporaryDefinition, err := swapFunctionSchemaToTemp(definition)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := c.q.ExecContext(ctx, temporaryDefinition); err != nil {
+		return "", fmt.Errorf("creating a temporary function from the definition: %w", err)
+	}
+
+	// The temporary function is the only one in the session's temporary schema, so it can be found
+	// without repeating its (possibly quoted) name.
+	var canonical, dropStatement string
+	if err := c.q.QueryRowContext(ctx,
+		"SELECT pg_catalog.pg_get_functiondef(proc.oid), pg_catalog.format('DROP FUNCTION %s', proc.oid::pg_catalog.regprocedure) "+
+			"FROM pg_catalog.pg_proc AS proc "+
+			"WHERE proc.pronamespace = pg_catalog.pg_my_temp_schema()").Scan(&canonical, &dropStatement); err != nil {
+		return "", fmt.Errorf("reading the definition back: %w", err)
+	}
+	if _, err := c.q.ExecContext(ctx, dropStatement); err != nil {
+		return "", fmt.Errorf("dropping the temporary function: %w", err)
+	}
+
+	// The canonical form names the temporary function; put the original name back so the field reads
+	// as the function it describes.
+	rest := canonical[len("CREATE OR REPLACE FUNCTION "):]
+	open := strings.IndexByte(rest, '(')
+	if open < 0 {
+		return "", fmt.Errorf("canonical definition has no argument list")
+	}
+	return "CREATE OR REPLACE FUNCTION " + originalQualifiedName + rest[open:], nil
+}
+
+// swapFunctionSchemaToTemp rewrites the schema qualifier of a routine definition to pg_temp, keeping
+// the routine's name, and returns the original qualified name so it can be restored afterwards.
+func swapFunctionSchemaToTemp(definition string) (originalQualifiedName, rewritten string, err error) {
+	const prefix = "CREATE OR REPLACE FUNCTION "
+	if !strings.HasPrefix(definition, prefix) {
+		return "", "", fmt.Errorf("definition does not start with %q", prefix)
+	}
+	rest := definition[len(prefix):]
+	open := strings.IndexByte(rest, '(')
+	if open < 0 {
+		return "", "", fmt.Errorf("definition has no argument list")
+	}
+	qualifiedName := rest[:open]
+	name := qualifiedName[lastTopLevelDot(qualifiedName)+1:]
+	return qualifiedName, prefix + "pg_temp." + name + rest[open:], nil
+}
+
+// lastTopLevelDot returns the index of the last '.' in a schema-qualified, possibly quoted name that
+// is not inside double quotes, or -1 when the name has no schema qualifier.
+func lastTopLevelDot(qualifiedName string) int {
+	last, inQuotes := -1, false
+	for i := 0; i < len(qualifiedName); i++ {
+		switch qualifiedName[i] {
+		case '"':
+			inQuotes = !inQuotes
+		case '.':
+			if !inQuotes {
+				last = i
+			}
+		}
+	}
+	return last
+}
+
 // parseViewJSONTableDependencies takes an slice of JSON values with schema,
 // `schema: string; table: string, columns: []string` and unmarshals them into a go struct.
 func parseJSONTableDependencies(vals []string) ([]TableDependency, error) {
@@ -1803,6 +2826,7 @@ func parseJSONTableDependencies(vals []string) ([]TableDependency, error) {
 		var s struct {
 			Schema  string   `json:"schema"`
 			Name    string   `json:"name"`
+			Kind    string   `json:"kind"`
 			Columns []string `json:"columns"`
 		}
 		if err := json.Unmarshal([]byte(v), &s); err != nil {
@@ -1810,7 +2834,28 @@ func parseJSONTableDependencies(vals []string) ([]TableDependency, error) {
 		}
 		out = append(out, TableDependency{
 			SchemaQualifiedName: buildNameFromUnescaped(s.Name, s.Schema),
+			Kind:                RelationKind(s.Kind),
 			Columns:             s.Columns,
+		})
+	}
+	return out, nil
+}
+
+func parseJSONPrivileges(vals []string) ([]Privilege, error) {
+	var out []Privilege
+	for _, v := range vals {
+		var p struct {
+			Grantee     string `json:"grantee"`
+			Privilege   string `json:"privilege"`
+			IsGrantable bool   `json:"is_grantable"`
+		}
+		if err := json.Unmarshal([]byte(v), &p); err != nil {
+			return nil, fmt.Errorf("json.Unmarshal(%q, Privilege): %w", string(v), err)
+		}
+		out = append(out, Privilege{
+			Grantee:     p.Grantee,
+			Privilege:   p.Privilege,
+			IsGrantable: p.IsGrantable,
 		})
 	}
 	return out, nil
@@ -1818,6 +2863,27 @@ func parseJSONTableDependencies(vals []string) ([]TableDependency, error) {
 
 // buildProcName is used to build the schema qualified name for a proc (function, procedure), i.e., anything
 // identified by a name AND its arguments.
+// parseJSONFunctionNames parses the JSON objects of schema, name and identity arguments a query
+// returns for the functions an object depends on, sorted and without duplicates.
+func parseJSONFunctionNames(vals []string) ([]SchemaQualifiedName, error) {
+	var out []SchemaQualifiedName
+	for _, v := range vals {
+		var f struct {
+			Schema            string `json:"schema"`
+			Name              string `json:"name"`
+			IdentityArguments string `json:"identity_arguments"`
+		}
+		if err := json.Unmarshal([]byte(v), &f); err != nil {
+			return nil, fmt.Errorf("json.Unmarshal(%q, function name): %w", v, err)
+		}
+		out = append(out, buildProcName(f.Name, f.IdentityArguments, f.Schema))
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return sortSchemaObjectsByName(dedupeSchemaQualifiedNames(out)), nil
+}
+
 func buildProcName(name, identityArguments, schemaName string) SchemaQualifiedName {
 	return SchemaQualifiedName{
 		SchemaName:  schemaName,

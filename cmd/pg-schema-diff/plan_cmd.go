@@ -101,7 +101,11 @@ func buildPlanCmd() *cobra.Command {
 			return err
 		}
 
-		cmdPrintln(cmd, outputFmt.convertToOutputString(plan))
+		out := outputFmt.convertToOutputString(plan)
+		if outputFmt.identifier == outputFormatSql.identifier && planOptsFlags.disableCheckFunctionBodies {
+			out = "SET check_function_bodies = false;\n\n" + out
+		}
+		cmdPrintln(cmd, out)
 		return nil
 	}
 
@@ -114,9 +118,10 @@ type (
 		includeSchemas []string
 		excludeSchemas []string
 
-		dataPackNewTables     bool
-		disablePlanValidation bool
-		noConcurrentIndexOps  bool
+		dataPackNewTables          bool
+		disablePlanValidation      bool
+		noConcurrentIndexOps       bool
+		disableCheckFunctionBodies bool
 
 		statementTimeoutModifiers []string
 		lockTimeoutModifiers      []string
@@ -227,6 +232,10 @@ func createPlanOptionsFlags(cmd *cobra.Command) *planOptionsFlags {
 		"database with an identical schema to the original, asserting that the generated plan actually migrates the schema to the desired target.")
 	cmd.Flags().BoolVar(&flags.noConcurrentIndexOps, "no-concurrent-index-ops", false, "If set, will disable the use of CONCURRENTLY in CREATE INDEX and DROP INDEX statements. "+
 		"This may result in longer lock times and potential downtime during migrations.")
+	cmd.Flags().BoolVar(&flags.disableCheckFunctionBodies, "disable-check-function-bodies", false, "If set, plan validation runs with "+
+		"check_function_bodies off, so PostgreSQL does not resolve the references a routine's body makes at CREATE time, and the emitted SQL script "+
+		"turns the check off before running. The default leaves it on, the way the migration runs; use this only when a routine's body names an object "+
+		"the plan cannot order before it.")
 
 	timeoutModifierFlagVar(cmd, &flags.statementTimeoutModifiers, "statement", "t")
 	timeoutModifierFlagVar(cmd, &flags.lockTimeoutModifiers, "lock", "l")
@@ -328,6 +337,9 @@ func parsePlanOptions(p planOptionsFlags) (planOptions, error) {
 	}
 	if p.noConcurrentIndexOps {
 		opts = append(opts, diff.WithNoConcurrentIndexOps())
+	}
+	if p.disableCheckFunctionBodies {
+		opts = append(opts, diff.WithDisableCheckFunctionBodies())
 	}
 
 	var statementTimeoutModifiers []timeoutModifier
@@ -607,7 +619,9 @@ func planToJsonS(plan diff.Plan) string {
 	return string(jsonData)
 }
 
-// planToSql converts the plan to one large runnable SQL script.
+// planToSql converts the plan to one large runnable SQL script. The caller prepends a
+// check_function_bodies setting only when the plan was generated with the check disabled; otherwise
+// the script runs the way the migration does, with PostgreSQL resolving each routine's body.
 func planToSql(plan diff.Plan) string {
 	sb := strings.Builder{}
 	for i, stmt := range plan.Statements {

@@ -13,6 +13,7 @@ import (
 
 type materializedViewDiff struct {
 	oldAndNew[schema.MaterializedView]
+	privilegesDiff listDiff[schema.TablePrivilege, privilegeDiff]
 }
 
 func buildMaterializedViewDiff(
@@ -38,6 +39,12 @@ func buildMaterializedViewDiff(
 	// - For some table X, it is currently not possible to create a SQL statement outside the table sql generator
 	// that comes before a column Y's delete statement but after a column Z's add statement.
 	for _, t := range old.TableDependencies {
+		if !t.Kind.IsTable() {
+			// A materialized view reads other views and materialized views too, but only a table's
+			// columns are modelled per column, and a non-table dependency's recreation is not
+			// cascaded yet.
+			continue
+		}
 		if _, ok := deletedTablesByName[t.GetName()]; ok {
 			// Recreate if a dependent table was deleted (or recreated).
 			return materializedViewDiff{}, true, nil
@@ -50,16 +57,38 @@ func buildMaterializedViewDiff(
 			)
 		}
 		deletedColumnsByName := buildSchemaObjByNameMap(td.columnsDiff.deletes)
+		retypedColumnsByName := retypedColumnNames(td)
 		for _, c := range t.Columns {
 			if _, ok := deletedColumnsByName[c]; ok {
 				// Recreate if a dependent column was deleted (or recreated).
 				return materializedViewDiff{}, true, nil
 			}
+			if retypedColumnsByName[c] {
+				// PostgreSQL refuses to change the type or collation of a column a materialized view
+				// reads.
+				return materializedViewDiff{}, true, nil
+			}
 		}
 	}
 
+	privilegesDiff, err := diffLists(
+		old.Privileges,
+		new.Privileges,
+		func(old, new schema.TablePrivilege, _, _ int) (privilegeDiff, bool, error) {
+			// Recreate the privilege if IsGrantable changes
+			recreate := old.IsGrantable != new.IsGrantable
+			return privilegeDiff{oldAndNew[schema.TablePrivilege]{old: old, new: new}}, recreate, nil
+		},
+	)
+	if err != nil {
+		return materializedViewDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+	}
+
 	// Recreate if the materialized view SQL generator cannot alter the materialized view.
-	d := materializedViewDiff{oldAndNew: oldAndNew[schema.MaterializedView]{old: old, new: new}}
+	d := materializedViewDiff{
+		oldAndNew:      oldAndNew[schema.MaterializedView]{old: old, new: new},
+		privilegesDiff: privilegesDiff,
+	}
 	if _, err := newMaterializedViewSQLVertexGenerator().Alter(d); err != nil {
 		if errors.Is(err, ErrNotImplemented) {
 			// The SQL generator cannot alter the materialized view, so add and delete it.
@@ -112,8 +141,12 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 
 	// Run after any dependent tables are added/altered.
 	for _, t := range mv.TableDependencies {
-		deps = append(deps, mustRun(addVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(addVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		deps = append(deps, mustRun(addVertexId).after(buildDependencyVertexId(t, diffTypeDelete)))
+		deps = append(deps, mustRun(addVertexId).after(buildDependencyVertexId(t, diffTypeAddAlter)))
+	}
+	// Run after the functions the definition calls exist.
+	for _, f := range mv.DependsOnFunctions {
+		deps = append(deps, mustRun(addVertexId).after(buildFunctionVertexId(f, diffTypeAddAlter)))
 	}
 
 	stmts := []Statement{{
@@ -121,7 +154,18 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}
+	privilegeGenerator := newPrivilegeSQLVertexGenerator(mv.SchemaQualifiedName)
+	for _, privilege := range mv.Privileges {
+		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
+		if err != nil {
+			return partialSQLGraph{}, fmt.Errorf("generating add privilege statements for privilege %s: %w", privilege.GetName(), err)
+		}
+		// Remove hazards from statements since the materialized view is brand new
+		stmts = append(stmts, stripMigrationHazards(addPrivilegePartialGraph.statements()...)...)
+	}
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("MATERIALIZED VIEW", mv.SchemaQualifiedName), mv.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetMaterializedView(mv.SchemaQualifiedName), mv.Description)...)
+	stmts = append(stmts, viewColumnCommentDDLForAdd(mv.SchemaQualifiedName, mv.Columns)...)
 
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
@@ -139,8 +183,12 @@ func (mvsg *materializedViewSQLGenerator) Delete(mv schema.MaterializedView) (pa
 	// Run before any dependent tables are deleted or added/altered.
 	var deps []dependency
 	for _, t := range mv.TableDependencies {
-		deps = append(deps, mustRun(deleteVertexId).before(buildTableVertexId(t.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(deleteVertexId).before(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		deps = append(deps, mustRun(deleteVertexId).before(buildDependencyVertexId(t, diffTypeDelete)))
+		deps = append(deps, mustRun(deleteVertexId).before(buildDependencyVertexId(t, diffTypeAddAlter)))
+	}
+	// Run before the functions the definition calls are dropped.
+	for _, f := range mv.DependsOnFunctions {
+		deps = append(deps, mustRun(deleteVertexId).before(buildFunctionVertexId(f, diffTypeDelete)))
 	}
 
 	return partialSQLGraph{
@@ -158,25 +206,44 @@ func (mvsg *materializedViewSQLGenerator) Delete(mv schema.MaterializedView) (pa
 }
 
 func (mvsg *materializedViewSQLGenerator) Alter(mvd materializedViewDiff) (partialSQLGraph, error) {
-	// Mask Description: a comment-only diff is altered via an explicit COMMENT statement.
+	// Mask Description and Owner (altered via explicit statements below), Privileges (handled
+	// by the privilege generator below) and the output columns (they follow from the definition;
+	// their comments are altered below).
+	//
+	// The definition is compared through its canonical form; see
+	// viewSQLGenerator.Alter.
 	oldCopy := mvd.old
 	oldCopy.Description = mvd.new.Description
-	if !cmp.Equal(oldCopy, mvd.new) {
-		// In the initial MVP, we don't support altering anything other than the comment.
+	oldCopy.Owner = mvd.new.Owner
+	oldCopy.Privileges = nil
+	oldCopy.Columns = nil
+	maskViewDefinition(&oldCopy.ViewDefinition, &oldCopy.ViewDefinitionCanonical)
+	newCopy := mvd.new
+	newCopy.Privileges = nil
+	newCopy.Columns = nil
+	maskViewDefinition(&newCopy.ViewDefinition, &newCopy.ViewDefinitionCanonical)
+	if !cmp.Equal(oldCopy, newCopy) {
+		// In the initial MVP, we don't support altering anything other than the comment, the owner
+		// and the grants.
 		return partialSQLGraph{}, ErrNotImplemented
 	}
 
-	commentStmts := commentDDLForAlter(commentTargetMaterializedView(mvd.new.SchemaQualifiedName), mvd.old.Description, mvd.new.Description)
-	if len(commentStmts) == 0 {
-		return partialSQLGraph{}, nil
+	privilegesPartialGraph, err := generatePartialGraph(newPrivilegeSQLVertexGenerator(mvd.new.SchemaQualifiedName), mvd.privilegesDiff)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("resolving privilege sql: %w", err)
 	}
-	return partialSQLGraph{
-		vertices: []sqlVertex{{
+
+	stmts := ownerDDLForAlter(ownershipTarget("MATERIALIZED VIEW", mvd.new.SchemaQualifiedName), mvd.old.Owner, mvd.new.Owner)
+	stmts = append(stmts, commentDDLForAlter(commentTargetMaterializedView(mvd.new.SchemaQualifiedName), mvd.old.Description, mvd.new.Description)...)
+	stmts = append(stmts, viewColumnCommentDDLForAlter(mvd.new.SchemaQualifiedName, mvd.old.Columns, mvd.new.Columns)...)
+	if len(stmts) > 0 {
+		privilegesPartialGraph.vertices = append(privilegesPartialGraph.vertices, sqlVertex{
 			id:         buildMaterializedViewVertexId(mvd.new.SchemaQualifiedName, diffTypeAddAlter),
 			priority:   sqlPrioritySooner,
-			statements: commentStmts,
-		}},
-	}, nil
+			statements: stmts,
+		})
+	}
+	return privilegesPartialGraph, nil
 }
 
 func buildMaterializedViewVertexId(n schema.SchemaQualifiedName, d diffType) sqlVertexId {

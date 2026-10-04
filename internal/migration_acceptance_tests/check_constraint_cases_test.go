@@ -551,6 +551,31 @@ var checkConstraintCases = []acceptanceTestCase{
 			`,
 		},
 	},
+	{
+		name: "refuse to re-create a check constraint around a function the plan drops",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION is_positive(p INT) RETURNS BOOLEAN
+                LANGUAGE sql IMMUTABLE
+                RETURN p > 0;
+
+            CREATE TABLE foobar(id INT);
+            ALTER TABLE foobar ADD CONSTRAINT foobar_id_positive CHECK (is_positive(id)) NOT VALID;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION is_positive(p BIGINT) RETURNS BOOLEAN
+                LANGUAGE sql IMMUTABLE
+                RETURN p > 0;
+
+            CREATE TABLE foobar(id INT);
+            ALTER TABLE foobar ADD CONSTRAINT foobar_id_positive CHECK (is_positive(id)) NOT VALID;
+		`},
+		// Re-adding the constraint would validate every row, so the plan names the function and the
+		// constraint instead.
+		expectedPlanErrorIs:       diff.ErrNotImplemented,
+		expectedPlanErrorContains: "check constraint foobar_id_positive",
+	},
 }
 
 func TestCheckConstraintTestCases(t *testing.T) {

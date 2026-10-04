@@ -736,6 +736,122 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 	},
+	{
+		name: "Create policy whose expression calls a function created in the same plan",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id uuid);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id uuid);
+                CREATE FUNCTION current_user_id() RETURNS uuid
+                    LANGUAGE sql STABLE
+                    AS $$ SELECT '00000000-0000-0000-0000-000000000000'::uuid $$;
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (id = current_user_id());
+			`,
+		},
+		// PostgreSQL resolves the function the USING expression calls at CREATE POLICY time, so the
+		// function must come first. Applying the plan is the assertion: the wrong order would fail
+		// with `function current_user_id() does not exist`.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
+	{
+		name: "Create policy reading a table created in the same plan",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE TABLE foobar_grant(id INT, grantee UUID);
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar_grant g WHERE g.id = foobar.grant_id
+                    ));
+			`,
+		},
+		// PostgreSQL resolves the relation the USING expression reads at CREATE POLICY time, and the
+		// policy is emitted with its table, so the table must come after that relation.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
+	{
+		name:         "Create a policy calling a function whose SQL-standard body reads the policy's own table",
+		oldSchemaDDL: nil,
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT);
+                CREATE FUNCTION row_count() RETURNS bigint
+                    LANGUAGE SQL
+                BEGIN ATOMIC
+                    SELECT count(*) FROM foobar WHERE id > 0;
+                END;
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (row_count() > 0);
+		`},
+		// The real order is table → function → policy: the function's body reads the table, and the
+		// policy calls the function. Keeping the policy inside the table's vertex would make it
+		// table → function and function → table, a cycle that fails plan generation.
+	},
+	{
+		name:  "re-create a policy with its roles, expressions and comment around a function whose argument type changes",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, owner_id INT);
+            ALTER TABLE foobar ENABLE ROW LEVEL SECURITY;
+
+            CREATE FUNCTION is_owner(p INT) RETURNS BOOLEAN
+                LANGUAGE sql STABLE
+                RETURN p > 0;
+
+            CREATE POLICY foobar_owner ON foobar
+                AS RESTRICTIVE
+                FOR UPDATE
+                TO reader
+                USING (is_owner(owner_id))
+                WITH CHECK (is_owner(id));
+            COMMENT ON POLICY foobar_owner ON foobar IS 'owner';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, owner_id INT);
+            ALTER TABLE foobar ENABLE ROW LEVEL SECURITY;
+
+            CREATE FUNCTION is_owner(p BIGINT) RETURNS BOOLEAN
+                LANGUAGE sql STABLE
+                RETURN p > 0;
+
+            CREATE POLICY foobar_owner ON foobar
+                AS RESTRICTIVE
+                FOR UPDATE
+                TO reader
+                USING (is_owner(owner_id))
+                WITH CHECK (is_owner(id));
+            COMMENT ON POLICY foobar_owner ON foobar IS 'owner';
+		`},
+		// The old signature is dropped, so the policy that calls it is dropped first and created
+		// again after the new signature exists, with its command, roles, expressions and comment.
+		// Between the two the restrictive policy is absent, which the hazards say.
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAuthzUpdate},
+	},
 }
 
 func TestPolicyCases(t *testing.T) {

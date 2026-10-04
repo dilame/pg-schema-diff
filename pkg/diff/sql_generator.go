@@ -88,6 +88,15 @@ func (o oldAndNew[S]) GetOld() S {
 type (
 	namedSchemaDiff struct {
 		oldAndNew[schema.NamedSchema]
+		privilegesDiff listDiff[schema.SchemaPrivilege, schemaPrivilegeDiff]
+	}
+
+	schemaPrivilegeDiff struct {
+		oldAndNew[schema.SchemaPrivilege]
+	}
+
+	defaultPrivilegeDiff struct {
+		oldAndNew[schema.DefaultPrivilege]
 	}
 
 	enumDiff struct {
@@ -96,6 +105,10 @@ type (
 
 	compositeTypeDiff struct {
 		oldAndNew[schema.CompositeType]
+	}
+
+	domainDiff struct {
+		oldAndNew[schema.Domain]
 	}
 
 	extensionDiff struct {
@@ -116,12 +129,17 @@ type (
 		oldAndNew[schema.TablePrivilege]
 	}
 
+	columnPrivilegeDiff struct {
+		oldAndNew[schema.ColumnPrivilege]
+	}
+
 	tableDiff struct {
 		oldAndNew[schema.Table]
-		columnsDiff         listDiff[schema.Column, columnDiff]
-		checkConstraintDiff listDiff[schema.CheckConstraint, checkConstraintDiff]
-		policiesDiff        listDiff[schema.Policy, policyDiff]
-		privilegesDiff      listDiff[schema.TablePrivilege, privilegeDiff]
+		columnsDiff          listDiff[schema.Column, columnDiff]
+		checkConstraintDiff  listDiff[schema.CheckConstraint, checkConstraintDiff]
+		policiesDiff         listDiff[schema.Policy, policyDiff]
+		privilegesDiff       listDiff[schema.TablePrivilege, privilegeDiff]
+		columnPrivilegesDiff listDiff[schema.ColumnPrivilege, columnPrivilegeDiff]
 	}
 
 	indexDiff struct {
@@ -138,19 +156,23 @@ type (
 
 	functionDiff struct {
 		oldAndNew[schema.Function]
+		privilegesDiff listDiff[schema.Privilege, privilegeDiff]
 	}
 
 	procedureDiff struct {
 		oldAndNew[schema.Procedure]
+		privilegesDiff listDiff[schema.Privilege, privilegeDiff]
 	}
 )
 
 type schemaDiff struct {
 	oldAndNew[schema.Schema]
 	namedSchemaDiffs          listDiff[schema.NamedSchema, namedSchemaDiff]
+	defaultPrivilegeDiffs     listDiff[schema.DefaultPrivilege, defaultPrivilegeDiff]
 	extensionDiffs            listDiff[schema.Extension, extensionDiff]
 	enumDiffs                 listDiff[schema.Enum, enumDiff]
 	compositeTypeDiffs        listDiff[schema.CompositeType, compositeTypeDiff]
+	domainDiffs               listDiff[schema.Domain, domainDiff]
 	tableDiffs                listDiff[schema.Table, tableDiff]
 	indexDiffs                listDiff[schema.Index, indexDiff]
 	foreignKeyConstraintDiffs listDiff[schema.ForeignKeyConstraint, foreignKeyConstraintDiff]
@@ -160,6 +182,9 @@ type schemaDiff struct {
 	triggerDiffs              listDiff[schema.Trigger, triggerDiff]
 	viewDiff                  listDiff[schema.View, viewDiff]
 	materializedViewDiffs     listDiff[schema.MaterializedView, materializedViewDiff]
+	// functionDependentsRebinds are the policies and column defaults that call a function the
+	// plan drops, taken out of their tables' diffs (see detachFunctionDependents).
+	functionDependentsRebinds []functionDependentsRebind
 }
 
 // The procedure for DIFFING schemas and GENERATING/RESOLVING the SQL required to migrate the old schema to the new schema is
@@ -192,7 +217,9 @@ type schemaDiff struct {
 // The sqlGenerator just generates SQL, while the sqlVertexGenerator also defines dependencies that a schema object has
 // on other schema objects
 
-func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
+// buildSchemaDiff diffs two schemas. The views named in recreatedViews are dropped and created
+// again even where they could be replaced in place (see generateMigrationStatements).
+func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (schemaDiff, bool, error) {
 	// Normalize the schemas, so we get a consistent ordering for statements.
 	old = old.Normalize()
 	new = new.Normalize()
@@ -201,15 +228,43 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		old.NamedSchemas,
 		new.NamedSchemas,
 		func(old, new schema.NamedSchema, _, _ int) (namedSchemaDiff, bool, error) {
+			oldPrivileges := filterSchemaOwnerPrivileges(old.Privileges, old.Owner)
+			newPrivileges := filterSchemaOwnerPrivileges(new.Privileges, new.Owner)
+			privilegesDiff, err := diffLists(
+				oldPrivileges,
+				newPrivileges,
+				func(old, new schema.SchemaPrivilege, _, _ int) (schemaPrivilegeDiff, bool, error) {
+					// Recreate the privilege if IsGrantable changes
+					recreate := old.IsGrantable != new.IsGrantable
+					return schemaPrivilegeDiff{oldAndNew[schema.SchemaPrivilege]{old: old, new: new}}, recreate, nil
+				},
+			)
+			if err != nil {
+				return namedSchemaDiff{}, false, fmt.Errorf("diffing schema privileges: %w", err)
+			}
+
 			return namedSchemaDiff{
 				oldAndNew[schema.NamedSchema]{
 					old: old,
 					new: new,
 				},
+				privilegesDiff,
 			}, false, nil
 		})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing schemas: %w", err)
+	}
+
+	defaultPrivilegeDiffs, err := diffLists(
+		old.DefaultPrivileges,
+		new.DefaultPrivileges,
+		func(old, new schema.DefaultPrivilege, _, _ int) (defaultPrivilegeDiff, bool, error) {
+			// Re-create the privilege if IsGrantable changes: there is no ALTER for it.
+			recreate := old.IsGrantable != new.IsGrantable
+			return defaultPrivilegeDiff{oldAndNew[schema.DefaultPrivilege]{old: old, new: new}}, recreate, nil
+		})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing default privileges: %w", err)
 	}
 
 	extensionDiffs, err := diffLists(
@@ -239,12 +294,29 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing enums: %w", err)
 	}
 
+	// domainsBeingRecreated tracks the domains whose base type or collation is changing.
+	// Neither can be altered in place, so those domains are dropped and re-created, and every
+	// function, procedure, or composite type whose signature/attributes are typed with one of
+	// them must be re-created too: their definitions cannot change in place.
+	domainsBeingRecreated, err := identifyDomainsToRecreate(old, new)
+	if err != nil {
+		return schemaDiff{}, false, err
+	}
+	domainDiffs, err := diffLists(old.Domains, new.Domains, func(old, new schema.Domain, _, _ int) (domainDiff, bool, error) {
+		return domainDiff{
+			oldAndNew[schema.Domain]{old: old, new: new},
+		}, domainsBeingRecreated[new.GetName()], nil
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing domains: %w", err)
+	}
+
 	// compositeTypesBeingRecreated tracks types whose attribute layout is changing,
 	// including composite types that must be recreated because one of their
 	// attribute types is being recreated. Functions and procedures that reference
 	// any of these must be force-recreated so they pick up the new layout —
 	// `CREATE OR REPLACE FUNCTION` cannot change a function's argument or return type.
-	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(old.CompositeTypes, new.CompositeTypes)
+	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(old.CompositeTypes, new.CompositeTypes, domainsBeingRecreated)
 	if err != nil {
 		return schemaDiff{}, false, err
 	}
@@ -309,35 +381,71 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 
 	functionDiffs, err := diffLists(old.Functions, new.Functions, func(old, new schema.Function, _, _ int) (functionDiff, bool, error) {
 		// If the new function references a composite type whose attributes are being
-		// recreated, the function must be dropped and recreated alongside the type
-		// (CREATE OR REPLACE cannot change a function's argument or return type).
-		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) {
+		// recreated, or a domain whose base type is being re-created, the function must be
+		// dropped and recreated alongside it (CREATE OR REPLACE cannot change a function's
+		// argument or return type).
+		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
+			dependsOnAnyRecreatedDomain(new.DependsOnDomains, domainsBeingRecreated) {
 			return functionDiff{
 				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
 			}, true, nil
 		}
+		// The identity arguments do not include the result type, so two functions
+		// that differ only in their result are matched as one alterable object
+		// here. `CREATE OR REPLACE` cannot change a function's result type
+		// (PostgreSQL raises SQLSTATE 42P13), so such a change has to be a
+		// drop-and-recreate of the same signature.
+		if old.ResultType != new.ResultType {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
+			}, true, nil
+		}
+		// A SQL-standard body (`BEGIN ATOMIC`) resolves the columns it reads at CREATE time and
+		// PostgreSQL refuses to alter or drop such a column while the function exists. Re-create the
+		// function around the change; the delete dependency orders its drop before the column change
+		// and the add dependency orders its create after.
+		if functionDependsOnAlteredColumn(old, tableDiffsByName, deletedTablesByName) {
+			return functionDiff{
+				oldAndNew[schema.Function]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
+			}, true, nil
+		}
+		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
+		if err != nil {
+			return functionDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+		}
 		return functionDiff{
-			oldAndNew[schema.Function]{
-				old: old,
-				new: new,
-			},
+			oldAndNew:      oldAndNew[schema.Function]{old: old, new: new},
+			privilegesDiff: privilegesDiff,
 		}, false, nil
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing functions: %w", err)
 	}
+	functionDiffs = cascadeRecreatedFunctions(functionDiffs)
+	droppedFunctions := droppedFunctionNames(functionDiffs)
+	if err := refuseUnrebindableFunctionDependents(tableDiffs, old.Indexes, droppedFunctions); err != nil {
+		return schemaDiff{}, false, err
+	}
+	tableDiffs, functionDependentsRebinds := detachFunctionDependents(tableDiffs, droppedFunctions)
 
 	procedureDiffs, err := diffLists(old.Procedures, new.Procedures, func(old, new schema.Procedure, _, _ int) (procedureDiff, bool, error) {
-		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) {
+		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
+			dependsOnAnyRecreatedDomain(new.DependsOnDomains, domainsBeingRecreated) {
 			return procedureDiff{
 				oldAndNew[schema.Procedure]{old: old, new: new},
+				listDiff[schema.Privilege, privilegeDiff]{},
 			}, true, nil
 		}
+		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
+		if err != nil {
+			return procedureDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+		}
 		return procedureDiff{
-			oldAndNew[schema.Procedure]{
-				old: old,
-				new: new,
-			},
+			oldAndNew:      oldAndNew[schema.Procedure]{old: old, new: new},
+			privilegesDiff: privilegesDiff,
 		}, false, nil
 	})
 	if err != nil {
@@ -348,6 +456,12 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		if _, isOnNewTable := addedTablesByName[new.OwningTable.GetName()]; isOnNewTable {
 			// If the table is new, then it must be re-created (this occurs if the base table has been
 			// re-created). In other words, a trigger must be re-created if the owning table is re-created
+			return triggerDiff{}, true, nil
+		}
+		if keepsCallingDroppedFunction(old.DependsOnFunctions, new.DependsOnFunctions, droppedFunctions) {
+			// A trigger that keeps calling a function the plan drops cannot be replaced in place
+			// between the drop and the create, so it is dropped before the function and created
+			// again after the functions it calls, with its comment and enabled state.
 			return triggerDiff{}, true, nil
 		}
 		return triggerDiff{
@@ -362,6 +476,9 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	}
 
 	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View, _, _ int) (diff viewDiff, requiresRecreation bool, error error) {
+		if recreatedViews[new.GetName()] {
+			return viewDiff{}, true, nil
+		}
 		return buildViewDiff(deletedTablesByName, tableDiffsByName, old, new)
 	})
 	if err != nil {
@@ -375,15 +492,19 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing materialized views: %w", err)
 	}
 
+	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs, functionDiffs)
+
 	return schemaDiff{
 		oldAndNew: oldAndNew[schema.Schema]{
 			old: old,
 			new: new,
 		},
 		namedSchemaDiffs:          schemaDiffs,
+		defaultPrivilegeDiffs:     defaultPrivilegeDiffs,
 		extensionDiffs:            extensionDiffs,
 		enumDiffs:                 enumDiffs,
 		compositeTypeDiffs:        compositeTypeDiffs,
+		domainDiffs:               domainDiffs,
 		tableDiffs:                tableDiffs,
 		indexDiffs:                indexesDiff,
 		foreignKeyConstraintDiffs: foreignKeyConstraintDiffs,
@@ -393,7 +514,23 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		triggerDiffs:              triggerDiffs,
 		viewDiff:                  viewDiffs,
 		materializedViewDiffs:     materializedViewDiffs,
+		functionDependentsRebinds: functionDependentsRebinds,
 	}, false, nil
+}
+
+func filterSchemaOwnerPrivileges(privileges []schema.SchemaPrivilege, owner string) []schema.SchemaPrivilege {
+	if owner == "" {
+		return privileges
+	}
+
+	var filtered []schema.SchemaPrivilege
+	for _, privilege := range privileges {
+		if privilege.Grantee == owner && (privilege.Privilege == "USAGE" || privilege.Privilege == "CREATE") {
+			continue
+		}
+		filtered = append(filtered, privilege)
+	}
+	return filtered
 }
 
 func buildTableDiff(oldTable, newTable schema.Table, _, _ int) (diff tableDiff, requiresRecreation bool, err error) {
@@ -466,29 +603,68 @@ func buildTableDiff(oldTable, newTable schema.Table, _, _ int) (diff tableDiff, 
 
 	}
 
-	privilegesDiff, err := diffLists(
-		oldTable.Privileges,
-		newTable.Privileges,
-		func(old, new schema.TablePrivilege, _, _ int) (privilegeDiff, bool, error) {
-			// Recreate the privilege if IsGrantable changes
-			recreate := old.IsGrantable != new.IsGrantable
-			return privilegeDiff{oldAndNew[schema.TablePrivilege]{old: old, new: new}}, recreate, nil
-		},
-	)
+	privilegesDiff, err := buildPrivilegeDiffs(oldTable.Privileges, newTable.Privileges)
 	if err != nil {
 		return tableDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
 	}
+
+	columnPrivilegesDiff, err := diffLists(
+		oldTable.ColumnPrivileges,
+		newTable.ColumnPrivileges,
+		func(old, new schema.ColumnPrivilege, _, _ int) (columnPrivilegeDiff, bool, error) {
+			// Recreate the privilege if IsGrantable changes
+			recreate := old.IsGrantable != new.IsGrantable
+			return columnPrivilegeDiff{oldAndNew[schema.ColumnPrivilege]{old: old, new: new}}, recreate, nil
+		},
+	)
+	if err != nil {
+		return tableDiff{}, false, fmt.Errorf("diffing column privileges: %w", err)
+	}
+	columnPrivilegesDiff.deletes = pruneColumnPrivilegesForDroppedColumns(columnPrivilegesDiff.deletes, newTable)
 
 	return tableDiff{
 		oldAndNew: oldAndNew[schema.Table]{
 			old: oldTable,
 			new: newTable,
 		},
-		columnsDiff:         columnsDiff,
-		checkConstraintDiff: checkConsDiff,
-		policiesDiff:        policiesDiff,
-		privilegesDiff:      privilegesDiff,
+		columnsDiff:          columnsDiff,
+		checkConstraintDiff:  checkConsDiff,
+		policiesDiff:         policiesDiff,
+		privilegesDiff:       privilegesDiff,
+		columnPrivilegesDiff: columnPrivilegesDiff,
 	}, false, nil
+}
+
+func buildPrivilegeDiffs(oldPrivileges, newPrivileges []schema.Privilege) (listDiff[schema.Privilege, privilegeDiff], error) {
+	return diffLists(
+		oldPrivileges,
+		newPrivileges,
+		func(old, new schema.Privilege, _, _ int) (privilegeDiff, bool, error) {
+			// Recreate the privilege if IsGrantable changes.
+			recreate := old.IsGrantable != new.IsGrantable
+			return privilegeDiff{oldAndNew[schema.Privilege]{old: old, new: new}}, recreate, nil
+		},
+	)
+}
+
+// pruneColumnPrivilegesForDroppedColumns removes privileges belonging to columns that are absent from the
+// new schema. Such privileges are dropped together with their column, so emitting a REVOKE for them would
+// be unnecessary (and would fail, since the column no longer exists at that point).
+func pruneColumnPrivilegesForDroppedColumns(deletes []schema.ColumnPrivilege, newTable schema.Table) []schema.ColumnPrivilege {
+	if len(deletes) == 0 {
+		return deletes
+	}
+	columnsInNewTable := make(map[string]bool, len(newTable.Columns))
+	for _, column := range newTable.Columns {
+		columnsInNewTable[column.Name] = true
+	}
+	var kept []schema.ColumnPrivilege
+	for _, p := range deletes {
+		if columnsInNewTable[p.ColumnName] {
+			kept = append(kept, p)
+		}
+	}
+	return kept
 }
 
 type indexDiffConfig struct {
@@ -630,6 +806,17 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, tablePartialGraph)
 
+	newTablePoliciesPartialGraph, err := newNewTablePoliciesSQLVertexGenerator().AddAll(diff.tableDiffs.adds)
+	if err != nil {
+		return nil, fmt.Errorf("resolving new table policies: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, newTablePoliciesPartialGraph)
+
+	defaultPrivilegeStatements, err := diff.defaultPrivilegeDiffs.resolveToSQLGroupedByEffect(&defaultPrivilegeSQLGenerator{})
+	if err != nil {
+		return nil, fmt.Errorf("resolving default privilege sql statements: %w", err)
+	}
+
 	extensionStatements, err := diff.extensionDiffs.resolveToSQLGroupedByEffect(&extensionSQLGenerator{})
 	if err != nil {
 		return nil, fmt.Errorf("resolving extension diff: %w", err)
@@ -699,7 +886,18 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, sequenceOwnershipsPartialGraph)
 
-	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(diff.old.CompositeTypes, diff.new.CompositeTypes)
+	domainsBeingRecreated, err := identifyDomainsToRecreate(diff.old, diff.new)
+	if err != nil {
+		return nil, fmt.Errorf("identifying domains to recreate: %w", err)
+	}
+	domainGenerator := newDomainSQLVertexGenerator(diff.old, diff.new, domainsBeingRecreated)
+	domainsPartialGraph, err := generatePartialGraph(domainGenerator, diff.domainDiffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving domain diff: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, domainsPartialGraph)
+
+	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(diff.old.CompositeTypes, diff.new.CompositeTypes, domainsBeingRecreated)
 	if err != nil {
 		return nil, fmt.Errorf("identifying composite types to recreate: %w", err)
 	}
@@ -715,7 +913,14 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving function diff: %w", err)
 	}
+	functionsPartialGraph = orderFunctionDropsBeforeFunctionCreates(functionsPartialGraph, diff.functionDiffs)
 	partialGraph = concatPartialGraphs(partialGraph, functionsPartialGraph)
+
+	functionDependentsGraph, err := functionDependentsPartialGraph(diff.functionDependentsRebinds)
+	if err != nil {
+		return nil, fmt.Errorf("resolving the objects that call a dropped function: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, functionDependentsGraph)
 
 	procedureGenerator := newProcedureSqlVertexGenerator(diff.new)
 	proceduresPartialGraph, err := generatePartialGraph(procedureGenerator, diff.proceduresDiffs)
@@ -763,6 +968,13 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	// that all dependencies exist before the view is created.
 	statements = append(statements, namedSchemaStatements.Adds...)
 	statements = append(statements, namedSchemaStatements.Alters...)
+	// Default privileges only affect objects created after them, so all of them are resolved
+	// before the graph statements create anything, and after every schema exists. Revokes come
+	// first so that a privilege whose grant option changed (a revoke plus a grant) ends up
+	// granted.
+	statements = append(statements, defaultPrivilegeStatements.Deletes...)
+	statements = append(statements, defaultPrivilegeStatements.Alters...)
+	statements = append(statements, defaultPrivilegeStatements.Adds...)
 	statements = append(statements, extensionStatements.Adds...)
 	statements = append(statements, extensionStatements.Alters...)
 	statements = append(statements, enumStatements.Adds...)
@@ -834,7 +1046,7 @@ func buildSchemaObjByNameMap[S schema.Object](s []S) map[string]S {
 	})
 }
 
-func identifyCompositeTypesToRecreate(old, new []schema.CompositeType) (map[string]bool, error) {
+func identifyCompositeTypesToRecreate(old, new []schema.CompositeType, recreatedDomains map[string]bool) (map[string]bool, error) {
 	oldByName := buildSchemaObjByNameMap(old)
 	recreated := make(map[string]bool)
 
@@ -861,9 +1073,10 @@ func identifyCompositeTypesToRecreate(old, new []schema.CompositeType) (map[stri
 			if !ok {
 				continue
 			}
-			if dependsOnAnyRecreatedType(newType.DependsOnCompositeTypes, recreated) {
+			if dependsOnAnyRecreatedType(newType.DependsOnCompositeTypes, recreated) ||
+				dependsOnAnyRecreatedDomain(newType.DependsOnDomains, recreatedDomains) {
 				if oldType.IsUsedByTable {
-					return nil, fmt.Errorf("recreating composite type %s used by a table column because one of its composite attributes changed: %w", newType.GetFQEscapedName(), ErrNotImplemented)
+					return nil, fmt.Errorf("recreating composite type %s used by a table column because one of its attribute types changed: %w", newType.GetFQEscapedName(), ErrNotImplemented)
 				}
 				recreated[newType.GetName()] = true
 				changed = true
@@ -872,6 +1085,69 @@ func identifyCompositeTypesToRecreate(old, new []schema.CompositeType) (map[stri
 	}
 
 	return recreated, nil
+}
+
+// identifyDomainsToRecreate returns the domains whose base type or collation changed. Postgres
+// has no `ALTER DOMAIN ... TYPE`, so such a domain must be dropped and re-created. If a table
+// column is typed with one of them, the re-creation is refused: dropping the domain would require
+// dropping the column.
+func identifyDomainsToRecreate(old, new schema.Schema) (map[string]bool, error) {
+	oldByName := buildSchemaObjByNameMap(old.Domains)
+	recreated := make(map[string]bool)
+
+	for _, newDomain := range new.Domains {
+		oldDomain, ok := oldByName[newDomain.GetName()]
+		if !ok {
+			continue
+		}
+		if oldDomain.BaseType == newDomain.BaseType && cmp.Equal(oldDomain.Collation, newDomain.Collation) {
+			continue
+		}
+		for _, table := range old.Tables {
+			if dependsOnDomain(table.DependsOnDomains, newDomain.GetName()) {
+				return nil, fmt.Errorf("changing the base type or collation of domain %s used by a column of table %s: %w", newDomain.GetFQEscapedName(), table.GetFQEscapedName(), ErrNotImplemented)
+			}
+		}
+		recreated[newDomain.GetName()] = true
+	}
+
+	return recreated, nil
+}
+
+func dependsOnAnyRecreatedDomain(deps []schema.SchemaQualifiedName, recreated map[string]bool) bool {
+	for _, dep := range deps {
+		if recreated[dep.GetName()] {
+			return true
+		}
+	}
+	return false
+}
+
+// functionDependsOnAlteredColumn reports whether the function reads a relation column that is being
+// altered or dropped (or whose relation is being re-created). `CREATE OR REPLACE FUNCTION` leaves
+// the body's column references as they are, and PostgreSQL refuses to change such a column while
+// the function exists, so the function has to be dropped before the change and created again after.
+func functionDependsOnAlteredColumn(function schema.Function, tableDiffsByName map[string]tableDiff, deletedTablesByName map[string]schema.Table) bool {
+	for _, dep := range function.DependsOnRelationColumns {
+		if _, deleted := deletedTablesByName[dep.GetName()]; deleted {
+			return true
+		}
+		td, ok := tableDiffsByName[dep.GetName()]
+		if !ok {
+			continue
+		}
+		for _, deletedColumn := range td.columnsDiff.deletes {
+			if deletedColumn.Name == dep.Column {
+				return true
+			}
+		}
+		for _, columnDiff := range td.columnsDiff.alters {
+			if columnDiff.new.Name == dep.Column && columnDiff.old.Type != columnDiff.new.Type {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func buildDiffByNameMap[S schema.Object, D diff[S]](d []D) map[string]D {
@@ -909,6 +1185,9 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		if len(table.Privileges) > 0 {
 			return nil, fmt.Errorf("privileges on partitions: %w", ErrNotImplemented)
 		}
+		if len(table.ColumnPrivileges) > 0 {
+			return nil, fmt.Errorf("column privileges on partitions: %w", ErrNotImplemented)
+		}
 		// We attach the partitions separately. So the partition must have all the same check constraints
 		// as the original table
 		table.CheckConstraints = append(table.CheckConstraints, t.tablesInNewSchemaByName[table.ParentTable.GetName()].CheckConstraints...)
@@ -925,7 +1204,12 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		columnDefs = append(columnDefs, "\t"+columnDef)
 	}
 	createTableSb := strings.Builder{}
-	createTableSb.WriteString(fmt.Sprintf("CREATE TABLE %s (\n%s\n)",
+	tableKind := "TABLE"
+	if table.IsUnlogged {
+		tableKind = "UNLOGGED TABLE"
+	}
+	createTableSb.WriteString(fmt.Sprintf("CREATE %s %s (\n%s\n)",
+		tableKind,
 		table.GetFQEscapedName(),
 		strings.Join(columnDefs, ",\n"),
 	))
@@ -937,6 +1221,7 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	})
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("TABLE", table.SchemaQualifiedName), table.Owner)...)
 
 	// Emit COMMENT ON TABLE / COMMENT ON COLUMN immediately after CREATE TABLE so that
 	// metadata travels with the structural DDL. PG drops these along with the table on
@@ -970,18 +1255,9 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		stmts = append(stmts, alterReplicaIdentityStmt)
 	}
 
-	policyGenerator, err := newPolicySQLVertexGenerator(nil, table)
-	if err != nil {
-		return nil, fmt.Errorf("creating policy sql vertex generator: %w", err)
-	}
-	for _, policy := range table.Policies {
-		addPolicyPartialGraph, err := policyGenerator.Add(policy)
-		if err != nil {
-			return nil, fmt.Errorf("generating add policy statements for policy %s: %w", policy.EscapedName, err)
-		}
-		// Remove hazards from statements since the table is brand new
-		stmts = append(stmts, stripMigrationHazards(addPolicyPartialGraph.statements()...)...)
-	}
+	// A new table's policies are emitted by newTablePoliciesSQLVertexGenerator as a vertex separate
+	// from the table's own. See the generator for why. RLS enable/force stays in this vertex, before
+	// that one, because enabling RLS first is harmless on a table that has just been created.
 
 	if table.RLSEnabled {
 		stmts = append(stmts, stripMigrationHazards(enableRLSForTable(table))...)
@@ -990,11 +1266,21 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		stmts = append(stmts, stripMigrationHazards(forceRLSForTable(table))...)
 	}
 
-	privilegeGenerator := &privilegeSQLVertexGenerator{tableName: table.SchemaQualifiedName}
+	privilegeGenerator := newPrivilegeSQLVertexGenerator(table.SchemaQualifiedName)
 	for _, privilege := range table.Privileges {
-		addPrivilegeStmts, err := privilegeGenerator.Add(privilege)
+		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
 		if err != nil {
 			return nil, fmt.Errorf("generating add privilege statements for privilege %s: %w", privilege.GetName(), err)
+		}
+		// Remove hazards from statements since the table is brand new
+		stmts = append(stmts, stripMigrationHazards(addPrivilegePartialGraph.statements()...)...)
+	}
+
+	columnPrivilegeGenerator := &columnPrivilegeSQLVertexGenerator{tableName: table.SchemaQualifiedName}
+	for _, privilege := range table.ColumnPrivileges {
+		addPrivilegeStmts, err := columnPrivilegeGenerator.Add(privilege)
+		if err != nil {
+			return nil, fmt.Errorf("generating add column privilege statements for privilege %s: %w", privilege.GetName(), err)
 		}
 		// Remove hazards from statements since the table is brand new
 		stmts = append(stmts, stripMigrationHazards(addPrivilegeStmts...)...)
@@ -1035,6 +1321,7 @@ func (t *tableSQLVertexGenerator) Alter(diff tableDiff) ([]Statement, error) {
 	}
 
 	var stmts []Statement
+	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("TABLE", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	stmts = append(stmts, commentDDLForAlter(commentTargetTable(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
 	// Only handle disabling RLS if it was previously enabled.
 	// We want to disable RLS before we do any other operations on the table, e.g., delete policies, to avoid creating an
@@ -1058,6 +1345,10 @@ func (t *tableSQLVertexGenerator) Alter(diff tableDiff) ([]Statement, error) {
 			return nil, fmt.Errorf("altering base table: %w", err)
 		}
 		stmts = append(stmts, alterBaseTableStmts...)
+	}
+
+	if diff.old.IsUnlogged != diff.new.IsUnlogged {
+		stmts = append(stmts, alterTablePersistenceStatement(diff.new.SchemaQualifiedName, diff.new.IsUnlogged))
 	}
 
 	if diff.old.ReplicaIdentity != diff.new.ReplicaIdentity {
@@ -1148,6 +1439,13 @@ func (t *tableSQLVertexGenerator) alterBaseTable(diff tableDiff) ([]Statement, e
 	}
 	partialGraph = concatPartialGraphs(partialGraph, privilegesPartialGraph)
 
+	columnPrivilegeGenerator := newColumnPrivilegeSQLVertexGenerator(diff.new.SchemaQualifiedName)
+	columnPrivilegesPartialGraph, err := generatePartialGraph(columnPrivilegeGenerator, diff.columnPrivilegesDiff)
+	if err != nil {
+		return nil, fmt.Errorf("resolving column privilege sql: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, columnPrivilegesPartialGraph)
+
 	graph, err := graphFromPartials(partialGraph)
 	if err != nil {
 		return nil, fmt.Errorf("converting to graph")
@@ -1166,6 +1464,22 @@ func (t *tableSQLVertexGenerator) alterBaseTable(diff tableDiff) ([]Statement, e
 	return stmts, nil
 }
 
+func alterTablePersistenceStatement(table schema.SchemaQualifiedName, isUnlogged bool) Statement {
+	persistence := "LOGGED"
+	if isUnlogged {
+		persistence = "UNLOGGED"
+	}
+	return Statement{
+		DDL:         fmt.Sprintf("%s SET %s", alterTablePrefix(table), persistence),
+		Timeout:     statementTimeoutDefault,
+		LockTimeout: lockTimeoutDefault,
+		Hazards: []MigrationHazard{{
+			Type:    MigrationHazardTypeAcquiresAccessExclusiveLock,
+			Message: "Changing table persistence requires an ACCESS EXCLUSIVE lock and rewrites the table",
+		}},
+	}
+}
+
 func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, error) {
 	if diff.old.ForValues != diff.new.ForValues {
 		return nil, fmt.Errorf("altering partition FOR VALUES: %w", ErrNotImplemented)
@@ -1182,6 +1496,11 @@ func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, e
 		// Privilege diffing on individual partitions cannot be supported until where a SQL statement is generated is
 		// _independent_ of how it is ordered.
 		return nil, fmt.Errorf("privileges on partitions: %w", ErrNotImplemented)
+	}
+	if !diff.columnPrivilegesDiff.isEmpty() {
+		// Column privilege diffing on individual partitions cannot be supported until where a SQL statement is
+		// generated is _independent_ of how it is ordered.
+		return nil, fmt.Errorf("column privileges on partitions: %w", ErrNotImplemented)
 	}
 
 	var alteredParentColumnsByName map[string]columnDiff
@@ -1271,7 +1590,36 @@ func buildTableVertexId(name schema.SchemaQualifiedName, diffType diffType) sqlV
 	return buildSchemaObjVertexId("table", name.GetFQEscapedName(), diffType)
 }
 
-func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, _ schema.Table) ([]dependency, error) {
+// buildRelationKindVertexId maps a relation kind to the vertex of the generator that emits that
+// relation's statement, so a dependency edge can point at the right statement. The view generator
+// emits CREATE VIEW under the table vertex id (so a view is ordered with the tables it reads) and
+// DROP VIEW under the view vertex id; a materialized view uses its own vertex id throughout.
+func buildRelationKindVertexId(kind schema.RelationKind, name schema.SchemaQualifiedName, diffType diffType) sqlVertexId {
+	switch kind {
+	case schema.RelationKindView:
+		if diffType == diffTypeDelete {
+			return buildViewVertexId(name, diffType)
+		}
+		return buildTableVertexId(name, diffType)
+	case schema.RelationKindMaterializedView:
+		return buildMaterializedViewVertexId(name, diffType)
+	default:
+		// Ordinary and partitioned tables share the table generator.
+		return buildTableVertexId(name, diffType)
+	}
+}
+
+// buildRelationVertexId maps a relation referenced by a routine's signature to its SQL vertex.
+func buildRelationVertexId(relation schema.RelationDependency, diffType diffType) sqlVertexId {
+	return buildRelationKindVertexId(relation.Kind, relation.SchemaQualifiedName, diffType)
+}
+
+// buildDependencyVertexId maps a view/materialized-view dependency to its SQL vertex.
+func buildDependencyVertexId(dep schema.TableDependency, diffType diffType) sqlVertexId {
+	return buildRelationKindVertexId(dep.Kind, dep.SchemaQualifiedName, diffType)
+}
+
+func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, oldTable schema.Table) ([]dependency, error) {
 	deps := []dependency{
 		mustRun(t.GetSQLVertexId(table, diffTypeAddAlter)).after(t.GetSQLVertexId(table, diffTypeDelete)),
 	}
@@ -1280,6 +1628,14 @@ func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, _ schema.Table)
 		deps = append(deps,
 			mustRun(t.GetSQLVertexId(table, diffTypeAddAlter)).after(buildTableVertexId(*table.ParentTable, diffTypeAddAlter)),
 		)
+	}
+	// A new table's policies have their own vertex, which carries the dependency on the functions
+	// they call. On an existing table the policies are appended to this vertex, so they need the
+	// dependency here — but only the ones this migration adds or alters: an unchanged policy is not
+	// re-created, and its dependency would make table → function (policy) and function → table (a
+	// SQL-standard body reads the table) a cycle even though neither statement does anything.
+	if !cmp.Equal(oldTable, schema.Table{}) {
+		deps = append(deps, consumerPolicyFunctionDependencies(oldTable, table)...)
 	}
 	return deps, nil
 }
@@ -1349,7 +1705,52 @@ func (t *tableSQLVertexGenerator) GetDeleteDependencies(table schema.Table) ([]d
 			mustRun(t.GetSQLVertexId(table, diffTypeDelete)).after(buildTableVertexId(*table.ParentTable, diffTypeDelete)),
 		)
 	}
+	deps = append(deps, policyFunctionDeleteDependencies(table)...)
 	return deps, nil
+}
+
+// consumerPolicyFunctionDependencies orders an altered table's vertex after every function a
+// policy it adds or alters calls. PostgreSQL resolves the functions named in a policy expression at
+// CREATE / ALTER POLICY time, so the table's statement stream, which carries those policies, has to
+// run after them. A policy that is unchanged is not re-created and needs no such dependency.
+func consumerPolicyFunctionDependencies(oldTable, newTable schema.Table) []dependency {
+	oldPoliciesByName := buildSchemaObjByNameMap(oldTable.Policies)
+	var deps []dependency
+	for _, policy := range newTable.Policies {
+		if old, existed := oldPoliciesByName[policy.GetName()]; existed && cmp.Equal(old, policy) {
+			continue
+		}
+		for _, depFunction := range policy.DependsOnFunctions {
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
+		}
+		for _, depRelation := range policy.DependsOnRelations {
+			if depRelation.GetName() == newTable.SchemaQualifiedName.GetName() {
+				// The policy's own table; the table vertex already precedes its policies.
+				continue
+			}
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
+		}
+	}
+	return deps
+}
+
+// policyFunctionDeleteDependencies orders a table's drop before the drop of every function its
+// policies call: a policy lives and dies with its table, so the function may only be dropped after
+// the policy is gone.
+func policyFunctionDeleteDependencies(table schema.Table) []dependency {
+	var deps []dependency
+	for _, policy := range table.Policies {
+		for _, depFunction := range policy.DependsOnFunctions {
+			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)).before(buildFunctionVertexId(depFunction, diffTypeDelete)))
+		}
+		for _, depRelation := range policy.DependsOnRelations {
+			if depRelation.GetName() == table.SchemaQualifiedName.GetName() {
+				continue
+			}
+			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)).before(buildRelationVertexId(depRelation, diffTypeDelete)))
+		}
+	}
+	return deps
 }
 
 type columnSQLVertexGenerator struct {
@@ -2672,6 +3073,7 @@ func (s *sequenceSQLVertexGenerator) Add(seq schema.Sequence) ([]Statement, erro
 	stmts := []Statement{
 		s.buildAddAlterSequenceStatement(seq, false),
 	}
+	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("SEQUENCE", seq.SchemaQualifiedName), seq.RoleOwner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetSequence(seq.SchemaQualifiedName), seq.Description)...)
 	return stmts, nil
 }
@@ -2698,6 +3100,9 @@ func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, erro
 	var stmts []Statement
 	// Ownership changes handled by the sequenceOwnershipSQLVertexGenerator
 	diff.old.Owner = diff.new.Owner
+	oldRoleOwner := diff.old.RoleOwner
+	roleOwnerChanged := oldRoleOwner != diff.new.RoleOwner
+	diff.old.RoleOwner = diff.new.RoleOwner
 	// Mask Description: handled by an explicit COMMENT statement below.
 	descChanged := diff.old.Description != diff.new.Description
 	diff.old.Description = diff.new.Description
@@ -2725,6 +3130,9 @@ func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, erro
 
 	if !cmp.Equal(diff.old, diff.new) {
 		return nil, fmt.Errorf("altering sequence to resolve the following diff %s: %w", cmp.Diff(diff.old, diff.new), ErrNotImplemented)
+	}
+	if roleOwnerChanged {
+		stmts = append(stmts, ownerDDLForAlter(ownershipTarget("SEQUENCE", diff.new.SchemaQualifiedName), oldRoleOwner, diff.new.RoleOwner)...)
 	}
 
 	if descChanged {

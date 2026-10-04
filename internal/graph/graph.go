@@ -12,6 +12,85 @@ type Vertex interface {
 
 type AdjacencyMatrix map[string]map[string]bool
 
+// CycleError is returned by a topological sort of a graph that has a cycle.
+type CycleError struct {
+	// OnCycle holds the ids of the vertices that lie on a cycle, sorted.
+	OnCycle []string
+	message string
+}
+
+func (e *CycleError) Error() string {
+	return e.message
+}
+
+// verticesOnCycles returns the ids of the vertices that lie on a cycle: the members of every
+// strongly connected component with more than one vertex, and every vertex with an edge to itself.
+func (g *Graph[V]) verticesOnCycles() []string {
+	ids := make([]string, 0, len(g.verticesById))
+	for id := range g.verticesById {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	// Tarjan's algorithm.
+	index := 0
+	indexById := make(map[string]int)
+	lowLinkById := make(map[string]int)
+	onStack := make(map[string]bool)
+	var stack []string
+	var onCycles []string
+
+	var connect func(id string)
+	connect = func(id string) {
+		indexById[id] = index
+		lowLinkById[id] = index
+		index++
+		stack = append(stack, id)
+		onStack[id] = true
+
+		var targets []string
+		for target, hasEdge := range g.edges[id] {
+			if hasEdge {
+				if _, ok := g.verticesById[target]; ok {
+					targets = append(targets, target)
+				}
+			}
+		}
+		sort.Strings(targets)
+		for _, target := range targets {
+			if _, visited := indexById[target]; !visited {
+				connect(target)
+				lowLinkById[id] = min(lowLinkById[id], lowLinkById[target])
+			} else if onStack[target] {
+				lowLinkById[id] = min(lowLinkById[id], indexById[target])
+			}
+		}
+
+		if lowLinkById[id] == indexById[id] {
+			var component []string
+			for {
+				top := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				onStack[top] = false
+				component = append(component, top)
+				if top == id {
+					break
+				}
+			}
+			if len(component) > 1 || g.edges[id][id] {
+				onCycles = append(onCycles, component...)
+			}
+		}
+	}
+	for _, id := range ids {
+		if _, visited := indexById[id]; !visited {
+			connect(id)
+		}
+	}
+	sort.Strings(onCycles)
+	return onCycles
+}
+
 // Graph is a directed graph
 type Graph[V Vertex] struct {
 	verticesById map[string]V
@@ -196,7 +275,10 @@ func (g *Graph[V]) TopologicallySortWithPriority(isLowerPriority func(V, V) bool
 				dotSB.Reset()
 				dotSB.WriteString(fmt.Sprintf("failed to encode graph to DOT: %v", err))
 			}
-			return nil, fmt.Errorf("cycle detected: %+v, %+v\n%s", graph, incomingEdgeCountByVertex, dotSB.String())
+			return nil, &CycleError{
+				OnCycle: graph.verticesOnCycles(),
+				message: fmt.Sprintf("cycle detected: %+v, %+v\n%s", graph, incomingEdgeCountByVertex, dotSB.String()),
+			}
 		}
 		sourceWithHighestPriority := sources[indexOfSourceWithHighestPri]
 

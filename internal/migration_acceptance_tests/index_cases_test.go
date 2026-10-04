@@ -824,6 +824,31 @@ var indexAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeIndexDropped,
 		},
 	},
+	{
+		name: "refuse to re-create an expression index around a function the plan drops",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION bucket(p INT) RETURNS INT
+                LANGUAGE sql IMMUTABLE
+                RETURN p / 10;
+
+            CREATE TABLE foobar(id INT);
+            CREATE INDEX foobar_bucket_idx ON foobar (bucket(id));
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION bucket(p INT) RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                RETURN p / 10;
+
+            CREATE TABLE foobar(id INT);
+            CREATE INDEX foobar_bucket_idx ON foobar (bucket(id));
+		`},
+		// Rebuilding the index takes as long as the table is large, so the plan names the function
+		// and the index instead.
+		expectedPlanErrorIs:       diff.ErrNotImplemented,
+		expectedPlanErrorContains: "index \"foobar_bucket_idx\"",
+	},
 }
 
 func TestIndexTestCases(t *testing.T) {

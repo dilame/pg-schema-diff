@@ -82,7 +82,7 @@ func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (parti
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
 			id:       deleteVertexId,
-			priority: sqlPriorityLater,
+			priority: sqlPriorityDropsLast,
 			statements: []Statement{{
 				DDL:         fmt.Sprintf("DROP TYPE %s", ct.GetFQEscapedName()),
 				Timeout:     statementTimeoutDefault,

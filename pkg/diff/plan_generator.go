@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/kr/pretty"
+	"github.com/stripe/pg-schema-diff/internal/graph"
 	"github.com/stripe/pg-schema-diff/internal/schema"
 	externalschema "github.com/stripe/pg-schema-diff/pkg/schema"
 
@@ -28,14 +30,15 @@ var (
 
 type (
 	planOptions struct {
-		tempDbFactory           tempdb.Factory
-		dataPackNewTables       bool
-		ignoreChangesToColOrder bool
-		logger                  log.Logger
-		validatePlan            bool
-		getSchemaOpts           []schema.GetSchemaOpt
-		randReader              io.Reader
-		noConcurrentIndexOps    bool
+		tempDbFactory              tempdb.Factory
+		dataPackNewTables          bool
+		ignoreChangesToColOrder    bool
+		logger                     log.Logger
+		validatePlan               bool
+		getSchemaOpts              []schema.GetSchemaOpt
+		randReader                 io.Reader
+		noConcurrentIndexOps       bool
+		disableCheckFunctionBodies bool
 	}
 
 	PlanOpt func(opts *planOptions)
@@ -68,6 +71,16 @@ func WithRespectColumnOrder() PlanOpt {
 func WithDoNotValidatePlan() PlanOpt {
 	return func(opts *planOptions) {
 		opts.validatePlan = false
+	}
+}
+
+// WithDisableCheckFunctionBodies runs plan validation with the check_function_bodies session setting off, so
+// PostgreSQL does not resolve the references a routine's body makes at CREATE time. The default is on, which is how
+// the migration will run; use this only when the plan creates a routine whose body names an object the plan cannot
+// order before it.
+func WithDisableCheckFunctionBodies() PlanOpt {
+	return func(opts *planOptions) {
+		opts.disableCheckFunctionBodies = true
 	}
 }
 
@@ -180,8 +193,56 @@ func Generate(
 	return plan, nil
 }
 
+// generateMigrationStatements orders the plan's statements. A view whose output columns stay the
+// same is replaced in place, which keeps it readable throughout, but the replacement has to run
+// after the relations its new definition reads and before the ones only its old definition reads
+// are dropped, and the rest of the plan can make that order impossible (an old relation that is
+// dropped before a new one can be altered). When the order has a cycle, every view replaced in
+// place that lies on it is re-created instead, which the plan can always order, and the statements
+// are ordered again. A re-created view comes back with all of its state, so the plan is correct
+// either way.
 func generateMigrationStatements(oldSchema, newSchema schema.Schema, planOptions *planOptions) ([]Statement, error) {
-	diff, _, err := buildSchemaDiff(oldSchema, newSchema)
+	recreatedViews := make(map[string]bool)
+	for {
+		statements, err := generateMigrationStatementsRecreatingViews(oldSchema, newSchema, planOptions, recreatedViews)
+		var cycleErr *graph.CycleError
+		if err == nil || !errors.As(err, &cycleErr) {
+			return statements, err
+		}
+		if !recreateViewsOnCycle(oldSchema, newSchema, cycleErr.OnCycle, recreatedViews) {
+			return nil, err
+		}
+	}
+}
+
+// recreateViewsOnCycle adds to recreatedViews every view the plan replaces in place whose
+// replacement lies on a cycle, and reports whether it added any.
+func recreateViewsOnCycle(oldSchema, newSchema schema.Schema, onCycle []string, recreatedViews map[string]bool) bool {
+	onCycleIds := make(map[string]bool)
+	for _, id := range onCycle {
+		onCycleIds[id] = true
+	}
+	oldViewsByName := buildSchemaObjByNameMap(oldSchema.Views)
+	added := false
+	for _, newView := range newSchema.Views {
+		oldView, ok := oldViewsByName[newView.GetName()]
+		if !ok || recreatedViews[newView.GetName()] || !viewDefinitionChanged(oldView, newView) {
+			continue
+		}
+		if onCycleIds[buildTableVertexId(newView.SchemaQualifiedName, diffTypeAddAlter).String()] {
+			recreatedViews[newView.GetName()] = true
+			added = true
+		}
+	}
+	return added
+}
+
+func generateMigrationStatementsRecreatingViews(
+	oldSchema, newSchema schema.Schema,
+	planOptions *planOptions,
+	recreatedViews map[string]bool,
+) ([]Statement, error) {
+	diff, _, err := buildSchemaDiff(oldSchema, newSchema, recreatedViews)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +289,7 @@ func assertValidPlan(ctx context.Context,
 		return fmt.Errorf("inserting schema in temporary database: %w", err)
 	}
 
-	if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements); err != nil {
+	if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements, planOptions.disableCheckFunctionBodies); err != nil {
 		return fmt.Errorf("running migration plan: %w", err)
 	}
 
@@ -269,7 +330,13 @@ func setSchemaForEmptyDatabase(ctx context.Context, emptyDb *tempdb.Database, ta
 	if err != nil {
 		return fmt.Errorf("building schema diff: %w", err)
 	}
-	if err := executeStatementsIgnoreTimeouts(ctx, emptyDb.ConnPool, statements); err != nil {
+	// This reconstructs the schema that already exists in the source database, and the tool only has
+	// to reach the same state, not the same statement order. A legacy string-body routine records no
+	// reference to the relation its body reads, so its create cannot be ordered after that relation;
+	// turn the body check off here, as pg_dump does, so a source schema that still has such routines
+	// can be reconstructed. The plan itself is still applied with the caller's setting (see
+	// assertValidPlan), which is on by default.
+	if err := executeStatementsIgnoreTimeouts(ctx, emptyDb.ConnPool, statements, true); err != nil {
 		return fmt.Errorf("executing statements: %w\n%# v", err, pretty.Formatter(statements))
 	}
 	return nil
@@ -279,13 +346,24 @@ func schemaFromTempDb(ctx context.Context, db *tempdb.Database, plan *planOption
 	return schema.GetSchema(ctx, db.ConnPool, append(plan.getSchemaOpts, db.ExcludeMetadataOptions...)...)
 }
 
-// clearTableAndViewPrivileges returns a copy of the schema with all table and view privileges
-// cleared. This is used during plan validation because privilege statements are skipped (roles
-// don't exist in temp DB).
-func clearTableAndViewPrivileges(s schema.Schema) schema.Schema {
+// clearSkippedPrivileges returns a copy of the schema with all privileges cleared that are emitted
+// as SkipValidation statements (table, column, schema, view, materialized view, routine, and
+// default privileges).
+// This is used during plan validation because privilege statements are skipped (roles don't exist in temp DB).
+func clearSkippedPrivileges(s schema.Schema) schema.Schema {
+	s.DefaultPrivileges = nil
+
+	namedSchemas := make([]schema.NamedSchema, len(s.NamedSchemas))
+	for i, namedSchema := range s.NamedSchemas {
+		namedSchema.Privileges = nil
+		namedSchemas[i] = namedSchema
+	}
+	s.NamedSchemas = namedSchemas
+
 	tables := make([]schema.Table, len(s.Tables))
 	for i, t := range s.Tables {
 		t.Privileges = nil
+		t.ColumnPrivileges = nil
 		tables[i] = t
 	}
 	s.Tables = tables
@@ -297,14 +375,35 @@ func clearTableAndViewPrivileges(s schema.Schema) schema.Schema {
 	}
 	s.Views = views
 
+	materializedViews := make([]schema.MaterializedView, len(s.MaterializedViews))
+	for i, mv := range s.MaterializedViews {
+		mv.Privileges = nil
+		materializedViews[i] = mv
+	}
+	s.MaterializedViews = materializedViews
+
+	functions := make([]schema.Function, len(s.Functions))
+	for i, f := range s.Functions {
+		f.Privileges = nil
+		functions[i] = f
+	}
+	s.Functions = functions
+
+	procedures := make([]schema.Procedure, len(s.Procedures))
+	for i, p := range s.Procedures {
+		p.Privileges = nil
+		procedures[i] = p
+	}
+	s.Procedures = procedures
+
 	return s
 }
 
 func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema schema.Schema, planOptions *planOptions) error {
 	// Clear privileges from both schemas since privilege statements are skipped during validation
 	// (roles don't exist in temp DB). We make copies to avoid modifying the original schemas.
-	migratedSchema = clearTableAndViewPrivileges(migratedSchema)
-	targetSchema = clearTableAndViewPrivileges(targetSchema)
+	migratedSchema = clearSkippedPrivileges(migratedSchema)
+	targetSchema = clearSkippedPrivileges(targetSchema)
 
 	toTargetSchemaStmts, err := generateMigrationStatements(migratedSchema, targetSchema, planOptions)
 	if err != nil {
@@ -324,7 +423,7 @@ func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema schema.Schem
 
 // executeStatementsIgnoreTimeouts executes the statements using the sql connection but ignores any provided timeouts.
 // This function is currently used to validate migration plans.
-func executeStatementsIgnoreTimeouts(ctx context.Context, connPool *sql.DB, statements []Statement) error {
+func executeStatementsIgnoreTimeouts(ctx context.Context, connPool *sql.DB, statements []Statement, disableCheckFunctionBodies bool) error {
 	conn, err := connPool.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("getting connection from pool: %w", err)
@@ -334,6 +433,18 @@ func executeStatementsIgnoreTimeouts(ctx context.Context, connPool *sql.DB, stat
 	// Set a session-level statement_timeout to bound the execution of the migration plan.
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION statement_timeout = %d", (10*time.Second).Milliseconds())); err != nil {
 		return fmt.Errorf("setting statement timeout: %w", err)
+	}
+	// PostgreSQL validates a routine's body at CREATE time (the check_function_bodies session
+	// setting) unless it is turned off. Set it explicitly to the caller's choice rather than only
+	// turning it off: the connection comes from a pool and keeps a previous caller's setting, so a
+	// step that reconstructed a schema with the check off would otherwise leak that into the plan
+	// apply on the same connection.
+	checkFunctionBodies := "on"
+	if disableCheckFunctionBodies {
+		checkFunctionBodies = "off"
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION check_function_bodies = %s", checkFunctionBodies)); err != nil {
+		return fmt.Errorf("setting check_function_bodies: %w", err)
 	}
 	// Due to the way *sql.Db works, when a statement_timeout is set for the session, it will NOT reset
 	// by default when it's returned to the pool.

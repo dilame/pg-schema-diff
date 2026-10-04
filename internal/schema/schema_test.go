@@ -34,6 +34,18 @@ var (
 		EscapedName: `"C"`,
 		SchemaName:  "pg_catalog",
 	}
+	publicSchema = NamedSchema{
+		Name:        "public",
+		Description: "standard public schema",
+		Owner:       "pg_database_owner",
+		Privileges: []SchemaPrivilege{
+			{Grantee: "", Privilege: "USAGE", IsGrantable: false},
+		},
+	}
+	postgresOwnedSchema = func(name string) NamedSchema {
+		return NamedSchema{Name: name, Owner: "postgres"}
+	}
+	defaultExecutePrivileges = []Privilege{{Privilege: "EXECUTE"}}
 
 	testCases = []*testCase{
 		// Exclude materialized views from the test for now because Postgres 14-15 fully qualify column names while Postgres
@@ -92,6 +104,18 @@ var (
 				IMMUTABLE
 				RETURNS NULL ON NULL INPUT
 				RETURN schema_filtered_1.add(a, b) + schema_1.increment(a);
+
+			CREATE DOMAIN schema_1.foobar_domain AS TEXT
+				COLLATE "C"
+				DEFAULT 'foobar'::TEXT
+				NOT NULL
+				CONSTRAINT foobar_domain_check CHECK (length(VALUE) > 0);
+			-- A domain built on another domain, with a CHECK calling a user-defined function
+			CREATE DOMAIN schema_1.dependent_domain AS schema_1.foobar_domain
+				CONSTRAINT dependent_domain_check CHECK (function_with_dependencies(length(VALUE), 1) > 0);
+			COMMENT ON DOMAIN schema_1.foobar_domain IS 'some domain comment';
+			-- Validate domains are filtered out
+			CREATE DOMAIN schema_filtered_1.foobar_domain AS TEXT;
 
 			CREATE TABLE schema_2.foo (
 				id SERIAL,
@@ -238,13 +262,33 @@ var (
 			-- Add table privileges to test they are fetched correctly
 			GRANT SELECT ON schema_2.foo TO some_role_1;
 			GRANT INSERT ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
+
+			-- Add default privileges to test they are fetched correctly
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1 GRANT SELECT ON TABLES TO some_role_1;
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+				GRANT USAGE ON SEQUENCES TO some_role_2 WITH GRANT OPTION;
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_2 GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+			-- Validate default privileges of filtered schemas are filtered out
+			ALTER DEFAULT PRIVILEGES IN SCHEMA schema_filtered_1
+				GRANT SELECT ON TABLES TO some_role_1;
+			-- Validate database-wide default privileges are out of scope
+			ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO some_role_1;
+
+			-- Add column privileges to test they are fetched correctly
+			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
+			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "35f5dafe9016615b",
+			expectedHash: "d2780fd411ecde18",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
-					{Name: "schema_1"},
-					{Name: "schema_2"},
+					publicSchema,
+					postgresOwnedSchema("schema_1"),
+					postgresOwnedSchema("schema_2"),
+				},
+				DefaultPrivileges: []DefaultPrivilege{
+					{TargetRole: "postgres", SchemaName: "schema_1", ObjectType: "SEQUENCES", Grantee: "some_role_2", Privilege: "USAGE", IsGrantable: true},
+					{TargetRole: "postgres", SchemaName: "schema_1", ObjectType: "TABLES", Grantee: "some_role_1", Privilege: "SELECT"},
+					{TargetRole: "postgres", SchemaName: "schema_2", ObjectType: "FUNCTIONS", Grantee: "", Privilege: "EXECUTE"},
 				},
 				Extensions: []Extension{
 					{
@@ -272,6 +316,34 @@ var (
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"foobar_enum\""},
 						Labels:              []string{"foobar_1", "foobar_2"},
+					},
+				},
+				Domains: []Domain{
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"dependent_domain\""},
+						BaseType:            "schema_1.foobar_domain",
+						// Postgres copies the base domain's default into the derived domain.
+						Default: "'foobar'::text",
+						Constraints: []DomainConstraint{
+							{Name: "dependent_domain_check", Def: "CHECK ((function_with_dependencies(length((VALUE)::text), 1) > 0))"},
+						},
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"function_with_dependencies\"(a integer, b integer)", SchemaName: "public"},
+						},
+						DependsOnDomains: []SchemaQualifiedName{
+							{EscapedName: "\"foobar_domain\"", SchemaName: "schema_1"},
+						},
+					},
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"foobar_domain\""},
+						BaseType:            "text",
+						IsNotNull:           true,
+						Default:             "'foobar'::text",
+						Collation:           cCollation,
+						Constraints: []DomainConstraint{
+							{Name: "foobar_domain_check", Def: "CHECK ((length(VALUE) > 0))"},
+						},
+						Description: "some domain comment",
 					},
 				},
 				Tables: []Table{
@@ -320,6 +392,11 @@ var (
 						Privileges: []TablePrivilege{
 							{Grantee: "some_role_2", Privilege: "INSERT", IsGrantable: true},
 							{Grantee: "some_role_1", Privilege: "SELECT", IsGrantable: false},
+						},
+						ColumnPrivileges: []ColumnPrivilege{
+							{ColumnName: "author", Grantee: "some_role_1", Privilege: "SELECT", IsGrantable: false},
+							{ColumnName: "content", Grantee: "some_role_1", Privilege: "SELECT", IsGrantable: false},
+							{ColumnName: "content", Grantee: "some_role_2", Privilege: "UPDATE", IsGrantable: true},
 						},
 						ReplicaIdentity: ReplicaIdentityIndex,
 						RLSEnabled:      true,
@@ -461,33 +538,49 @@ var (
 				},
 				Functions: []Function{
 					{
-						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"function_with_dependencies\"(a integer, b integer)", SchemaName: "public"},
-						FunctionDef:         "CREATE OR REPLACE FUNCTION public.function_with_dependencies(a integer, b integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE STRICT\nRETURN (schema_filtered_1.add(a, b) + schema_1.increment(a))\n",
-						Language:            "sql",
+						SchemaQualifiedName:  SchemaQualifiedName{EscapedName: "\"function_with_dependencies\"(a integer, b integer)", SchemaName: "public"},
+						FunctionDef:          "CREATE OR REPLACE FUNCTION public.function_with_dependencies(a integer, b integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE STRICT\nRETURN (schema_filtered_1.add(a, b) + schema_1.increment(a))\n",
+						FunctionDefCanonical: "CREATE OR REPLACE FUNCTION public.function_with_dependencies(a integer, b integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE STRICT\nRETURN (schema_filtered_1.add(a, b) + schema_1.increment(a))\n",
+						Language:             "sql",
+						ResultType:           "integer",
 						DependsOnFunctions: []SchemaQualifiedName{
 							{EscapedName: "\"add\"(a integer, b integer)", SchemaName: "schema_filtered_1"},
 							{EscapedName: "\"increment\"(i integer)", SchemaName: "schema_1"},
 						},
+						Privileges: defaultExecutePrivileges,
 					},
 					{
-						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"increment\"(i integer)", SchemaName: "schema_1"},
-						FunctionDef:         "CREATE OR REPLACE FUNCTION schema_1.increment(i integer)\n RETURNS integer\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\t\tBEGIN\n\t\t\t\t\t\t\tRETURN i + 1;\n\t\t\t\t\tEND;\n\t\t\t$function$\n",
-						Language:            "plpgsql",
+						SchemaQualifiedName:  SchemaQualifiedName{EscapedName: "\"increment\"(i integer)", SchemaName: "schema_1"},
+						FunctionDef:          "CREATE OR REPLACE FUNCTION schema_1.increment(i integer)\n RETURNS integer\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\t\tBEGIN\n\t\t\t\t\t\t\tRETURN i + 1;\n\t\t\t\t\tEND;\n\t\t\t$function$\n",
+						FunctionDefCanonical: "CREATE OR REPLACE FUNCTION schema_1.increment(i integer)\n RETURNS integer\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\t\tBEGIN\n\t\t\t\t\t\t\tRETURN i + 1;\n\t\t\t\t\tEND;\n\t\t\t$function$\n",
+						Language:             "plpgsql",
+						ResultType:           "integer",
+						Privileges:           defaultExecutePrivileges,
 					},
 					{
-						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
-						FunctionDef:         "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
-						Language:            "plpgsql",
+						SchemaQualifiedName:  SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
+						FunctionDef:          "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
+						FunctionDefCanonical: "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
+						Language:             "plpgsql",
+						ResultType:           "trigger",
+						Privileges:           defaultExecutePrivileges,
 					},
 				},
 				Procedures: []Procedure{
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"some_plpgsql_procedure\"(IN foobar numeric)"},
 						Def:                 "CREATE OR REPLACE PROCEDURE public.some_plpgsql_procedure(IN foobar numeric)\n LANGUAGE plpgsql\nAS $procedure$\n\t\t\t\tBEGIN\n\t\t\t\t\tRAISE NOTICE 'some notice';\n\t\t\t\tEND\n\t\t\t\t$procedure$\n",
+						Privileges:          defaultExecutePrivileges,
 					},
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: "\"some_insert_procedure\"(IN a integer, IN b integer)"},
 						Def:                 "CREATE OR REPLACE PROCEDURE schema_2.some_insert_procedure(IN a integer, IN b integer)\n LANGUAGE sql\nBEGIN ATOMIC\n INSERT INTO schema_2.foo DEFAULT VALUES;\nEND\n",
+						Privileges:          defaultExecutePrivileges,
+						// A SQL-standard (BEGIN ATOMIC) body records the relations it reads in pg_depend,
+						// unlike a string body.
+						DependsOnRelations: []RelationDependency{
+							{SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: `"foo"`}, Kind: RelationKindTable},
+						},
 					},
 				},
 				Triggers: []Trigger{
@@ -496,13 +589,21 @@ var (
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo\"", SchemaName: "schema_2"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
 						GetTriggerDefStmt: "CREATE TRIGGER some_trigger BEFORE UPDATE ON schema_2.foo FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION schema_filtered_1.increment_version()",
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
+						},
 					},
 					{
 						EscapedName:       "\"some_constraint_trigger\"",
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo\"", SchemaName: "schema_2"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
 						GetTriggerDefStmt: "CREATE CONSTRAINT TRIGGER some_constraint_trigger AFTER UPDATE ON schema_2.foo DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION schema_filtered_1.increment_version()",
-						IsConstraint:      true,
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
+						},
+						IsConstraint: true,
 					},
 				},
 				Views: []View{
@@ -511,17 +612,24 @@ var (
 							SchemaName:  "schema_2",
 							EscapedName: "\"foo_view\"",
 						},
-						ViewDefinition: " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
+						ViewDefinition:          " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
+						ViewDefinitionCanonical: " SELECT foo.id,\n    foo.author\n   FROM schema_2.foo\n     JOIN schema_1.foo_fk ON foo.id = foo_fk.id;",
 						Options: map[string]string{
 							"security_barrier": "true",
+						},
+						Columns: []ViewColumn{
+							{Name: "id", Type: "integer"},
+							{Name: "author", Type: "text"},
 						},
 						TableDependencies: []TableDependency{
 							{
 								SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: `"foo_fk"`},
+								Kind:                RelationKindTable,
 								Columns:             []string{"id"},
 							},
 							{
 								SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: `"foo"`},
+								Kind:                RelationKindTable,
 								Columns:             []string{"author", "id"},
 							},
 						},
@@ -593,10 +701,10 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "2e424d75a012ed5e",
+			expectedHash: "460bdcd458ca38bf",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -880,9 +988,12 @@ var (
 				},
 				Functions: []Function{
 					{
-						SchemaQualifiedName: SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
-						FunctionDef:         "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
-						Language:            "plpgsql",
+						SchemaQualifiedName:  SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
+						FunctionDef:          "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
+						FunctionDefCanonical: "CREATE OR REPLACE FUNCTION public.increment_version()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n\t\t\t\tBEGIN\n\t\t\t\t\tNEW.version = OLD.version + 1;\n\t\t\t\t\tRETURN NEW;\n\t\t\t\tEND;\n\t\t\t$function$\n",
+						Language:             "plpgsql",
+						ResultType:           "trigger",
+						Privileges:           defaultExecutePrivileges,
 					},
 				},
 				Triggers: []Trigger{
@@ -891,12 +1002,20 @@ var (
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo\"", SchemaName: "public"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
 						GetTriggerDefStmt: "CREATE TRIGGER some_trigger BEFORE UPDATE ON public.foo FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION increment_version()",
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "public"},
+						},
 					},
 					{
 						EscapedName:       "\"some_partition_trigger\"",
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo_1\"", SchemaName: "public"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
 						GetTriggerDefStmt: "CREATE TRIGGER some_partition_trigger BEFORE UPDATE ON public.foo_1 FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION increment_version()",
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "public"},
+						},
 					},
 				},
 			},
@@ -915,7 +1034,7 @@ var (
 		`},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -972,7 +1091,7 @@ var (
 		`},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -1045,7 +1164,7 @@ var (
 		`},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -1079,7 +1198,7 @@ var (
 		   `},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -1107,7 +1226,7 @@ var (
 		   `},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -1132,8 +1251,8 @@ var (
 		   `},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
-					{Name: "schema_1"},
+					publicSchema,
+					postgresOwnedSchema("schema_1"),
 				},
 				Tables: []Table{
 					{
@@ -1175,10 +1294,10 @@ var (
 				CREATE TYPE pg_temp.color AS ENUM ('red', 'green', 'blue');
 			`},
 			// Assert empty schema hash, since we want to validate specifically that this hash is deterministic
-			expectedHash: "ab91b603e898f324",
+			expectedHash: "88672a4b111c43a5",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 			},
 		},
@@ -1191,7 +1310,7 @@ var (
 		`},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
+					publicSchema,
 				},
 				Tables: []Table{
 					{
@@ -1219,8 +1338,8 @@ var (
 			`},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "public", Description: "standard public schema"},
-					{Name: "schema_2"},
+					publicSchema,
+					postgresOwnedSchema("schema_2"),
 				},
 				Tables: []Table{
 					{
@@ -1250,7 +1369,7 @@ var (
 			`},
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
-					{Name: "schema_1"},
+					postgresOwnedSchema("schema_1"),
 				},
 				Tables: []Table{
 					{
@@ -1345,13 +1464,14 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 		require.NoError(t, err)
 	}
 
-	expectedNormalized := testCase.expectedSchema.Normalize()
+	expectedSchema := fillDefaultObjectOwners(testCase.expectedSchema)
+	expectedNormalized := expectedSchema.Normalize()
 	fetchedNormalized := fetchedSchema.Normalize()
 	assert.Equal(t, expectedNormalized, fetchedNormalized, "expected=\n%# v \n fetched=%# v\n", pretty.Formatter(expectedNormalized), pretty.Formatter(fetchedNormalized))
 
 	fetchedSchemaHash, err := fetchedSchema.Hash()
 	require.NoError(t, err)
-	expectedSchemaHash, err := testCase.expectedSchema.Hash()
+	expectedSchemaHash, err := expectedSchema.Hash()
 	require.NoError(t, err)
 	// same schemas should have the same hashes
 	assert.Equal(t, expectedSchemaHash, fetchedSchemaHash, "hash of expected schema should match fetched hash")
@@ -1359,6 +1479,45 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 		// Optionally assert that the hash matches the expected hash
 		assert.Equal(t, testCase.expectedHash, fetchedSchemaHash)
 	}
+}
+
+func fillDefaultObjectOwners(s Schema) Schema {
+	for i := range s.Enums {
+		if s.Enums[i].Owner == "" {
+			s.Enums[i].Owner = "postgres"
+		}
+	}
+	for i := range s.Tables {
+		if s.Tables[i].Owner == "" {
+			s.Tables[i].Owner = "postgres"
+		}
+	}
+	for i := range s.Sequences {
+		if s.Sequences[i].RoleOwner == "" {
+			s.Sequences[i].RoleOwner = "postgres"
+		}
+	}
+	for i := range s.Functions {
+		if s.Functions[i].Owner == "" {
+			s.Functions[i].Owner = "postgres"
+		}
+	}
+	for i := range s.Procedures {
+		if s.Procedures[i].Owner == "" {
+			s.Procedures[i].Owner = "postgres"
+		}
+	}
+	for i := range s.Views {
+		if s.Views[i].Owner == "" {
+			s.Views[i].Owner = "postgres"
+		}
+	}
+	for i := range s.MaterializedViews {
+		if s.MaterializedViews[i].Owner == "" {
+			s.MaterializedViews[i].Owner = "postgres"
+		}
+	}
+	return s
 }
 
 func TestIdxDefStmtToCreateIdxConcurrently(t *testing.T) {

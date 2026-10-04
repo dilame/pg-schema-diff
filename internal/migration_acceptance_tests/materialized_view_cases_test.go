@@ -609,6 +609,128 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeDeletesData,
 		},
 	},
+	{
+		name: "create a materialized view that reads a view created in the same plan",
+		oldSchemaDDL: []string{
+			``,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo VARCHAR(255));
+            CREATE VIEW foobar_view AS SELECT id, foo FROM foobar;
+            CREATE MATERIALIZED VIEW foobar_mv AS SELECT id FROM foobar_view;
+			`,
+		},
+		// The materialized view's defining query is resolved at CREATE time, and it reads a view:
+		// the dependency kind, not just the name, decides which vertex the dependency is emitted by.
+		expectedPlanDDL: []string{
+			"CREATE TABLE \"public\".\"foobar\" (\n\t\"id\" integer,\n\t\"foo\" character varying(255) COLLATE \"pg_catalog\".\"default\"\n)",
+			"ALTER TABLE \"public\".\"foobar\" OWNER TO \"postgres\"",
+			"CREATE VIEW \"public\".\"foobar_view\" AS\n SELECT id,\n    foo\n   FROM foobar;",
+			"ALTER VIEW \"public\".\"foobar_view\" OWNER TO \"postgres\"",
+			"CREATE MATERIALIZED VIEW \"public\".\"foobar_mv\" AS\n SELECT id\n   FROM foobar_view\nWITH NO DATA",
+			"ALTER MATERIALIZED VIEW \"public\".\"foobar_mv\" OWNER TO \"postgres\"",
+		},
+	},
+	{
+		name: "no-op - materialized view definition with an unnamed union column",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY
+            );
+
+            CREATE MATERIALIZED VIEW foobar_view AS
+                SELECT x.id, x.kind
+                FROM (
+                    SELECT id, 'credit'::text AS kind FROM foobar
+                    UNION ALL
+                    SELECT id, 'incentive' FROM foobar
+                ) x;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY
+            );
+
+            CREATE MATERIALIZED VIEW foobar_view AS
+                SELECT x.id, x.kind
+                FROM (
+                    SELECT id, 'credit'::text AS kind FROM foobar
+                    UNION ALL
+                    SELECT id, 'incentive' FROM foobar
+                ) x;
+			`,
+		},
+		// A materialized view cannot be created in pg_temp, so its canonical
+		// definition is taken through a temporary view over the same query.
+		expectEmptyPlan: true,
+	},
+	{
+		name:  "re-create a materialized view whose column type changes with its grants, comment and owner, and the view that reads it with its own",
+		roles: []string{"reader", "view_owner"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar;
+            ALTER MATERIALIZED VIEW foobar_mv OWNER TO view_owner;
+            GRANT SELECT ON foobar_mv TO reader;
+            COMMENT ON MATERIALIZED VIEW foobar_mv IS 'materialized';
+            COMMENT ON COLUMN foobar_mv.id IS 'the id';
+
+            CREATE VIEW foobar_mv_reader WITH (security_barrier = true) AS
+                SELECT id
+                FROM foobar_mv;
+            ALTER VIEW foobar_mv_reader OWNER TO view_owner;
+            GRANT SELECT ON foobar_mv_reader TO reader;
+            COMMENT ON VIEW foobar_mv_reader IS 'reader';
+            COMMENT ON COLUMN foobar_mv_reader.id IS 'the reader id';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id::BIGINT AS id, foo
+                FROM foobar;
+            ALTER MATERIALIZED VIEW foobar_mv OWNER TO view_owner;
+            GRANT SELECT ON foobar_mv TO reader;
+            COMMENT ON MATERIALIZED VIEW foobar_mv IS 'materialized';
+            COMMENT ON COLUMN foobar_mv.id IS 'the id';
+
+            CREATE VIEW foobar_mv_reader WITH (security_barrier = true) AS
+                SELECT id
+                FROM foobar_mv;
+            ALTER VIEW foobar_mv_reader OWNER TO view_owner;
+            GRANT SELECT ON foobar_mv_reader TO reader;
+            COMMENT ON VIEW foobar_mv_reader IS 'reader';
+            COMMENT ON COLUMN foobar_mv_reader.id IS 'the reader id';
+		`},
+		// Both relations are dropped and created again, and each comes back with everything it
+		// carried: the database after the plan matches the target's dump.
+	},
+	{
+		name:  "grant SELECT on a materialized view",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+            CREATE MATERIALIZED VIEW foobar_mv AS SELECT id FROM foobar;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+            CREATE MATERIALIZED VIEW foobar_mv AS SELECT id FROM foobar;
+            GRANT SELECT ON foobar_mv TO reader;
+		`},
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAuthzUpdate},
+		expectedPlanDDL:     []string{"GRANT SELECT ON \"public\".\"foobar_mv\" TO \"reader\""},
+	},
 }
 
 func TestMaterializedViewTestCases(t *testing.T) {
