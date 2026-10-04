@@ -278,7 +278,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "8867f7404dd9fd8c",
+			expectedHash: "52ea19eef3046432",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -589,13 +589,21 @@ var (
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo\"", SchemaName: "schema_2"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
 						GetTriggerDefStmt: "CREATE TRIGGER some_trigger BEFORE UPDATE ON schema_2.foo FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION schema_filtered_1.increment_version()",
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
+						},
 					},
 					{
 						EscapedName:       "\"some_constraint_trigger\"",
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo\"", SchemaName: "schema_2"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
 						GetTriggerDefStmt: "CREATE CONSTRAINT TRIGGER some_constraint_trigger AFTER UPDATE ON schema_2.foo DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION schema_filtered_1.increment_version()",
-						IsConstraint:      true,
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "schema_filtered_1"},
+						},
+						IsConstraint: true,
 					},
 				},
 				Views: []View{
@@ -693,7 +701,7 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "44025bacf4731ef",
+			expectedHash: "d8c0bd68859636f8",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -994,12 +1002,20 @@ var (
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo\"", SchemaName: "public"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
 						GetTriggerDefStmt: "CREATE TRIGGER some_trigger BEFORE UPDATE ON public.foo FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION increment_version()",
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "public"},
+						},
 					},
 					{
 						EscapedName:       "\"some_partition_trigger\"",
 						OwningTable:       SchemaQualifiedName{EscapedName: "\"foo_1\"", SchemaName: "public"},
 						Function:          SchemaQualifiedName{EscapedName: "\"increment_version\"()", SchemaName: "public"},
 						GetTriggerDefStmt: "CREATE TRIGGER some_partition_trigger BEFORE UPDATE ON public.foo_1 FOR EACH ROW WHEN ((old.* IS DISTINCT FROM new.*)) EXECUTE FUNCTION increment_version()",
+						Enabled:           "O",
+						DependsOnFunctions: []SchemaQualifiedName{
+							{EscapedName: "\"increment_version\"()", SchemaName: "public"},
+						},
 					},
 				},
 			},

@@ -1370,6 +1370,27 @@ var columnAcceptanceTestCases = []acceptanceTestCase{
 		},
 		expectEmptyPlan: true,
 	},
+	{
+		name: "re-create a column default around a function whose result type changes",
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION next_label() RETURNS INT
+                LANGUAGE sql VOLATILE
+                RETURN 1;
+
+            CREATE TABLE foobar(id INT, label BIGINT DEFAULT next_label());
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION next_label() RETURNS BIGINT
+                LANGUAGE sql VOLATILE
+                RETURN 1;
+
+            CREATE TABLE foobar(id INT, label BIGINT DEFAULT next_label());
+		`},
+		// The function is dropped and created again, so the default that calls it is dropped first
+		// and set again afterwards.
+	},
 }
 
 func TestColumnTestCases(t *testing.T) {

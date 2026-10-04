@@ -182,6 +182,9 @@ type schemaDiff struct {
 	triggerDiffs              listDiff[schema.Trigger, triggerDiff]
 	viewDiff                  listDiff[schema.View, viewDiff]
 	materializedViewDiffs     listDiff[schema.MaterializedView, materializedViewDiff]
+	// functionDependentsRebinds are the policies and column defaults that call a function the
+	// plan drops, taken out of their tables' diffs (see detachFunctionDependents).
+	functionDependentsRebinds []functionDependentsRebind
 }
 
 // The procedure for DIFFING schemas and GENERATING/RESOLVING the SQL required to migrate the old schema to the new schema is
@@ -419,6 +422,12 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing functions: %w", err)
 	}
+	functionDiffs = cascadeRecreatedFunctions(functionDiffs)
+	droppedFunctions := droppedFunctionNames(functionDiffs)
+	if err := refuseUnrebindableFunctionDependents(tableDiffs, old.Indexes, droppedFunctions); err != nil {
+		return schemaDiff{}, false, err
+	}
+	tableDiffs, functionDependentsRebinds := detachFunctionDependents(tableDiffs, droppedFunctions)
 
 	procedureDiffs, err := diffLists(old.Procedures, new.Procedures, func(old, new schema.Procedure, _, _ int) (procedureDiff, bool, error) {
 		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
@@ -445,6 +454,12 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		if _, isOnNewTable := addedTablesByName[new.OwningTable.GetName()]; isOnNewTable {
 			// If the table is new, then it must be re-created (this occurs if the base table has been
 			// re-created). In other words, a trigger must be re-created if the owning table is re-created
+			return triggerDiff{}, true, nil
+		}
+		if keepsCallingDroppedFunction(old.DependsOnFunctions, new.DependsOnFunctions, droppedFunctions) {
+			// A trigger that keeps calling a function the plan drops cannot be replaced in place
+			// between the drop and the create, so it is dropped before the function and created
+			// again after the functions it calls, with its comment and enabled state.
 			return triggerDiff{}, true, nil
 		}
 		return triggerDiff{
@@ -494,6 +509,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		triggerDiffs:              triggerDiffs,
 		viewDiff:                  viewDiffs,
 		materializedViewDiffs:     materializedViewDiffs,
+		functionDependentsRebinds: functionDependentsRebinds,
 	}, false, nil
 }
 
@@ -894,6 +910,12 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	functionsPartialGraph = orderFunctionDropsBeforeFunctionCreates(functionsPartialGraph, diff.functionDiffs)
 	partialGraph = concatPartialGraphs(partialGraph, functionsPartialGraph)
+
+	functionDependentsGraph, err := functionDependentsPartialGraph(diff.functionDependentsRebinds)
+	if err != nil {
+		return nil, fmt.Errorf("resolving the objects that call a dropped function: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, functionDependentsGraph)
 
 	procedureGenerator := newProcedureSqlVertexGenerator(diff.new)
 	proceduresPartialGraph, err := generatePartialGraph(procedureGenerator, diff.proceduresDiffs)
