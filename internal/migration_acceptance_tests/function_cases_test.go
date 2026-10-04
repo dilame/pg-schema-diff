@@ -951,6 +951,123 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeHasUntrackableDependencies,
 		},
 	},
+	{
+		name:  "re-create a function whose result type changes with its grants, comment and owner, and the view that calls it with its own",
+		roles: []string{"reader", "routine_owner"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION widen(p INT) RETURNS INT
+                LANGUAGE sql IMMUTABLE
+                RETURN p;
+            ALTER FUNCTION widen(INT) OWNER TO routine_owner;
+            REVOKE EXECUTE ON FUNCTION widen(INT) FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION widen(INT) TO reader;
+            COMMENT ON FUNCTION widen(INT) IS 'widens';
+
+            CREATE VIEW foobar_widened WITH (security_barrier = true) AS
+                SELECT widen(id) AS id
+                FROM foobar;
+            ALTER VIEW foobar_widened OWNER TO routine_owner;
+            GRANT SELECT ON foobar_widened TO reader;
+            COMMENT ON VIEW foobar_widened IS 'widened';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION widen(p INT) RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                RETURN p;
+            ALTER FUNCTION widen(INT) OWNER TO routine_owner;
+            REVOKE EXECUTE ON FUNCTION widen(INT) FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION widen(INT) TO reader;
+            COMMENT ON FUNCTION widen(INT) IS 'widens';
+
+            CREATE VIEW foobar_widened WITH (security_barrier = true) AS
+                SELECT widen(id) AS id
+                FROM foobar;
+            ALTER VIEW foobar_widened OWNER TO routine_owner;
+            GRANT SELECT ON foobar_widened TO reader;
+            COMMENT ON VIEW foobar_widened IS 'widened';
+		`},
+		// A result type cannot be changed in place, so the function is dropped and created again,
+		// and the view that calls it has to be dropped before and created after it. Each comes back
+		// with everything it carried: the database after the plan matches the target's dump.
+	},
+	{
+		name:  "re-create a view that calls a function whose argument type changes",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION describe_id(p INT) RETURNS TEXT
+                LANGUAGE sql IMMUTABLE
+                RETURN p::TEXT;
+
+            CREATE VIEW foobar_described AS
+                SELECT describe_id(id) AS described
+                FROM foobar;
+            GRANT SELECT ON foobar_described TO reader;
+            COMMENT ON VIEW foobar_described IS 'described';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION describe_id(p BIGINT) RETURNS TEXT
+                LANGUAGE sql IMMUTABLE
+                RETURN p::TEXT;
+
+            CREATE VIEW foobar_described AS
+                SELECT describe_id(id) AS described
+                FROM foobar;
+            GRANT SELECT ON foobar_described TO reader;
+            COMMENT ON VIEW foobar_described IS 'described';
+		`},
+		// The old signature is dropped, and the view that calls it has to go first and come back
+		// afterwards, calling the new one, with its grant and comment.
+	},
+	{
+		name:  "re-create a SQL-standard body with its grants, comment and owner around a function whose result type changes",
+		roles: []string{"reader", "routine_owner"},
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION base_value() RETURNS INT
+                LANGUAGE sql IMMUTABLE
+                RETURN 1;
+
+            CREATE FUNCTION doubled_value() RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                BEGIN ATOMIC
+                    SELECT base_value() * 2;
+                END;
+            ALTER FUNCTION doubled_value() OWNER TO routine_owner;
+            REVOKE EXECUTE ON FUNCTION doubled_value() FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION doubled_value() TO reader;
+            COMMENT ON FUNCTION doubled_value() IS 'doubled';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION base_value() RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                RETURN 1;
+
+            CREATE FUNCTION doubled_value() RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                BEGIN ATOMIC
+                    SELECT base_value() * 2;
+                END;
+            ALTER FUNCTION doubled_value() OWNER TO routine_owner;
+            REVOKE EXECUTE ON FUNCTION doubled_value() FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION doubled_value() TO reader;
+            COMMENT ON FUNCTION doubled_value() IS 'doubled';
+		`},
+		// The SQL-standard body records the function it calls, so it is dropped before that function
+		// and created again after it, with its owner, grants and comment.
+	},
 }
 
 func TestFunctionTestCases(t *testing.T) {

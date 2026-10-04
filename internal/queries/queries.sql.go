@@ -236,7 +236,31 @@ SELECT
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type,
     COALESCE(
         pg_catalog.col_description(a.attrelid, a.attnum), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- The functions the column's default calls, as JSON objects of schema, name and identity
+    -- arguments. PostgreSQL refuses to drop such a function while the default exists.
+    ARRAY(
+        SELECT
+            JSONB_BUILD_OBJECT(
+                'schema', proc_namespace.nspname,
+                'name', proc.proname,
+                'identity_arguments',
+                pg_catalog.pg_get_function_identity_arguments(proc.oid)
+            )::TEXT
+        FROM pg_catalog.pg_depend AS depend
+        INNER JOIN
+            pg_catalog.pg_proc AS proc
+            ON
+                depend.refclassid = 'pg_proc'::REGCLASS
+                AND depend.refobjid = proc.oid
+        INNER JOIN
+            pg_catalog.pg_namespace AS proc_namespace
+            ON proc.pronamespace = proc_namespace.oid
+        WHERE
+            depend.classid = 'pg_attrdef'::REGCLASS
+            AND depend.objid = d.oid
+            AND depend.deptype = 'n'
+    )::TEXT [] AS default_depends_on_functions
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN
     pg_catalog.pg_attrdef AS d
@@ -276,6 +300,7 @@ type GetColumnsForTableRow struct {
 	IsGenerated               bool
 	ColumnType                string
 	Description               string
+	DefaultDependsOnFunctions []string
 }
 
 func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) ([]GetColumnsForTableRow, error) {
@@ -306,6 +331,7 @@ func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) 
 			&i.IsGenerated,
 			&i.ColumnType,
 			&i.Description,
+			pq.Array(&i.DefaultDependsOnFunctions),
 		); err != nil {
 			return nil, err
 		}
@@ -1264,7 +1290,31 @@ SELECT
     )::TEXT AS description,
     COALESCE(
         pg_catalog.obj_description(con.oid, 'pg_constraint'), ''
-    )::TEXT AS constraint_description
+    )::TEXT AS constraint_description,
+    -- The functions the index's expressions or predicate call, as JSON objects of schema, name and
+    -- identity arguments. PostgreSQL refuses to drop such a function while the index exists.
+    ARRAY(
+        SELECT
+            JSONB_BUILD_OBJECT(
+                'schema', proc_namespace.nspname,
+                'name', proc.proname,
+                'identity_arguments',
+                pg_catalog.pg_get_function_identity_arguments(proc.oid)
+            )::TEXT
+        FROM pg_catalog.pg_depend AS depend
+        INNER JOIN
+            pg_catalog.pg_proc AS proc
+            ON
+                depend.refclassid = 'pg_proc'::REGCLASS
+                AND depend.refobjid = proc.oid
+        INNER JOIN
+            pg_catalog.pg_namespace AS proc_namespace
+            ON proc.pronamespace = proc_namespace.oid
+        WHERE
+            depend.classid = 'pg_class'::REGCLASS
+            AND depend.objid = c.oid
+            AND depend.deptype = 'n'
+    )::TEXT [] AS depends_on_functions
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_index AS i ON (c.oid = i.indexrelid)
 INNER JOIN pg_catalog.pg_class AS table_c ON (i.indrelid = table_c.oid)
@@ -1317,6 +1367,7 @@ type GetIndexesRow struct {
 	ConstraintIsLocal     bool
 	Description           string
 	ConstraintDescription string
+	DependsOnFunctions    []string
 }
 
 func (q *Queries) GetIndexes(ctx context.Context) ([]GetIndexesRow, error) {
@@ -1347,6 +1398,7 @@ func (q *Queries) GetIndexes(ctx context.Context) ([]GetIndexesRow, error) {
 			&i.ConstraintIsLocal,
 			&i.Description,
 			&i.ConstraintDescription,
+			pq.Array(&i.DependsOnFunctions),
 		); err != nil {
 			return nil, err
 		}
@@ -1368,6 +1420,25 @@ SELECT
     owner_role.rolname::TEXT AS owner,
     c.reloptions::TEXT [] AS rel_options,
     COALESCE(ts.spcname, '')::TEXT AS tablespace_name,
+    -- The materialized view's output columns and their comments, in attribute order.
+    ARRAY(
+        SELECT a.attname::TEXT
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_names,
+    ARRAY(
+        SELECT pg_catalog.format_type(a.atttypid, a.atttypmod)
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_types,
+    ARRAY(
+        SELECT COALESCE(pg_catalog.col_description(c.oid, a.attnum), '')
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_descriptions,
     (SELECT
         ARRAY_AGG(DISTINCT JSONB_BUILD_OBJECT(
             'schema', dep_ns.nspname,
@@ -1423,10 +1494,16 @@ SELECT
     PG_GET_VIEWDEF(c.oid, true) AS view_definition,
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- The materialized view's rewrite rule: pg_depend records the functions the definition calls
+    -- against it.
+    view_rule.oid AS rule_oid
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
 INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
+INNER JOIN
+    pg_catalog.pg_rewrite AS view_rule
+    ON view_rule.ev_class = c.oid AND view_rule.rulename = '_RETURN'
 LEFT JOIN pg_catalog.pg_tablespace AS ts ON c.reltablespace = ts.oid
 WHERE
     c.relkind = 'm'
@@ -1444,14 +1521,18 @@ WHERE
 `
 
 type GetMaterializedViewsRow struct {
-	SchemaName        string
-	ViewName          string
-	Owner             string
-	RelOptions        []string
-	TablespaceName    string
-	TableDependencies []string
-	ViewDefinition    string
-	Description       string
+	SchemaName         string
+	ViewName           string
+	Owner              string
+	RelOptions         []string
+	TablespaceName     string
+	ColumnNames        []string
+	ColumnTypes        []string
+	ColumnDescriptions []string
+	TableDependencies  []string
+	ViewDefinition     string
+	Description        string
+	RuleOid            interface{}
 }
 
 func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedViewsRow, error) {
@@ -1469,9 +1550,13 @@ func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedVi
 			&i.Owner,
 			pq.Array(&i.RelOptions),
 			&i.TablespaceName,
+			pq.Array(&i.ColumnNames),
+			pq.Array(&i.ColumnTypes),
+			pq.Array(&i.ColumnDescriptions),
 			pq.Array(&i.TableDependencies),
 			&i.ViewDefinition,
 			&i.Description,
+			&i.RuleOid,
 		); err != nil {
 			return nil, err
 		}
@@ -1947,9 +2032,9 @@ WITH parsed_acl AS (
         n.nspname NOT IN ('pg_catalog', 'information_schema')
         AND n.nspname !~ '^pg_toast'
         AND n.nspname !~ '^pg_temp'
-        AND (c.relkind = 'r' OR c.relkind = 'p' OR c.relkind = 'v')
+        AND c.relkind IN ('r', 'p', 'v', 'm')
         AND c.relacl IS NOT null
-        -- Exclude tables/views owned by extensions
+        -- Exclude tables/views/materialized views owned by extensions
         AND NOT EXISTS (
             SELECT depend.objid
             FROM pg_catalog.pg_depend AS depend
@@ -2132,7 +2217,33 @@ SELECT
     trig.tgconstraint != 0 AS is_constraint,
     COALESCE(
         pg_catalog.obj_description(trig.oid, 'pg_trigger'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- O (enabled), D (disabled), R (replica only) or A (always).
+    trig.tgenabled::TEXT AS enabled,
+    -- The functions the trigger calls, its own function and those its WHEN condition calls, as
+    -- JSON objects of schema, name and identity arguments.
+    ARRAY(
+        SELECT
+            JSONB_BUILD_OBJECT(
+                'schema', dep_proc_namespace.nspname,
+                'name', dep_proc.proname,
+                'identity_arguments',
+                pg_catalog.pg_get_function_identity_arguments(dep_proc.oid)
+            )::TEXT
+        FROM pg_catalog.pg_depend AS depend
+        INNER JOIN
+            pg_catalog.pg_proc AS dep_proc
+            ON
+                depend.refclassid = 'pg_proc'::REGCLASS
+                AND depend.refobjid = dep_proc.oid
+        INNER JOIN
+            pg_catalog.pg_namespace AS dep_proc_namespace
+            ON dep_proc.pronamespace = dep_proc_namespace.oid
+        WHERE
+            depend.classid = 'pg_trigger'::REGCLASS
+            AND depend.objid = trig.oid
+            AND depend.deptype = 'n'
+    )::TEXT [] AS depends_on_functions
 FROM pg_catalog.pg_trigger AS trig
 INNER JOIN pg_catalog.pg_class AS owning_c ON trig.tgrelid = owning_c.oid
 INNER JOIN
@@ -2160,6 +2271,8 @@ type GetTriggersRow struct {
 	TriggerDef            string
 	IsConstraint          bool
 	Description           string
+	Enabled               string
+	DependsOnFunctions    []string
 }
 
 func (q *Queries) GetTriggers(ctx context.Context) ([]GetTriggersRow, error) {
@@ -2181,6 +2294,8 @@ func (q *Queries) GetTriggers(ctx context.Context) ([]GetTriggersRow, error) {
 			&i.TriggerDef,
 			&i.IsConstraint,
 			&i.Description,
+			&i.Enabled,
+			pq.Array(&i.DependsOnFunctions),
 		); err != nil {
 			return nil, err
 		}
@@ -2266,13 +2381,25 @@ SELECT
         WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
         ORDER BY a.attnum
     )::TEXT [] AS column_types,
+    -- The comments on the view's output columns, in attribute order; empty for none.
+    ARRAY(
+        SELECT COALESCE(pg_catalog.col_description(c.oid, a.attnum), '')
+        FROM pg_catalog.pg_attribute AS a
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    )::TEXT [] AS column_descriptions,
     PG_GET_VIEWDEF(c.oid, true) AS view_definition,
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- The view's rewrite rule: pg_depend records the functions the definition calls against it.
+    view_rule.oid AS rule_oid
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
 INNER JOIN pg_catalog.pg_roles AS owner_role ON c.relowner = owner_role.oid
+INNER JOIN
+    pg_catalog.pg_rewrite AS view_rule
+    ON view_rule.ev_class = c.oid AND view_rule.rulename = '_RETURN'
 WHERE
     c.relkind = 'v'
     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -2289,15 +2416,17 @@ WHERE
 `
 
 type GetViewsRow struct {
-	SchemaName        string
-	ViewName          string
-	Owner             string
-	RelOptions        []string
-	TableDependencies []string
-	ColumnNames       []string
-	ColumnTypes       []string
-	ViewDefinition    string
-	Description       string
+	SchemaName         string
+	ViewName           string
+	Owner              string
+	RelOptions         []string
+	TableDependencies  []string
+	ColumnNames        []string
+	ColumnTypes        []string
+	ColumnDescriptions []string
+	ViewDefinition     string
+	Description        string
+	RuleOid            interface{}
 }
 
 func (q *Queries) GetViews(ctx context.Context) ([]GetViewsRow, error) {
@@ -2317,8 +2446,10 @@ func (q *Queries) GetViews(ctx context.Context) ([]GetViewsRow, error) {
 			pq.Array(&i.TableDependencies),
 			pq.Array(&i.ColumnNames),
 			pq.Array(&i.ColumnTypes),
+			pq.Array(&i.ColumnDescriptions),
 			&i.ViewDefinition,
 			&i.Description,
+			&i.RuleOid,
 		); err != nil {
 			return nil, err
 		}

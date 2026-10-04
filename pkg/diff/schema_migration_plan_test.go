@@ -444,7 +444,7 @@ func TestSchemaMigrationPlanTest(t *testing.T) {
 	randReader := &deterministicRandReader{}
 	for _, testCase := range schemaMigrationPlanTestCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			schemaDiff, _, err := buildSchemaDiff(testCase.oldSchema, testCase.newSchema)
+			schemaDiff, _, err := buildSchemaDiff(testCase.oldSchema, testCase.newSchema, nil)
 			if testCase.expectedDiffErrIs != nil {
 				require.ErrorIs(t, err, testCase.expectedDiffErrIs)
 			} else if testCase.expectedDiffErrContains != "" {

@@ -212,6 +212,12 @@ An abridged list of unsupported migrations:
 - Types (Only enums and domains are currently supported)
 - Renaming. The diffing library relies on names to identify the old and new versions of a table, index, etc. If you rename
 an object, it will be treated as a drop and an add
+- A check constraint or an index that calls a function the plan drops. A function is dropped when its signature changes or
+when it has to be re-created (a changed result type, for instance), and PostgreSQL refuses the drop while anything calls it.
+Views, materialized views, SQL-standard function bodies, policies, column defaults and triggers that call it are re-created
+around it with their grants, owners, comments and other state. A check constraint and an index are deliberately not:
+re-adding the constraint validates every row of its table, and rebuilding the index takes as long as the table is large and
+leaves queries without it in between. The plan fails instead, naming the function and the object.
 
 # Contributing
 This project is in its early stages. We appreciate all the feature/bug requests we receive, but we have limited cycles

@@ -182,6 +182,9 @@ type schemaDiff struct {
 	triggerDiffs              listDiff[schema.Trigger, triggerDiff]
 	viewDiff                  listDiff[schema.View, viewDiff]
 	materializedViewDiffs     listDiff[schema.MaterializedView, materializedViewDiff]
+	// functionDependentsRebinds are the policies and column defaults that call a function the
+	// plan drops, taken out of their tables' diffs (see detachFunctionDependents).
+	functionDependentsRebinds []functionDependentsRebind
 }
 
 // The procedure for DIFFING schemas and GENERATING/RESOLVING the SQL required to migrate the old schema to the new schema is
@@ -214,7 +217,9 @@ type schemaDiff struct {
 // The sqlGenerator just generates SQL, while the sqlVertexGenerator also defines dependencies that a schema object has
 // on other schema objects
 
-func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
+// buildSchemaDiff diffs two schemas. The views named in recreatedViews are dropped and created
+// again even where they could be replaced in place (see generateMigrationStatements).
+func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (schemaDiff, bool, error) {
 	// Normalize the schemas, so we get a consistent ordering for statements.
 	old = old.Normalize()
 	new = new.Normalize()
@@ -419,6 +424,12 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing functions: %w", err)
 	}
+	functionDiffs = cascadeRecreatedFunctions(functionDiffs)
+	droppedFunctions := droppedFunctionNames(functionDiffs)
+	if err := refuseUnrebindableFunctionDependents(tableDiffs, old.Indexes, droppedFunctions); err != nil {
+		return schemaDiff{}, false, err
+	}
+	tableDiffs, functionDependentsRebinds := detachFunctionDependents(tableDiffs, droppedFunctions)
 
 	procedureDiffs, err := diffLists(old.Procedures, new.Procedures, func(old, new schema.Procedure, _, _ int) (procedureDiff, bool, error) {
 		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
@@ -447,6 +458,12 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 			// re-created). In other words, a trigger must be re-created if the owning table is re-created
 			return triggerDiff{}, true, nil
 		}
+		if keepsCallingDroppedFunction(old.DependsOnFunctions, new.DependsOnFunctions, droppedFunctions) {
+			// A trigger that keeps calling a function the plan drops cannot be replaced in place
+			// between the drop and the create, so it is dropped before the function and created
+			// again after the functions it calls, with its comment and enabled state.
+			return triggerDiff{}, true, nil
+		}
 		return triggerDiff{
 			oldAndNew[schema.Trigger]{
 				old: old,
@@ -459,6 +476,9 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	}
 
 	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View, _, _ int) (diff viewDiff, requiresRecreation bool, error error) {
+		if recreatedViews[new.GetName()] {
+			return viewDiff{}, true, nil
+		}
 		return buildViewDiff(deletedTablesByName, tableDiffsByName, old, new)
 	})
 	if err != nil {
@@ -472,7 +492,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing materialized views: %w", err)
 	}
 
-	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs)
+	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs, functionDiffs)
 
 	return schemaDiff{
 		oldAndNew: oldAndNew[schema.Schema]{
@@ -494,6 +514,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		triggerDiffs:              triggerDiffs,
 		viewDiff:                  viewDiffs,
 		materializedViewDiffs:     materializedViewDiffs,
+		functionDependentsRebinds: functionDependentsRebinds,
 	}, false, nil
 }
 
@@ -894,6 +915,12 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	functionsPartialGraph = orderFunctionDropsBeforeFunctionCreates(functionsPartialGraph, diff.functionDiffs)
 	partialGraph = concatPartialGraphs(partialGraph, functionsPartialGraph)
+
+	functionDependentsGraph, err := functionDependentsPartialGraph(diff.functionDependentsRebinds)
+	if err != nil {
+		return nil, fmt.Errorf("resolving the objects that call a dropped function: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, functionDependentsGraph)
 
 	procedureGenerator := newProcedureSqlVertexGenerator(diff.new)
 	proceduresPartialGraph, err := generatePartialGraph(procedureGenerator, diff.proceduresDiffs)
