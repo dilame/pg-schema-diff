@@ -525,6 +525,9 @@ type (
 		Identity *ColumnIdentity
 		// Description is the comment attached to the column (pg_description). Empty means no comment.
 		Description string
+		// DefaultDependsOnFunctions is the list of functions the column's default calls. PostgreSQL
+		// refuses to drop such a function while the default exists.
+		DefaultDependsOnFunctions []SchemaQualifiedName
 	}
 )
 
@@ -596,6 +599,10 @@ type (
 		// Note: when the index backs a constraint (PRIMARY KEY / UNIQUE), the comment lives on the
 		// constraint instead — see IndexConstraint.Description.
 		Description string
+
+		// DependsOnFunctions is the list of functions the index's expressions or predicate call.
+		// PostgreSQL refuses to drop such a function while the index exists.
+		DependsOnFunctions []SchemaQualifiedName
 	}
 )
 
@@ -845,6 +852,12 @@ type Trigger struct {
 	IsConstraint      bool
 	// Description is the comment attached to the trigger (pg_description). Empty means no comment.
 	Description string
+	// Enabled is pg_trigger.tgenabled: O (fires in origin and local mode), D (disabled), R (fires in
+	// replica mode only) or A (fires always). A created trigger starts as O.
+	Enabled string
+	// DependsOnFunctions is the list of functions the trigger calls: its own function and the ones
+	// its WHEN condition calls. PostgreSQL refuses to drop such a function while the trigger exists.
+	DependsOnFunctions []SchemaQualifiedName
 }
 
 func (t Trigger) GetName() string {
@@ -1720,6 +1733,10 @@ func (s *schemaFetcher) buildTable(
 	}
 	var columns []Column
 	for _, column := range rawColumns {
+		defaultDependsOnFunctions, err := parseJSONFunctionNames(column.DefaultDependsOnFunctions)
+		if err != nil {
+			return Table{}, fmt.Errorf("parsing the functions the default of column %q calls: %w", column.ColumnName, err)
+		}
 		collation := SchemaQualifiedName{}
 		if len(column.CollationName) > 0 {
 			collation = SchemaQualifiedName{
@@ -1759,6 +1776,8 @@ func (s *schemaFetcher) buildTable(
 			Size:                 int(column.ColumnSize),
 			Identity:             identity,
 			Description:          column.Description,
+
+			DefaultDependsOnFunctions: defaultDependsOnFunctions,
 		})
 	}
 
@@ -1872,7 +1891,11 @@ func (s *schemaFetcher) fetchIndexes(ctx context.Context) ([]Index, error) {
 
 	var idxs []Index
 	for _, idx := range rawIndexes {
-		idxs = append(idxs, s.buildIndex(idx))
+		builtIdx, err := s.buildIndex(idx)
+		if err != nil {
+			return nil, err
+		}
+		idxs = append(idxs, builtIdx)
 	}
 
 	idxs = filterSliceByName(
@@ -1886,7 +1909,12 @@ func (s *schemaFetcher) fetchIndexes(ctx context.Context) ([]Index, error) {
 	return idxs, nil
 }
 
-func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) Index {
+func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) (Index, error) {
+	dependsOnFunctions, err := parseJSONFunctionNames(rawIndex.DependsOnFunctions)
+	if err != nil {
+		return Index{}, fmt.Errorf("parsing the functions index %q calls: %w", rawIndex.IndexName, err)
+	}
+
 	var indexConstraint *IndexConstraint
 	if rawIndex.ConstraintName != "" {
 		indexConstraint = &IndexConstraint{
@@ -1923,7 +1951,9 @@ func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) Index {
 		ParentIdx: parentIdx,
 
 		Description: rawIndex.Description,
-	}
+
+		DependsOnFunctions: dependsOnFunctions,
+	}, nil
 }
 
 func (s *schemaFetcher) fetchForeignKeyCons(ctx context.Context) ([]ForeignKeyConstraint, error) {
@@ -2400,6 +2430,10 @@ func (s *schemaFetcher) fetchTriggers(ctx context.Context) ([]Trigger, error) {
 
 	var triggers []Trigger
 	for _, rawTrigger := range rawTriggers {
+		dependsOnFunctions, err := parseJSONFunctionNames(rawTrigger.DependsOnFunctions)
+		if err != nil {
+			return nil, fmt.Errorf("parsing the functions trigger %q calls: %w", rawTrigger.TriggerName, err)
+		}
 		triggers = append(triggers, Trigger{
 			EscapedName:       EscapeIdentifier(rawTrigger.TriggerName),
 			OwningTable:       buildNameFromUnescaped(rawTrigger.OwningTableName, rawTrigger.OwningTableSchemaName),
@@ -2407,6 +2441,9 @@ func (s *schemaFetcher) fetchTriggers(ctx context.Context) ([]Trigger, error) {
 			GetTriggerDefStmt: GetTriggerDefStatement(rawTrigger.TriggerDef),
 			IsConstraint:      rawTrigger.IsConstraint,
 			Description:       rawTrigger.Description,
+			Enabled:           rawTrigger.Enabled,
+
+			DependsOnFunctions: dependsOnFunctions,
 		})
 	}
 
@@ -2823,6 +2860,27 @@ func parseJSONPrivileges(vals []string) ([]Privilege, error) {
 
 // buildProcName is used to build the schema qualified name for a proc (function, procedure), i.e., anything
 // identified by a name AND its arguments.
+// parseJSONFunctionNames parses the JSON objects of schema, name and identity arguments a query
+// returns for the functions an object depends on, sorted and without duplicates.
+func parseJSONFunctionNames(vals []string) ([]SchemaQualifiedName, error) {
+	var out []SchemaQualifiedName
+	for _, v := range vals {
+		var f struct {
+			Schema            string `json:"schema"`
+			Name              string `json:"name"`
+			IdentityArguments string `json:"identity_arguments"`
+		}
+		if err := json.Unmarshal([]byte(v), &f); err != nil {
+			return nil, fmt.Errorf("json.Unmarshal(%q, function name): %w", v, err)
+		}
+		out = append(out, buildProcName(f.Name, f.IdentityArguments, f.Schema))
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return sortSchemaObjectsByName(dedupeSchemaQualifiedNames(out)), nil
+}
+
 func buildProcName(name, identityArguments, schemaName string) SchemaQualifiedName {
 	return SchemaQualifiedName{
 		SchemaName:  schemaName,

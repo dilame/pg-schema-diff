@@ -236,7 +236,31 @@ SELECT
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type,
     COALESCE(
         pg_catalog.col_description(a.attrelid, a.attnum), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- The functions the column's default calls, as JSON objects of schema, name and identity
+    -- arguments. PostgreSQL refuses to drop such a function while the default exists.
+    ARRAY(
+        SELECT
+            JSONB_BUILD_OBJECT(
+                'schema', proc_namespace.nspname,
+                'name', proc.proname,
+                'identity_arguments',
+                pg_catalog.pg_get_function_identity_arguments(proc.oid)
+            )::TEXT
+        FROM pg_catalog.pg_depend AS depend
+        INNER JOIN
+            pg_catalog.pg_proc AS proc
+            ON
+                depend.refclassid = 'pg_proc'::REGCLASS
+                AND depend.refobjid = proc.oid
+        INNER JOIN
+            pg_catalog.pg_namespace AS proc_namespace
+            ON proc.pronamespace = proc_namespace.oid
+        WHERE
+            depend.classid = 'pg_attrdef'::REGCLASS
+            AND depend.objid = d.oid
+            AND depend.deptype = 'n'
+    )::TEXT [] AS default_depends_on_functions
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN
     pg_catalog.pg_attrdef AS d
@@ -276,6 +300,7 @@ type GetColumnsForTableRow struct {
 	IsGenerated               bool
 	ColumnType                string
 	Description               string
+	DefaultDependsOnFunctions []string
 }
 
 func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) ([]GetColumnsForTableRow, error) {
@@ -306,6 +331,7 @@ func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) 
 			&i.IsGenerated,
 			&i.ColumnType,
 			&i.Description,
+			pq.Array(&i.DefaultDependsOnFunctions),
 		); err != nil {
 			return nil, err
 		}
@@ -1264,7 +1290,31 @@ SELECT
     )::TEXT AS description,
     COALESCE(
         pg_catalog.obj_description(con.oid, 'pg_constraint'), ''
-    )::TEXT AS constraint_description
+    )::TEXT AS constraint_description,
+    -- The functions the index's expressions or predicate call, as JSON objects of schema, name and
+    -- identity arguments. PostgreSQL refuses to drop such a function while the index exists.
+    ARRAY(
+        SELECT
+            JSONB_BUILD_OBJECT(
+                'schema', proc_namespace.nspname,
+                'name', proc.proname,
+                'identity_arguments',
+                pg_catalog.pg_get_function_identity_arguments(proc.oid)
+            )::TEXT
+        FROM pg_catalog.pg_depend AS depend
+        INNER JOIN
+            pg_catalog.pg_proc AS proc
+            ON
+                depend.refclassid = 'pg_proc'::REGCLASS
+                AND depend.refobjid = proc.oid
+        INNER JOIN
+            pg_catalog.pg_namespace AS proc_namespace
+            ON proc.pronamespace = proc_namespace.oid
+        WHERE
+            depend.classid = 'pg_class'::REGCLASS
+            AND depend.objid = c.oid
+            AND depend.deptype = 'n'
+    )::TEXT [] AS depends_on_functions
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_index AS i ON (c.oid = i.indexrelid)
 INNER JOIN pg_catalog.pg_class AS table_c ON (i.indrelid = table_c.oid)
@@ -1317,6 +1367,7 @@ type GetIndexesRow struct {
 	ConstraintIsLocal     bool
 	Description           string
 	ConstraintDescription string
+	DependsOnFunctions    []string
 }
 
 func (q *Queries) GetIndexes(ctx context.Context) ([]GetIndexesRow, error) {
@@ -1347,6 +1398,7 @@ func (q *Queries) GetIndexes(ctx context.Context) ([]GetIndexesRow, error) {
 			&i.ConstraintIsLocal,
 			&i.Description,
 			&i.ConstraintDescription,
+			pq.Array(&i.DependsOnFunctions),
 		); err != nil {
 			return nil, err
 		}
@@ -2165,7 +2217,33 @@ SELECT
     trig.tgconstraint != 0 AS is_constraint,
     COALESCE(
         pg_catalog.obj_description(trig.oid, 'pg_trigger'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    -- O (enabled), D (disabled), R (replica only) or A (always).
+    trig.tgenabled::TEXT AS enabled,
+    -- The functions the trigger calls, its own function and those its WHEN condition calls, as
+    -- JSON objects of schema, name and identity arguments.
+    ARRAY(
+        SELECT
+            JSONB_BUILD_OBJECT(
+                'schema', dep_proc_namespace.nspname,
+                'name', dep_proc.proname,
+                'identity_arguments',
+                pg_catalog.pg_get_function_identity_arguments(dep_proc.oid)
+            )::TEXT
+        FROM pg_catalog.pg_depend AS depend
+        INNER JOIN
+            pg_catalog.pg_proc AS dep_proc
+            ON
+                depend.refclassid = 'pg_proc'::REGCLASS
+                AND depend.refobjid = dep_proc.oid
+        INNER JOIN
+            pg_catalog.pg_namespace AS dep_proc_namespace
+            ON dep_proc.pronamespace = dep_proc_namespace.oid
+        WHERE
+            depend.classid = 'pg_trigger'::REGCLASS
+            AND depend.objid = trig.oid
+            AND depend.deptype = 'n'
+    )::TEXT [] AS depends_on_functions
 FROM pg_catalog.pg_trigger AS trig
 INNER JOIN pg_catalog.pg_class AS owning_c ON trig.tgrelid = owning_c.oid
 INNER JOIN
@@ -2193,6 +2271,8 @@ type GetTriggersRow struct {
 	TriggerDef            string
 	IsConstraint          bool
 	Description           string
+	Enabled               string
+	DependsOnFunctions    []string
 }
 
 func (q *Queries) GetTriggers(ctx context.Context) ([]GetTriggersRow, error) {
@@ -2214,6 +2294,8 @@ func (q *Queries) GetTriggers(ctx context.Context) ([]GetTriggersRow, error) {
 			&i.TriggerDef,
 			&i.IsConstraint,
 			&i.Description,
+			&i.Enabled,
+			pq.Array(&i.DependsOnFunctions),
 		); err != nil {
 			return nil, err
 		}

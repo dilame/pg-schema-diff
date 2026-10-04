@@ -810,6 +810,48 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 		// policy calls the function. Keeping the policy inside the table's vertex would make it
 		// table → function and function → table, a cycle that fails plan generation.
 	},
+	{
+		name:  "re-create a policy with its roles, expressions and comment around a function whose argument type changes",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, owner_id INT);
+            ALTER TABLE foobar ENABLE ROW LEVEL SECURITY;
+
+            CREATE FUNCTION is_owner(p INT) RETURNS BOOLEAN
+                LANGUAGE sql STABLE
+                RETURN p > 0;
+
+            CREATE POLICY foobar_owner ON foobar
+                AS RESTRICTIVE
+                FOR UPDATE
+                TO reader
+                USING (is_owner(owner_id))
+                WITH CHECK (is_owner(id));
+            COMMENT ON POLICY foobar_owner ON foobar IS 'owner';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT, owner_id INT);
+            ALTER TABLE foobar ENABLE ROW LEVEL SECURITY;
+
+            CREATE FUNCTION is_owner(p BIGINT) RETURNS BOOLEAN
+                LANGUAGE sql STABLE
+                RETURN p > 0;
+
+            CREATE POLICY foobar_owner ON foobar
+                AS RESTRICTIVE
+                FOR UPDATE
+                TO reader
+                USING (is_owner(owner_id))
+                WITH CHECK (is_owner(id));
+            COMMENT ON POLICY foobar_owner ON foobar IS 'owner';
+		`},
+		// The old signature is dropped, so the policy that calls it is dropped first and created
+		// again after the new signature exists, with its command, roles, expressions and comment.
+		// Between the two the restrictive policy is absent, which the hazards say.
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAuthzUpdate},
+	},
 }
 
 func TestPolicyCases(t *testing.T) {

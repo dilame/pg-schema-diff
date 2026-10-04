@@ -1030,6 +1030,44 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 		// The old signature is dropped, and the view that calls it has to go first and come back
 		// afterwards, calling the new one, with its grant and comment.
 	},
+	{
+		name:  "re-create a SQL-standard body with its grants, comment and owner around a function whose result type changes",
+		roles: []string{"reader", "routine_owner"},
+		oldSchemaDDL: []string{
+			`
+            CREATE FUNCTION base_value() RETURNS INT
+                LANGUAGE sql IMMUTABLE
+                RETURN 1;
+
+            CREATE FUNCTION doubled_value() RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                BEGIN ATOMIC
+                    SELECT base_value() * 2;
+                END;
+            ALTER FUNCTION doubled_value() OWNER TO routine_owner;
+            REVOKE EXECUTE ON FUNCTION doubled_value() FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION doubled_value() TO reader;
+            COMMENT ON FUNCTION doubled_value() IS 'doubled';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE FUNCTION base_value() RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                RETURN 1;
+
+            CREATE FUNCTION doubled_value() RETURNS BIGINT
+                LANGUAGE sql IMMUTABLE
+                BEGIN ATOMIC
+                    SELECT base_value() * 2;
+                END;
+            ALTER FUNCTION doubled_value() OWNER TO routine_owner;
+            REVOKE EXECUTE ON FUNCTION doubled_value() FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION doubled_value() TO reader;
+            COMMENT ON FUNCTION doubled_value() IS 'doubled';
+		`},
+		// The SQL-standard body records the function it calls, so it is dropped before that function
+		// and created again after it, with its owner, grants and comment.
+	},
 }
 
 func TestFunctionTestCases(t *testing.T) {

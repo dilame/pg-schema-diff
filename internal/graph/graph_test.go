@@ -311,10 +311,13 @@ func TestTopologicallySort(t *testing.T) {
 		v3, v5, v7, v8, v11, v2, v9, v10,
 	}, orderedNodes)
 
-	// Cycle should error
+	// Cycle should error, naming the vertices on it: 07 -> 11 -> 10 -> 07 and 07 -> 08, which
+	// does not lead back, nor do the vertices after the cycle.
 	assert.NoError(t, g.AddEdge("10", "07"))
 	_, err = g.TopologicallySort()
-	assert.Error(t, err)
+	var cycleErr *CycleError
+	require.ErrorAs(t, err, &cycleErr)
+	assert.Equal(t, []string{"07", "10", "11"}, cycleErr.OnCycle)
 }
 
 func TestTopologicallySortWithPriority(t *testing.T) {

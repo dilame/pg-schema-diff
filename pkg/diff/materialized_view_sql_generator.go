@@ -57,9 +57,15 @@ func buildMaterializedViewDiff(
 			)
 		}
 		deletedColumnsByName := buildSchemaObjByNameMap(td.columnsDiff.deletes)
+		retypedColumnsByName := retypedColumnNames(td)
 		for _, c := range t.Columns {
 			if _, ok := deletedColumnsByName[c]; ok {
 				// Recreate if a dependent column was deleted (or recreated).
+				return materializedViewDiff{}, true, nil
+			}
+			if retypedColumnsByName[c] {
+				// PostgreSQL refuses to change the type or collation of a column a materialized view
+				// reads.
 				return materializedViewDiff{}, true, nil
 			}
 		}

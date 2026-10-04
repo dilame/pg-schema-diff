@@ -941,6 +941,72 @@ var triggerAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 	},
+	{
+		name: "re-create a trigger with its comment and enabled state around a function its WHEN condition calls",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION is_tracked(p INT) RETURNS BOOLEAN
+                LANGUAGE sql IMMUTABLE
+                RETURN p > 0;
+
+            CREATE FUNCTION track() RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$ BEGIN RETURN NEW; END $$;
+
+            CREATE TRIGGER foobar_track
+                BEFORE INSERT ON foobar
+                FOR EACH ROW
+                WHEN (is_tracked(NEW.id))
+                EXECUTE FUNCTION track();
+            ALTER TABLE foobar DISABLE TRIGGER foobar_track;
+            COMMENT ON TRIGGER foobar_track ON foobar IS 'tracks';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+
+            CREATE FUNCTION is_tracked(p BIGINT) RETURNS BOOLEAN
+                LANGUAGE sql IMMUTABLE
+                RETURN p > 0;
+
+            CREATE FUNCTION track() RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$ BEGIN RETURN NEW; END $$;
+
+            CREATE TRIGGER foobar_track
+                BEFORE INSERT ON foobar
+                FOR EACH ROW
+                WHEN (is_tracked(NEW.id))
+                EXECUTE FUNCTION track();
+            ALTER TABLE foobar DISABLE TRIGGER foobar_track;
+            COMMENT ON TRIGGER foobar_track ON foobar IS 'tracks';
+		`},
+		// The old signature is dropped, so the trigger whose WHEN condition calls it is dropped first
+		// and created again afterwards, disabled and with its comment, as declared.
+	},
+	{
+		name: "disable a trigger",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+            CREATE FUNCTION track() RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$ BEGIN RETURN NEW; END $$;
+            CREATE TRIGGER foobar_track BEFORE INSERT ON foobar FOR EACH ROW EXECUTE FUNCTION track();
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT);
+            CREATE FUNCTION track() RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$ BEGIN RETURN NEW; END $$;
+            CREATE TRIGGER foobar_track BEFORE INSERT ON foobar FOR EACH ROW EXECUTE FUNCTION track();
+            ALTER TABLE foobar DISABLE TRIGGER foobar_track;
+		`},
+		expectedPlanDDL: []string{"ALTER TABLE \"public\".\"foobar\" DISABLE TRIGGER \"foobar_track\""},
+	},
 }
 
 func TestTriggerTestCases(t *testing.T) {
