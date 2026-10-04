@@ -217,7 +217,9 @@ type schemaDiff struct {
 // The sqlGenerator just generates SQL, while the sqlVertexGenerator also defines dependencies that a schema object has
 // on other schema objects
 
-func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
+// buildSchemaDiff diffs two schemas. The views named in recreatedViews are dropped and created
+// again even where they could be replaced in place (see generateMigrationStatements).
+func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (schemaDiff, bool, error) {
 	// Normalize the schemas, so we get a consistent ordering for statements.
 	old = old.Normalize()
 	new = new.Normalize()
@@ -474,6 +476,9 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	}
 
 	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View, _, _ int) (diff viewDiff, requiresRecreation bool, error error) {
+		if recreatedViews[new.GetName()] {
+			return viewDiff{}, true, nil
+		}
 		return buildViewDiff(deletedTablesByName, tableDiffsByName, old, new)
 	})
 	if err != nil {

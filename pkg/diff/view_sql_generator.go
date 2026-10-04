@@ -58,9 +58,14 @@ func buildViewDiff(
 			return viewDiff{}, false, fmt.Errorf("processing view table dependencies: expected a table diff to exist for %q. have=\n%s", t.GetName(), slices.Sorted(maps.Keys(tableDiffsByName)))
 		}
 		deletedColumnsByName := buildSchemaObjByNameMap(td.columnsDiff.deletes)
+		retypedColumnsByName := retypedColumnNames(td)
 		for _, c := range t.Columns {
 			if _, ok := deletedColumnsByName[c]; ok {
 				// Recreate if a dependent column was deleted (or recreated).
+				return viewDiff{}, true, nil
+			}
+			if retypedColumnsByName[c] {
+				// PostgreSQL refuses to change the type or collation of a column a view reads.
 				return viewDiff{}, true, nil
 			}
 		}
@@ -126,6 +131,19 @@ func stableTableDependencies(dependencies []schema.TableDependency, tableDiffsBy
 		}
 	}
 	return stable
+}
+
+// retypedColumnNames returns the names of a table's columns whose type or collation the plan
+// changes.
+func retypedColumnNames(td tableDiff) map[string]bool {
+	retyped := make(map[string]bool)
+	for _, cd := range td.columnsDiff.alters {
+		if !strings.EqualFold(cd.old.Type, cd.new.Type) ||
+			!strings.EqualFold(cd.old.Collation.GetFQEscapedName(), cd.new.Collation.GetFQEscapedName()) {
+			retyped[cd.old.GetName()] = true
+		}
+	}
+	return retyped
 }
 
 type viewSQLGenerator struct {

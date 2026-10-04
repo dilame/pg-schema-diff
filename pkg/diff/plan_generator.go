@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/kr/pretty"
+	"github.com/stripe/pg-schema-diff/internal/graph"
 	"github.com/stripe/pg-schema-diff/internal/schema"
 	externalschema "github.com/stripe/pg-schema-diff/pkg/schema"
 
@@ -191,8 +193,56 @@ func Generate(
 	return plan, nil
 }
 
+// generateMigrationStatements orders the plan's statements. A view whose output columns stay the
+// same is replaced in place, which keeps it readable throughout, but the replacement has to run
+// after the relations its new definition reads and before the ones only its old definition reads
+// are dropped, and the rest of the plan can make that order impossible (an old relation that is
+// dropped before a new one can be altered). When the order has a cycle, every view replaced in
+// place that lies on it is re-created instead, which the plan can always order, and the statements
+// are ordered again. A re-created view comes back with all of its state, so the plan is correct
+// either way.
 func generateMigrationStatements(oldSchema, newSchema schema.Schema, planOptions *planOptions) ([]Statement, error) {
-	diff, _, err := buildSchemaDiff(oldSchema, newSchema)
+	recreatedViews := make(map[string]bool)
+	for {
+		statements, err := generateMigrationStatementsRecreatingViews(oldSchema, newSchema, planOptions, recreatedViews)
+		var cycleErr *graph.CycleError
+		if err == nil || !errors.As(err, &cycleErr) {
+			return statements, err
+		}
+		if !recreateViewsOnCycle(oldSchema, newSchema, cycleErr.OnCycle, recreatedViews) {
+			return nil, err
+		}
+	}
+}
+
+// recreateViewsOnCycle adds to recreatedViews every view the plan replaces in place whose
+// replacement lies on a cycle, and reports whether it added any.
+func recreateViewsOnCycle(oldSchema, newSchema schema.Schema, onCycle []string, recreatedViews map[string]bool) bool {
+	onCycleIds := make(map[string]bool)
+	for _, id := range onCycle {
+		onCycleIds[id] = true
+	}
+	oldViewsByName := buildSchemaObjByNameMap(oldSchema.Views)
+	added := false
+	for _, newView := range newSchema.Views {
+		oldView, ok := oldViewsByName[newView.GetName()]
+		if !ok || recreatedViews[newView.GetName()] || !viewDefinitionChanged(oldView, newView) {
+			continue
+		}
+		if onCycleIds[buildTableVertexId(newView.SchemaQualifiedName, diffTypeAddAlter).String()] {
+			recreatedViews[newView.GetName()] = true
+			added = true
+		}
+	}
+	return added
+}
+
+func generateMigrationStatementsRecreatingViews(
+	oldSchema, newSchema schema.Schema,
+	planOptions *planOptions,
+	recreatedViews map[string]bool,
+) ([]Statement, error) {
+	diff, _, err := buildSchemaDiff(oldSchema, newSchema, recreatedViews)
 	if err != nil {
 		return nil, err
 	}

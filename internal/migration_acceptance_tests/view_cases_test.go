@@ -849,6 +849,102 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
 			"COMMENT ON COLUMN \"public\".\"foobar_view\".\"foo\" IS 'new'",
 		},
 	},
+	{
+		name:  "re-create a view that moves off a dropped view onto a table that gains the column it reads",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT);
+            CREATE VIEW w AS SELECT id FROM t;
+            CREATE VIEW v AS SELECT id FROM w;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT, foo INT);
+            CREATE VIEW v AS SELECT id, foo FROM t;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+		`},
+		// Replacing v in place would have to run after t gains foo and before w is dropped, while w
+		// has to be dropped before t is altered. The plan re-creates v instead, with its grant and
+		// comment.
+	},
+	{
+		name:  "re-create a view that moves off a re-created view onto a table that gains the column it reads",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT);
+            CREATE VIEW w AS SELECT id FROM t;
+            CREATE VIEW v AS SELECT id FROM w;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT, foo INT);
+            CREATE VIEW w AS SELECT id::BIGINT AS id FROM t;
+            CREATE VIEW v AS SELECT id, foo FROM t;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+		`},
+	},
+	{
+		name:  "re-create a view that moves off a dropped view onto a new view over a table that gains a column",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT);
+            CREATE VIEW w AS SELECT id FROM t;
+            CREATE VIEW v AS SELECT id FROM w;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT, foo INT);
+            CREATE VIEW n AS SELECT id, foo FROM t;
+            CREATE VIEW v AS SELECT id FROM n;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+		`},
+	},
+	{
+		name:  "re-create the views over a table column whose type changes, with their state",
+		roles: []string{"reader"},
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE t(id INT, foo INT);
+            CREATE VIEW v WITH (security_barrier = true) AS SELECT id FROM t;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+            COMMENT ON COLUMN v.id IS 'the id';
+            CREATE VIEW vv AS SELECT id FROM v;
+            GRANT SELECT ON vv TO reader;
+            CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;
+            GRANT SELECT ON mv TO reader;
+            COMMENT ON MATERIALIZED VIEW mv IS 'mv';
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE t(id BIGINT, foo INT);
+            CREATE VIEW v WITH (security_barrier = true) AS SELECT id FROM t;
+            GRANT SELECT ON v TO reader;
+            COMMENT ON VIEW v IS 'v';
+            COMMENT ON COLUMN v.id IS 'the id';
+            CREATE VIEW vv AS SELECT id FROM v;
+            GRANT SELECT ON vv TO reader;
+            CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;
+            GRANT SELECT ON mv TO reader;
+            COMMENT ON MATERIALIZED VIEW mv IS 'mv';
+		`},
+		// PostgreSQL refuses to change the type of a column a view reads, so the views and the
+		// materialized view over it, and the view over those, are dropped before the ALTER and
+		// created again after it with their grants, comments and options.
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAcquiresAccessExclusiveLock, diff.MigrationHazardTypeImpactsDatabasePerformance},
+	},
 }
 
 func TestViewTestCases(t *testing.T) {
