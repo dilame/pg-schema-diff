@@ -7,6 +7,32 @@
 Computes the diff(erences) between Postgres database schemas and generates the SQL required to get your database schema from point A to B with 
 minimal downtime & locks. This enables you to take your database and migrate it to any desired schema defined in plain DDL.
 
+## About this fork
+
+This fork (`dilame/pg-schema-diff`) is developed independently of upstream
+([stripe/pg-schema-diff](https://github.com/stripe/pg-schema-diff)): upstream
+has not been accepting external pull requests, so changes land on this fork's
+`main` branch directly. `main` tracks upstream and carries the following
+feature areas on top of it:
+
+- User-defined composite types (including nested and array dependencies) and
+  user-defined domains, with drop-and-recreate of dependent routines
+- `COMMENT ON` support for tables, views, materialized views, columns,
+  routines, types, and domains
+- Privilege diffs (`GRANT`/`REVOKE`) for tables, views, materialized views,
+  columns, schemas, routines, and default privileges; object ownership drift
+  detection (`OWNER TO`)
+- In-place replacement of views (`CREATE OR REPLACE VIEW`) when output columns
+  stay compatible, including re-creation of dependent views and ordering
+  around the relations and functions the definition reads
+- Drop-and-recreate of functions whose signature or `BEGIN ATOMIC` body is
+  affected by a change (changed result type, altered referenced columns,
+  recreated composite types or domains), with dependent object re-creation
+- SQL-standard function bodies (`BEGIN ATOMIC`), canonical function and view
+  definition comparison, plan validation with `check_function_bodies` disabled
+- Schema-qualified object support, table persistence drift, ordering fixes
+  (policies in their own vertex, routines after signature relations)
+
 The tooling attempts to use native postgres migration operations to perform online migrations and avoid locking wherever possible. Not all migrations will
 be lock-free and some might require downtime, but the hazards system will warn you ahead of time when that's the case.
 Stateful online migration techniques, like shadow tables, aren't yet supported.
