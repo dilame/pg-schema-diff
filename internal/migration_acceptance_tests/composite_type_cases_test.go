@@ -249,7 +249,7 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			CREATE TABLE users (id int, attrs pair);
 		`},
 		newSchemaDDL: []string{`
-			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE TYPE pair AS (c boolean, a int, b text);
 			CREATE TABLE users (id int, attrs pair);
 		`},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
@@ -279,10 +279,24 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			CREATE TABLE users (id int, attrs pair[]);
 		`},
 		newSchemaDDL: []string{`
-			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE TYPE pair AS (c boolean, a int, b text);
 			CREATE TABLE users (id int, attrs pair[]);
 		`},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
+	},
+	{
+		name: "alter composite type attrs in place - append attribute to a type used by a table array column",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int);
+			CREATE TABLE users (id int, attrs pair[]);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b integer);
+			CREATE TABLE users (id int, attrs pair[]);
+		`},
+		expectedPlanDDL: []string{
+			`ALTER TYPE "public"."pair" ADD ATTRIBUTE "b" integer`,
+		},
 	},
 	// ─── Re-creating a type whose layout ALTER cannot produce ───
 	{
@@ -350,6 +364,47 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		newSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text, c boolean);
 			CREATE VIEW pair_c AS SELECT (ROW(1, 'x', true)::pair).c AS c;
+		`},
+	},
+	{
+		name: "alter composite type attrs in place - append attribute to a type used by a table column",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int);
+			CREATE TABLE users (id int, attrs pair);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b integer);
+			CREATE TABLE users (id int, attrs pair);
+		`},
+		// Appending keeps the type's OID, so the table column that uses it is untouched.
+		expectedPlanDDL: []string{
+			`ALTER TYPE "public"."pair" ADD ATTRIBUTE "b" integer`,
+		},
+	},
+	{
+		name: "recreate a materialized view over a re-created composite type",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE MATERIALIZED VIEW pair_a AS SELECT (ROW(1, 'x')::pair).a AS a;
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (c boolean, a int, b text);
+			CREATE MATERIALIZED VIEW pair_a AS SELECT (ROW(true, 1, 'x')::pair).a AS a;
+		`},
+	},
+	{
+		name: "recreate a view that depends on an outer re-created type without naming the inner one",
+		oldSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE FUNCTION make_outer() RETURNS outer_t LANGUAGE sql AS 'SELECT ROW(ROW(1)::inner_t, ''x'')::outer_t';
+			CREATE VIEW v AS SELECT (ROW(1)::inner_t).n AS n;
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (extra text, n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE FUNCTION make_outer() RETURNS outer_t LANGUAGE sql AS 'SELECT ROW(ROW(''y'', 1)::inner_t, ''x'')::outer_t';
+			CREATE VIEW v AS SELECT make_outer() AS o;
 		`},
 	},
 }

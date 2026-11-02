@@ -915,9 +915,14 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, domainsPartialGraph)
 
-	// Whether a type is recreated or altered in place was decided when the diffs were built (see
-	// identifyCompositeTypesToRecreate), so the generator only emits the vertices for them.
-	compositeTypeGenerator := newCompositeTypeSQLVertexGenerator(diff.old, diff.new)
+	// The generator needs the same recreate-vs-alter decision the diffs were built with: a consumer
+	// that depends on a re-created type is re-created as well, and its create must not be ordered
+	// before that type's drop.
+	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(diff.old.CompositeTypes, diff.new.CompositeTypes, domainsBeingRecreated)
+	if err != nil {
+		return nil, fmt.Errorf("identifying composite types to recreate: %w", err)
+	}
+	compositeTypeGenerator := newCompositeTypeSQLVertexGenerator(diff.old, diff.new, compositeTypesBeingRecreated)
 	compositeTypesPartialGraph, err := generatePartialGraph(compositeTypeGenerator, diff.compositeTypeDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving composite type diff: %w", err)
@@ -1072,15 +1077,17 @@ func identifyCompositeTypesToRecreate(old, new []schema.CompositeType, recreated
 			continue
 		}
 		if !cmp.Equal(oldType.Attributes, newType.Attributes) {
-			if oldType.IsUsedByTable {
-				return nil, fmt.Errorf("changing attributes of composite type %s used by a table column: %w", newType.GetFQEscapedName(), ErrNotImplemented)
-			}
 			// Appending attributes with ALTER TYPE keeps the type's OID, so nothing that references
-			// it has to be dropped. Only a layout ALTER cannot produce — a dropped, retyped,
+			// it has to be dropped — not even a table column: PostgreSQL accepts ADD ATTRIBUTE on
+			// a type a column uses. Only a layout ALTER cannot produce — a dropped, retyped,
 			// renamed or inserted attribute — needs the drop-and-recreate cascade (see
-			// appendedCompositeTypeAttributes for why the other operations are left out).
+			// appendedCompositeTypeAttributes for why the other operations are left out), and a
+			// type a table column uses cannot be dropped at all.
 			if _, appendOnly := appendedCompositeTypeAttributes(oldType.Attributes, newType.Attributes); appendOnly {
 				continue
+			}
+			if oldType.IsUsedByTable {
+				return nil, fmt.Errorf("changing attributes of composite type %s used by a table column: %w", newType.GetFQEscapedName(), ErrNotImplemented)
 			}
 			recreated[newType.GetName()] = true
 		}

@@ -1158,6 +1158,10 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
+    -- The view's own relation: pg_depend also records a composite type as the
+    -- type of an output column against it, which the rewrite rule does not
+    -- name.
+    c.oid AS view_oid,
     -- The view's rewrite rule: pg_depend records the functions the definition
     -- calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
@@ -1265,6 +1269,10 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
+    -- The materialized view's own relation: pg_depend also records a composite
+    -- type as the type of an output column against it, which the rewrite rule
+    -- does not name.
+    c.oid AS view_oid,
     -- The materialized view's rewrite rule: pg_depend records the functions the
     -- definition calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition

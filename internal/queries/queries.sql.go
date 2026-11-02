@@ -1550,6 +1550,10 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
+    -- The materialized view's own relation: pg_depend also records a composite
+    -- type as the type of an output column against it, which the rewrite rule
+    -- does not name.
+    c.oid AS view_oid,
     -- The materialized view's rewrite rule: pg_depend records the functions the
     -- definition calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
@@ -1587,6 +1591,7 @@ type GetMaterializedViewsRow struct {
 	TableDependencies  []string
 	Description        string
 	RuleOid            interface{}
+	ViewOid            interface{}
 	ViewDefinition     string
 }
 
@@ -1611,6 +1616,7 @@ func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedVi
 			pq.Array(&i.TableDependencies),
 			&i.Description,
 			&i.RuleOid,
+			&i.ViewOid,
 			&i.ViewDefinition,
 		); err != nil {
 			return nil, err
@@ -2536,6 +2542,10 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
+    -- The view's own relation: pg_depend also records a composite type as the
+    -- type of an output column against it, which the rewrite rule does not
+    -- name.
+    c.oid AS view_oid,
     -- The view's rewrite rule: pg_depend records the functions the definition
     -- calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
@@ -2571,6 +2581,7 @@ type GetViewsRow struct {
 	ColumnDescriptions []string
 	Description        string
 	RuleOid            interface{}
+	ViewOid            interface{}
 	ViewDefinition     string
 }
 
@@ -2594,6 +2605,7 @@ func (q *Queries) GetViews(ctx context.Context) ([]GetViewsRow, error) {
 			pq.Array(&i.ColumnDescriptions),
 			&i.Description,
 			&i.RuleOid,
+			&i.ViewOid,
 			&i.ViewDefinition,
 		); err != nil {
 			return nil, err

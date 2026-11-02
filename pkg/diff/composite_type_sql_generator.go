@@ -30,12 +30,18 @@ type compositeTypeSQLVertexGenerator struct {
 	// any of them.
 	newSchema schema.Schema
 	oldSchema schema.Schema
+	// recreatedCompositeTypes are the types being dropped and created again. A consumer that
+	// depends on any of them is re-created too, even when it stops naming the type whose drop is
+	// being ordered here: its create already runs after that type's create, so ordering it before
+	// the drop would close a cycle through another re-created type.
+	recreatedCompositeTypes map[string]bool
 }
 
-func newCompositeTypeSQLVertexGenerator(oldSchema, newSchema schema.Schema) sqlVertexGenerator[schema.CompositeType, compositeTypeDiff] {
+func newCompositeTypeSQLVertexGenerator(oldSchema, newSchema schema.Schema, recreatedCompositeTypes map[string]bool) sqlVertexGenerator[schema.CompositeType, compositeTypeDiff] {
 	return &compositeTypeSQLVertexGenerator{
-		newSchema: newSchema,
-		oldSchema: oldSchema,
+		newSchema:               newSchema,
+		oldSchema:               oldSchema,
+		recreatedCompositeTypes: recreatedCompositeTypes,
 	}
 }
 
@@ -299,6 +305,16 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 	newMaterializedViewsByName := buildSchemaObjByNameMap(c.newSchema.MaterializedViews)
 	newCompositeTypesByName := buildSchemaObjByNameMap(c.newSchema.CompositeTypes)
 
+	// addAlterEdgeWouldCycle reports whether the consumer's add/alter vertex must not be ordered
+	// after this type's drop. If the consumer depends on some re-created type — this one, or
+	// another one it reaches through an outer type — it is re-created as well, and its create
+	// already runs after that type's create; ordering the create before this type's drop and the
+	// drop before the create is a cycle.
+	addAlterEdgeWouldCycle := func(newDeps []schema.SchemaQualifiedName) bool {
+		return dependsOnCompositeType(newDeps, ctName) ||
+			dependsOnAnyRecreatedType(newDeps, c.recreatedCompositeTypes)
+	}
+
 	var deps []dependency
 	for _, t := range c.oldSchema.Tables {
 		if !dependsOnCompositeType(t.DependsOnCompositeTypes, ctName) {
@@ -311,7 +327,7 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 		}
 		// A table column typed with a re-created type is refused up-front, so a table that still
 		// depends on the type here keeps it only when the type is not being dropped at all.
-		if !dependsOnCompositeType(newTablesByName[t.GetName()].DependsOnCompositeTypes, ctName) {
+		if !addAlterEdgeWouldCycle(newTablesByName[t.GetName()].DependsOnCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
@@ -320,7 +336,7 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 			continue
 		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeDelete)))
-		if !dependsOnCompositeType(newFunctionsByName[f.GetName()].DependsOnCompositeTypes, ctName) {
+		if !addAlterEdgeWouldCycle(newFunctionsByName[f.GetName()].DependsOnCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
@@ -329,7 +345,7 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 			continue
 		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeDelete)))
-		if !dependsOnCompositeType(newProceduresByName[p.GetName()].DependsOnCompositeTypes, ctName) {
+		if !addAlterEdgeWouldCycle(newProceduresByName[p.GetName()].DependsOnCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
@@ -338,7 +354,7 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 			continue
 		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildViewVertexId(v.SchemaQualifiedName, diffTypeDelete)))
-		if !dependsOnCompositeType(newViewsByName[v.GetName()].DependsOnCompositeTypes, ctName) {
+		if !addAlterEdgeWouldCycle(newViewsByName[v.GetName()].DependsOnCompositeTypes) {
 			// The view is replaced in place, which drops the reference to the type.
 			deps = append(deps, mustRun(deleteVertexId).after(buildTableVertexId(v.SchemaQualifiedName, diffTypeAddAlter)))
 		}
@@ -348,7 +364,7 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 			continue
 		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildMaterializedViewVertexId(mv.SchemaQualifiedName, diffTypeDelete)))
-		if !dependsOnCompositeType(newMaterializedViewsByName[mv.GetName()].DependsOnCompositeTypes, ctName) {
+		if !addAlterEdgeWouldCycle(newMaterializedViewsByName[mv.GetName()].DependsOnCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildMaterializedViewVertexId(mv.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
@@ -360,7 +376,7 @@ func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.Compos
 		// A composite type still typed with a re-created type is force re-created alongside it
 		// (see identifyCompositeTypesToRecreate), so the edge to its add/alter must be skipped:
 		// it would contradict compositeTypeDelete < typeDelete < typeAdd < compositeTypeAdd.
-		if !dependsOnCompositeType(newCompositeTypesByName[other.GetName()].DependsOnCompositeTypes, ctName) {
+		if !addAlterEdgeWouldCycle(newCompositeTypesByName[other.GetName()].DependsOnCompositeTypes) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildCompositeTypeVertexId(other.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}

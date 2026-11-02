@@ -2649,6 +2649,12 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 		if err != nil {
 			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", v.ViewName, err)
 		}
+		// A composite type used as the type of an output column is recorded against the view's own
+		// relation, not only against its rewrite rule.
+		outputColumnDependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_class", v.ViewOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", v.ViewName, err)
+		}
 
 		schemaQualifiedName := buildNameFromUnescaped(v.ViewName, v.SchemaName)
 		views = append(views, View{
@@ -2658,11 +2664,12 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 			Options:             options,
 			Columns:             buildViewColumns(v.ColumnNames, v.ColumnTypes, v.ColumnDescriptions),
 
-			TableDependencies:       tableDependencies,
-			DependsOnFunctions:      dedupeSchemaQualifiedNames(dependsOnFunctions),
-			DependsOnCompositeTypes: dedupeSchemaQualifiedNames(dependsOnCompositeTypes),
-			Privileges:              privilegesByView[schemaQualifiedName.GetFQEscapedName()],
-			Description:             v.Description,
+			TableDependencies:  tableDependencies,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			DependsOnCompositeTypes: dedupeSchemaQualifiedNames(append(
+				dependsOnCompositeTypes, outputColumnDependsOnCompositeTypes...)),
+			Privileges:  privilegesByView[schemaQualifiedName.GetFQEscapedName()],
+			Description: v.Description,
 		})
 	}
 
@@ -2731,6 +2738,12 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 		if err != nil {
 			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", mv.ViewName, err)
 		}
+		// A composite type used as the type of an output column is recorded against the
+		// materialized view's own relation, not only against its rewrite rule.
+		outputColumnDependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_class", mv.ViewOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", mv.ViewName, err)
+		}
 
 		schemaQualifiedName := buildNameFromUnescaped(mv.ViewName, mv.SchemaName)
 		materializedViews = append(materializedViews, MaterializedView{
@@ -2741,11 +2754,12 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 			Tablespace:          mv.TablespaceName,
 			Columns:             buildViewColumns(mv.ColumnNames, mv.ColumnTypes, mv.ColumnDescriptions),
 
-			TableDependencies:       tableDependencies,
-			DependsOnFunctions:      dedupeSchemaQualifiedNames(dependsOnFunctions),
-			DependsOnCompositeTypes: dedupeSchemaQualifiedNames(dependsOnCompositeTypes),
-			Privileges:              privilegesByMaterializedView[schemaQualifiedName.GetFQEscapedName()],
-			Description:             mv.Description,
+			TableDependencies:  tableDependencies,
+			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
+			DependsOnCompositeTypes: dedupeSchemaQualifiedNames(append(
+				dependsOnCompositeTypes, outputColumnDependsOnCompositeTypes...)),
+			Privileges:  privilegesByMaterializedView[schemaQualifiedName.GetFQEscapedName()],
+			Description: mv.Description,
 		})
 	}
 
