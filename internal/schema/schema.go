@@ -519,6 +519,12 @@ type (
 		// Only populated if IsGenerated is true.
 		GenerationExpression string
 		IsNullable           bool
+		// NotNullConstraintName is the name of the column's NOT NULL constraint when that name is
+		// not the one PostgreSQL generates by default for the column — an inherited name from a
+		// partitioned parent, or one the schema chose explicitly. An empty string means the
+		// default. PostgreSQL 18 catalogues NOT NULL constraints (contype = 'n'); earlier versions
+		// do not, so this is always empty there.
+		NotNullConstraintName string
 		// HasMissingValOptimization refers to the 'attmissingval' optimization for adding columns with a default.
 		HasMissingValOptimization bool
 		// Size is the number of bytes required to store the value.
@@ -759,7 +765,7 @@ type Function struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the function (pg_description). Empty means no comment.
 	Description string
-	Privileges              []Privilege
+	Privileges  []Privilege
 	// DependsOnDomains is the list of domains referenced by the function's signature
 	// (argument or return types). The function must be created after those domains exist.
 	DependsOnDomains []SchemaQualifiedName
@@ -785,7 +791,7 @@ type Procedure struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the procedure (pg_description). Empty means no comment.
 	Description string
-	Privileges              []Privilege
+	Privileges  []Privilege
 	// DependsOnDomains — see Function.DependsOnDomains.
 	DependsOnDomains []SchemaQualifiedName
 	// DependsOnRelations — see Function.DependsOnRelations.
@@ -1663,6 +1669,11 @@ func (s *schemaFetcher) fetchTables(ctx context.Context) ([]Table, error) {
 		checkConsByTable[cc.table.GetFQEscapedName()] = append(checkConsByTable[cc.table.GetFQEscapedName()], cc.checkConstraint)
 	}
 
+	notNullConsByTable, err := s.fetchNotNullConstraints(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetchNotNullConstraints(): %w", err)
+	}
+
 	policies, err := s.fetchPolicies(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetchPolicies(): %w", err)
@@ -1695,7 +1706,7 @@ func (s *schemaFetcher) fetchTables(ctx context.Context) ([]Table, error) {
 	for _, _rawTable := range rawTables {
 		rawTable := _rawTable // Capture loop variables for go routine
 		tableFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() (Table, error) {
-			return s.buildTable(ctx, rawTable, checkConsByTable, policiesByTable, privilegesByTable, columnPrivilegesByTable)
+			return s.buildTable(ctx, rawTable, checkConsByTable, notNullConsByTable, policiesByTable, privilegesByTable, columnPrivilegesByTable)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("starting table future: %w", err)
@@ -1722,6 +1733,7 @@ func (s *schemaFetcher) buildTable(
 	ctx context.Context,
 	table queries.GetTablesRow,
 	checkConsByTable map[string][]CheckConstraint,
+	notNullConsByTable map[string]map[string]string,
 	policiesByTable map[string][]Policy,
 	privilegesByTable map[string][]TablePrivilege,
 	columnPrivilegesByTable map[string][]ColumnPrivilege,
@@ -1730,6 +1742,7 @@ func (s *schemaFetcher) buildTable(
 	if err != nil {
 		return Table{}, fmt.Errorf("GetColumnsForTable(%s): %w", table.Oid, err)
 	}
+	notNullConsByColumn := notNullConsByTable[buildNameFromUnescaped(table.TableName, table.TableSchemaName).GetFQEscapedName()]
 	dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_class", table.Oid)
 	if err != nil {
 		return Table{}, fmt.Errorf("fetchDependsOnDomains(%s): %w", table.Oid, err)
@@ -1779,6 +1792,10 @@ func (s *schemaFetcher) buildTable(
 			Size:                 int(column.ColumnSize),
 			Identity:             identity,
 			Description:          column.Description,
+			// PostgreSQL and pg_dump elide a NOT NULL constraint's name when it is exactly
+			// "<table>_<column>_not_null", so only a different name is part of the schema.
+			NotNullConstraintName: notNullConstraintNameIfExplicit(
+				notNullConsByColumn[column.ColumnName], table.TableName, column.ColumnName),
 
 			DefaultDependsOnFunctions: defaultDependsOnFunctions,
 		})
@@ -1867,6 +1884,39 @@ func (s *schemaFetcher) fetchCheckCons(ctx context.Context) ([]checkConstraintAn
 	)
 
 	return ccs, nil
+}
+
+// fetchNotNullConstraints returns the name of every column's NOT NULL constraint, keyed by the
+// table it belongs to and the column. PostgreSQL 18 catalogues them in pg_constraint; earlier
+// versions return nothing.
+func (s *schemaFetcher) fetchNotNullConstraints(ctx context.Context) (map[string]map[string]string, error) {
+	rows, err := s.q.GetNotNullConstraints(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetNotNullConstraints: %w", err)
+	}
+
+	byTable := make(map[string]map[string]string, len(rows))
+	for _, row := range rows {
+		tableName := buildNameFromUnescaped(row.TableName, row.TableSchemaName).GetFQEscapedName()
+		byColumn, ok := byTable[tableName]
+		if !ok {
+			byColumn = make(map[string]string)
+			byTable[tableName] = byColumn
+		}
+		byColumn[row.ColumnName] = row.ConstraintName
+	}
+	return byTable, nil
+}
+
+// notNullConstraintNameIfExplicit returns the constraint name unless it is the default one
+// PostgreSQL generates for that column. PostgreSQL and pg_dump omit the name when it is exactly
+// "<table>_<column>_not_null" (pg_dump compares against the untruncated name), so only a different
+// name is part of the schema and has to be reproduced by the plan.
+func notNullConstraintNameIfExplicit(name, tableName, columnName string) string {
+	if name == fmt.Sprintf("%s_%s_not_null", tableName, columnName) {
+		return ""
+	}
+	return name
 }
 
 func (s *schemaFetcher) buildCheckConstraint(ctx context.Context, cc queries.GetCheckConstraintsRow) (CheckConstraint, error) {
@@ -2889,6 +2939,15 @@ func buildProcName(name, identityArguments, schemaName string) SchemaQualifiedNa
 		SchemaName:  schemaName,
 		EscapedName: fmt.Sprintf("%s(%s)", EscapeIdentifier(name), identityArguments),
 	}
+}
+
+// UnescapeIdentifier reverses EscapeIdentifier for an identifier this package escaped: it strips
+// the surrounding quotes and collapses the doubled quotes.
+func UnescapeIdentifier(escaped string) string {
+	if len(escaped) >= 2 && escaped[0] == '"' && escaped[len(escaped)-1] == '"' {
+		return strings.ReplaceAll(escaped[1:len(escaped)-1], `""`, `"`)
+	}
+	return escaped
 }
 
 func buildNameFromUnescaped(unescapedName, schemaName string) SchemaQualifiedName {

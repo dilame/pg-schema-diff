@@ -230,8 +230,13 @@ for _, stmt := range plan.Statements {
 ```
 
 # Supported Postgres versions
-Supported: 14, 15, 16, 17
+Supported: 14, 15, 16, 17, 18
 Unsupported: <= 13  are not supported. Use at your own risk.
+
+PostgreSQL 18 catalogues NOT NULL constraints and pg_dump prints a partition's inherited constraint
+name, so the schema model carries a column's NOT NULL constraint name whenever it is not the default
+`<table>_<column>_not_null`, and the plan reproduces it: a partition whose constraint is renamed to —
+or away from — the parent's name is detached, altered and attached again.
 
 # Unsupported migrations
 An abridged list of unsupported migrations:

@@ -1594,6 +1594,64 @@ func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedVi
 	return items, nil
 }
 
+const getNotNullConstraints = `-- name: GetNotNullConstraints :many
+SELECT
+    pg_constraint.conname::TEXT AS constraint_name,
+    pg_class.relname::TEXT AS table_name,
+    table_namespace.nspname::TEXT AS table_schema_name,
+    a.attname::TEXT AS column_name
+FROM pg_catalog.pg_constraint
+INNER JOIN pg_catalog.pg_class ON pg_constraint.conrelid = pg_class.oid
+INNER JOIN
+    pg_catalog.pg_namespace AS table_namespace
+    ON pg_class.relnamespace = table_namespace.oid
+INNER JOIN
+    pg_catalog.pg_attribute AS a
+    ON
+        a.attrelid = pg_constraint.conrelid
+        AND a.attnum = pg_constraint.conkey[1]
+WHERE
+    table_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND table_namespace.nspname !~ '^pg_toast'
+    AND table_namespace.nspname !~ '^pg_temp'
+    AND pg_constraint.contype = 'n'
+`
+
+type GetNotNullConstraintsRow struct {
+	ConstraintName  string
+	TableName       string
+	TableSchemaName string
+	ColumnName      string
+}
+
+func (q *Queries) GetNotNullConstraints(ctx context.Context) ([]GetNotNullConstraintsRow, error) {
+	rows, err := q.db.QueryContext(ctx, getNotNullConstraints)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetNotNullConstraintsRow
+	for rows.Next() {
+		var i GetNotNullConstraintsRow
+		if err := rows.Scan(
+			&i.ConstraintName,
+			&i.TableName,
+			&i.TableSchemaName,
+			&i.ColumnName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getPolicies = `-- name: GetPolicies :many
 WITH roles AS (
     SELECT

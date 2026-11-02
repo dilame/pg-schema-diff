@@ -20,9 +20,12 @@ type testCase struct {
 	ddl            []string
 	expectedSchema Schema
 	// expectedHash is the expected hash of the schema. If it is not provided, the test will not validate the hash.
-	expectedHash        string
-	expectedErrIs       error
-	expectedErrContains string
+	expectedHash string
+	// expectedHashBeforePG18 is used instead of expectedHash on servers before PostgreSQL 18, where
+	// NOT NULL constraints are not catalogued and the schema hash differs.
+	expectedHashBeforePG18 string
+	expectedErrIs          error
+	expectedErrContains    string
 }
 
 var (
@@ -278,7 +281,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "d2780fd411ecde18",
+			expectedHash: "ea629d77f278478e",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -701,7 +704,8 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "460bdcd458ca38bf",
+			expectedHash:           "5c94961f8c1552",
+			expectedHashBeforePG18: "beccefa166cfbaea",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1465,6 +1469,17 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	}
 
 	expectedSchema := fillDefaultObjectOwners(testCase.expectedSchema)
+	var serverVersionNum int
+	require.NoError(t, connPool.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum >= 180000 {
+		// PostgreSQL 18 catalogues NOT NULL constraints and pg_dump prints their names; fill the
+		// ones a partition inherits from its parent.
+		expectedSchema = fillPartitionNotNullConstraintNames(expectedSchema)
+	} else {
+		// Before 18 there is nothing to compare: a NOT NULL column simply has no constraint name.
+		expectedSchema = clearNotNullConstraintNames(expectedSchema)
+		fetchedSchema = clearNotNullConstraintNames(fetchedSchema)
+	}
 	expectedNormalized := expectedSchema.Normalize()
 	fetchedNormalized := fetchedSchema.Normalize()
 	assert.Equal(t, expectedNormalized, fetchedNormalized, "expected=\n%# v \n fetched=%# v\n", pretty.Formatter(expectedNormalized), pretty.Formatter(fetchedNormalized))
@@ -1475,10 +1490,71 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	require.NoError(t, err)
 	// same schemas should have the same hashes
 	assert.Equal(t, expectedSchemaHash, fetchedSchemaHash, "hash of expected schema should match fetched hash")
-	if testCase.expectedHash != "" {
-		// Optionally assert that the hash matches the expected hash
-		assert.Equal(t, testCase.expectedHash, fetchedSchemaHash)
+	expectedHash := testCase.expectedHash
+	if serverVersionNum < 180000 && testCase.expectedHashBeforePG18 != "" {
+		expectedHash = testCase.expectedHashBeforePG18
 	}
+	if expectedHash != "" {
+		// Optionally assert that the hash matches the expected hash
+		assert.Equal(t, expectedHash, fetchedSchemaHash)
+	}
+}
+
+// fillPartitionNotNullConstraintNames sets the NOT NULL constraint names PostgreSQL 18 would report
+// for the expected schema: a partition inherits its parent's name, while a NOT NULL constraint the
+// child declares itself takes the child's default name, which pg_dump omits.
+func fillPartitionNotNullConstraintNames(s Schema) Schema {
+	tablesByName := make(map[string]Table, len(s.Tables))
+	for _, t := range s.Tables {
+		tablesByName[t.GetName()] = t
+	}
+
+	var effectiveName func(t Table, column Column) string
+	effectiveName = func(t Table, column Column) string {
+		if t.ParentTable != nil {
+			if parent, ok := tablesByName[t.ParentTable.GetName()]; ok {
+				for _, parentColumn := range parent.Columns {
+					if parentColumn.Name == column.Name && !parentColumn.IsNullable {
+						return effectiveName(parent, parentColumn)
+					}
+				}
+				// No NOT NULL comes from the parent: the child's own constraint is default-named.
+				return ""
+			}
+			// The parent is filtered out of the expected schema; its own constraint carries the
+			// default name for the parent.
+			return UnescapeIdentifier(t.ParentTable.EscapedName) + "_" + column.Name + "_not_null"
+		}
+		return UnescapeIdentifier(t.EscapedName) + "_" + column.Name + "_not_null"
+	}
+
+	for i := range s.Tables {
+		columns := append([]Column(nil), s.Tables[i].Columns...)
+		for j := range columns {
+			if columns[j].IsNullable || columns[j].NotNullConstraintName != "" {
+				continue
+			}
+			name := effectiveName(s.Tables[i], columns[j])
+			defaultName := UnescapeIdentifier(s.Tables[i].EscapedName) + "_" + columns[j].Name + "_not_null"
+			if name == defaultName {
+				name = ""
+			}
+			columns[j].NotNullConstraintName = name
+		}
+		s.Tables[i].Columns = columns
+	}
+	return s
+}
+
+func clearNotNullConstraintNames(s Schema) Schema {
+	for i := range s.Tables {
+		columns := append([]Column(nil), s.Tables[i].Columns...)
+		for j := range columns {
+			columns[j].NotNullConstraintName = ""
+		}
+		s.Tables[i].Columns = columns
+	}
+	return s
 }
 
 func fillDefaultObjectOwners(s Schema) Schema {
@@ -1602,5 +1678,72 @@ func TestTriggerDefStmtToCreateOrReplace(t *testing.T) {
 				require.Equal(t, tc.out, out)
 			}
 		})
+	}
+}
+
+func TestNotNullConstraintNames(t *testing.T) {
+	engine, err := pgengine.StartEngine()
+	require.NoError(t, err)
+	defer engine.Close()
+	db, err := engine.CreateDatabase()
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.DropDB())
+	}()
+
+	conn, err := sql.Open("pgx", db.GetDSN())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, conn.Close())
+	}()
+	for _, stmt := range []string{
+		`CREATE TABLE nn_parent (id int, tag text, PRIMARY KEY (id, tag)) PARTITION BY LIST (tag)`,
+		`CREATE TABLE nn_child PARTITION OF nn_parent FOR VALUES IN ('a')`,
+		`CREATE TABLE nn_local_child PARTITION OF nn_parent (tag NOT NULL) FOR VALUES IN ('b')`,
+		`CREATE TABLE nn_local (id int, flag text CONSTRAINT custom_nn NOT NULL)`,
+		`CREATE TABLE nn_plain (id int NOT NULL)`,
+	} {
+		_, err := conn.Exec(stmt)
+		require.NoError(t, err)
+	}
+
+	s, err := GetSchema(context.Background(), conn)
+	require.NoError(t, err)
+
+	var serverVersionNum int
+	require.NoError(t, conn.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+
+	// The effective name of every NOT NULL column: PostgreSQL 18 catalogues them, and a partition
+	// inherits its parent's name. Before 18 there are no names at all. The name PostgreSQL generates
+	// for a column — "<table>_<column>_not_null" — is never reported, because PostgreSQL and pg_dump
+	// omit it.
+	expected := map[string]map[string]string{
+		"public.nn_parent":      {"id": "", "tag": ""},
+		"public.nn_child":       {"id": "nn_parent_id_not_null", "tag": "nn_parent_tag_not_null"},
+		"public.nn_local_child": {"id": "nn_parent_id_not_null", "tag": ""},
+		"public.nn_local":       {"id": "", "flag": "custom_nn"},
+		"public.nn_plain":       {"id": ""},
+	}
+	if serverVersionNum < 180000 {
+		for table, columns := range expected {
+			for column := range columns {
+				expected[table][column] = ""
+			}
+		}
+	}
+
+	for _, table := range s.Tables {
+		tableName := "public." + UnescapeIdentifier(table.EscapedName)
+		expectedColumns, ok := expected[tableName]
+		if !ok {
+			continue
+		}
+		for _, column := range table.Columns {
+			expectedName, ok := expectedColumns[column.Name]
+			if !ok {
+				continue
+			}
+			assert.Equal(t, expectedName, column.NotNullConstraintName, "%s.%s", tableName, column.Name)
+		}
 	}
 }
