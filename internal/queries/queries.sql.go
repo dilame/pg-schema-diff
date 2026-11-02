@@ -224,15 +224,17 @@ SELECT
     identity_col_seq.seqcycle AS is_cycle,
     COALESCE(coll.collname, '')::TEXT AS collation_name,
     COALESCE(collation_namespace.nspname, '')::TEXT AS collation_schema_name,
+    -- attgenerated: 's' is a stored generated column, 'v' is a virtual one
+    -- (PostgreSQL 18); an empty string is a plain column.
     COALESCE(
         CASE
-            WHEN a.attgenerated = 's' THEN ''
+            WHEN a.attgenerated != '' THEN ''
             ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid)
         END, ''
     )::TEXT AS default_value,
     COALESCE(
         CASE
-            WHEN a.attgenerated = 's'
+            WHEN a.attgenerated != ''
                 THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid)
             ELSE ''
         END, ''
@@ -240,6 +242,9 @@ SELECT
     COALESCE(
         pg_catalog.col_description(a.attrelid, a.attnum), ''
     )::TEXT AS description,
+    -- The functions the column's default calls, as JSON objects of schema,
+    -- name and identity arguments. PostgreSQL refuses to drop such a function
+    -- while the default exists.
     ARRAY(
         SELECT
             JSONB_BUILD_OBJECT(
@@ -262,10 +267,8 @@ SELECT
             AND depend.objid = d.oid
             AND depend.deptype = 'n'
     )::TEXT [] AS default_depends_on_functions,
-    (a.attgenerated = 's') AS is_generated,
-    -- The functions the column's default calls, as JSON objects of schema, name
-    -- and identity arguments. PostgreSQL refuses to drop such a function while
-    -- the default exists.
+    (a.attgenerated != '') AS is_generated,
+    (a.attgenerated = 'v') AS is_generated_virtual,
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN
@@ -306,6 +309,7 @@ type GetColumnsForTableRow struct {
 	Description               string
 	DefaultDependsOnFunctions []string
 	IsGenerated               bool
+	IsGeneratedVirtual        bool
 	ColumnType                string
 }
 
@@ -337,6 +341,7 @@ func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) 
 			&i.Description,
 			pq.Array(&i.DefaultDependsOnFunctions),
 			&i.IsGenerated,
+			&i.IsGeneratedVirtual,
 			&i.ColumnType,
 		); err != nil {
 			return nil, err
@@ -1220,6 +1225,12 @@ SELECT
     foreign_table_c.relname::TEXT AS foreign_table_name,
     foreign_table_namespace.nspname::TEXT AS foreign_table_schema_name,
     pg_constraint.convalidated AS is_valid,
+    -- For a foreign key, conindid is the unique index or constraint on the
+    -- referenced table it uses. PostgreSQL refuses to drop that index while the
+    -- foreign key depends on it, so the foreign key is dropped and re-created
+    -- around a re-created constraint.
+    referenced_index_c.relname::TEXT AS referenced_index_name,
+    referenced_index_namespace.nspname::TEXT AS referenced_index_schema_name,
     COALESCE(
         pg_catalog.obj_description(pg_constraint.oid, 'pg_constraint'), ''
     )::TEXT AS description,
@@ -1236,6 +1247,11 @@ INNER JOIN
 INNER JOIN pg_catalog.pg_namespace AS foreign_table_namespace
     ON
         foreign_table_c.relnamespace = foreign_table_namespace.oid
+INNER JOIN
+    pg_catalog.pg_class AS referenced_index_c
+    ON pg_constraint.conindid = referenced_index_c.oid
+INNER JOIN pg_catalog.pg_namespace AS referenced_index_namespace
+    ON referenced_index_c.relnamespace = referenced_index_namespace.oid
 WHERE
     constraint_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
     AND constraint_namespace.nspname !~ '^pg_toast'
@@ -1245,14 +1261,16 @@ WHERE
 `
 
 type GetForeignKeyConstraintsRow struct {
-	ConstraintName         string
-	OwningTableName        string
-	OwningTableSchemaName  string
-	ForeignTableName       string
-	ForeignTableSchemaName string
-	IsValid                bool
-	Description            string
-	ConstraintDef          string
+	ConstraintName            string
+	OwningTableName           string
+	OwningTableSchemaName     string
+	ForeignTableName          string
+	ForeignTableSchemaName    string
+	IsValid                   bool
+	ReferencedIndexName       string
+	ReferencedIndexSchemaName string
+	Description               string
+	ConstraintDef             string
 }
 
 func (q *Queries) GetForeignKeyConstraints(ctx context.Context) ([]GetForeignKeyConstraintsRow, error) {
@@ -1271,6 +1289,8 @@ func (q *Queries) GetForeignKeyConstraints(ctx context.Context) ([]GetForeignKey
 			&i.ForeignTableName,
 			&i.ForeignTableSchemaName,
 			&i.IsValid,
+			&i.ReferencedIndexName,
+			&i.ReferencedIndexSchemaName,
 			&i.Description,
 			&i.ConstraintDef,
 		); err != nil {

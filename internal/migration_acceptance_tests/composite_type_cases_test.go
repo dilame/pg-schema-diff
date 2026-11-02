@@ -191,7 +191,7 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
-		name: "alter composite type attrs - cascade through dependent procedure",
+		name: "alter composite type attrs in place - append attribute with dependent procedure",
 		oldSchemaDDL: []string{`
 			CREATE TYPE pair AS (a int, b text);
 			CREATE PROCEDURE use_pair(p pair) LANGUAGE plpgsql AS $$ BEGIN END $$;
@@ -200,11 +200,9 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			CREATE TYPE pair AS (a int, b text, c boolean);
 			CREATE PROCEDURE use_pair(p pair) LANGUAGE plpgsql AS $$ BEGIN END $$;
 		`},
-		// Procedures always carry the untrackable-deps hazard regardless of the
-		// underlying composite-type recreation; pg-schema-diff cannot follow plpgsql
-		// body references through pg_depend.
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeHasUntrackableDependencies,
+		// Appending an attribute keeps the type's OID, so the procedure is not touched.
+		expectedPlanDDL: []string{
+			`ALTER TYPE "public"."pair" ADD ATTRIBUTE "c" boolean`,
 		},
 	},
 	{
@@ -257,7 +255,7 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		expectedPlanErrorIs: diff.ErrNotImplemented,
 	},
 	{
-		name: "alter composite type attrs is unsupported when dependent composite type is used by a table column",
+		name: "alter composite type attrs in place through dependent composite type used by a table column",
 		oldSchemaDDL: []string{`
 			CREATE TYPE inner_t AS (n int);
 			CREATE TYPE outer_t AS (i inner_t, label text);
@@ -268,7 +266,11 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			CREATE TYPE outer_t AS (i inner_t, label text);
 			CREATE TABLE users (id int, attrs outer_t);
 		`},
-		expectedPlanErrorIs: diff.ErrNotImplemented,
+		// The appended attribute keeps inner_t's OID, so outer_t and the table column
+		// that uses it are untouched.
+		expectedPlanDDL: []string{
+			`ALTER TYPE "public"."inner_t" ADD ATTRIBUTE "extra" text COLLATE "pg_catalog"."default"`,
+		},
 	},
 	{
 		name: "alter composite type attrs is unsupported when used by a table array column",
@@ -281,6 +283,74 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 			CREATE TABLE users (id int, attrs pair[]);
 		`},
 		expectedPlanErrorIs: diff.ErrNotImplemented,
+	},
+	// ─── Re-creating a type whose layout ALTER cannot produce ───
+	{
+		name: "recreate composite type with dependent view and function when an attribute is inserted",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE VIEW pair_a AS SELECT (ROW(1, 'x')::pair).a AS a;
+			CREATE FUNCTION pair_a_value(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+			CREATE TABLE unrelated (id int);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (c boolean, a int, b text);
+			CREATE VIEW pair_a AS SELECT (ROW(true, 1, 'x')::pair).a AS a;
+			CREATE FUNCTION pair_a_value(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+			CREATE TABLE unrelated (id int);
+		`},
+	},
+	{
+		name: "recreate nested composite type with dependent view and unrelated relations present",
+		oldSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE VIEW outer_label AS SELECT (ROW(ROW(1)::inner_t, 'x')::outer_t).label AS label;
+			CREATE FUNCTION unrelated_fn() RETURNS void LANGUAGE sql AS 'SELECT NULL';
+			CREATE TABLE unrelated (id int);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE inner_t AS (extra text, n int);
+			CREATE TYPE outer_t AS (i inner_t, label text);
+			CREATE VIEW outer_label AS SELECT (ROW(ROW('y', 1)::inner_t, 'x')::outer_t).label AS label;
+			CREATE FUNCTION unrelated_fn() RETURNS void LANGUAGE sql AS 'SELECT NULL';
+			CREATE TABLE unrelated (id int);
+		`},
+	},
+	// ─── Altering a type in place ───
+	{
+		name: "recreate composite type when a trailing attribute is dropped with a dependent view and function",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE VIEW pair_a AS SELECT (ROW(1, 'x')::pair).a AS a;
+			CREATE FUNCTION pair_a_value(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int);
+			CREATE VIEW pair_a AS SELECT (ROW(1)::pair).a AS a;
+			CREATE FUNCTION pair_a_value(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+		`},
+	},
+	{
+		name: "recreate composite type when an attribute is retyped with a dependent function",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE FUNCTION pair_a(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b character varying);
+			CREATE FUNCTION pair_a(p pair) RETURNS int LANGUAGE sql AS 'SELECT (p).a';
+		`},
+	},
+	{
+		name: "alter composite type attrs in place - append attribute read by a new view",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text, c boolean);
+			CREATE VIEW pair_c AS SELECT (ROW(1, 'x', true)::pair).c AS c;
+		`},
 	},
 }
 

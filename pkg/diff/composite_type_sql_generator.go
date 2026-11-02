@@ -8,35 +8,34 @@ import (
 	"github.com/stripe/pg-schema-diff/internal/schema"
 )
 
-// compositeTypeSQLVertexGenerator handles `CREATE TYPE foo AS (...)` and
-// `DROP TYPE foo` for user-defined composite types. It is a SQLVertexGenerator
-// (rather than a plain SQLGenerator) so it can carry explicit ordering
-// dependencies relative to the consumers of a composite type — namely tables,
-// functions, procedures, and triggers, which may reference the type in column
-// types, parameter types, or return types.
+// compositeTypeSQLVertexGenerator handles `CREATE TYPE foo AS (...)`, `DROP TYPE foo` and
+// `ALTER TYPE foo ADD ATTRIBUTE` for user-defined composite types. It is a
+// SQLVertexGenerator (rather than a plain SQLGenerator) so it can carry explicit ordering
+// dependencies relative to the consumers of a composite type — tables, views, materialized views,
+// functions, procedures and other composite types, which may reference the type in column types,
+// definitions, parameter types or return types.
 //
-// Phase 1 scope: Add and Drop only. ALTER (when attributes change) is
-// returned as ErrNotImplemented so the diff machinery fails loudly rather
-// than silently dropping the change. A future phase can extend Alter to
-// drop+recreate cascade for the function-only-dependents case.
+// A change to a type's attribute list takes one of two paths. Adding attributes at the end needs no
+// dependent to be touched: `ALTER TYPE ... ADD ATTRIBUTE` keeps the type's OID, and PostgreSQL
+// never blocks it, whereas it refuses to drop or retype an attribute a view or rule reads. Every
+// other change — a dropped, retyped, renamed or inserted attribute, or a reorder — is resolved by
+// dropping and creating the type again, with every tracked dependent dropped first and created
+// afterwards: PostgreSQL refuses the drop while anything still references the type. Re-creating a
+// type that a table column uses is refused up front (see identifyCompositeTypesToRecreate).
 type compositeTypeSQLVertexGenerator struct {
-	// newSchema and oldSchema are used to set up dependency edges from every
-	// table/function/procedure/trigger that may reference a composite type to
-	// the type's add/delete vertices. We do not parse signatures to know
-	// which functions actually reference a given composite — instead we
-	// take a blanket approach and let topo-sort untangle it. This matches
-	// how procedureSQLVertexGenerator handles its own untrackable deps.
+	// newSchema and oldSchema are used to set up dependency edges between a composite type and the
+	// objects that reference it. Only the objects whose recorded dependencies name the type get an
+	// edge; a blanket edge to every table or function would close a cycle with the type's own drop
+	// for a re-created type (typeAdd → consumerAdd → typeDelete → typeAdd) and is not needed by
+	// any of them.
 	newSchema schema.Schema
 	oldSchema schema.Schema
-
-	recreatedCompositeTypes map[string]bool
 }
 
-func newCompositeTypeSQLVertexGenerator(oldSchema, newSchema schema.Schema, recreatedCompositeTypes map[string]bool) sqlVertexGenerator[schema.CompositeType, compositeTypeDiff] {
+func newCompositeTypeSQLVertexGenerator(oldSchema, newSchema schema.Schema) sqlVertexGenerator[schema.CompositeType, compositeTypeDiff] {
 	return &compositeTypeSQLVertexGenerator{
-		newSchema:               newSchema,
-		oldSchema:               oldSchema,
-		recreatedCompositeTypes: recreatedCompositeTypes,
+		newSchema: newSchema,
+		oldSchema: oldSchema,
 	}
 }
 
@@ -50,13 +49,10 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 	}}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Description)...)
 
-	// The type must exist before any consumer (table/function/procedure/trigger)
-	// is added or altered. We add blanket "after-this" dependencies on the type
-	// from every such consumer in the new schema; the topo sort will pick the
-	// correct order.
+	// The type must exist before any new consumer is created or altered to use it.
 	deps := c.consumerDepsForAddAlter(ct)
 	deps = append(deps, c.compositeTypeDepsForAddAlter(ct)...)
-	// Run after re-create (if recreated). Mirrors the view/mview pattern.
+	// Run after re-create (if recreated). Mirrors the view/mview/domain pattern.
 	deps = append(deps, mustRun(addVertexId).after(buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeDelete)))
 
 	return partialSQLGraph{
@@ -72,10 +68,8 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (partialSQLGraph, error) {
 	deleteVertexId := buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeDelete)
 
-	// The type must be dropped after every consumer (in the OLD schema) is
-	// dropped or altered to no longer reference it. Add blanket
-	// "before-this" dependencies on the type's delete from every consumer's
-	// delete and add/alter vertices.
+	// The type must be dropped after every consumer (in the OLD schema) has been dropped or altered
+	// to no longer reference it.
 	deps := c.consumerDepsForDelete(ct)
 	deps = append(deps, c.compositeTypeDepsForDelete(ct)...)
 
@@ -94,11 +88,9 @@ func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (parti
 }
 
 func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQLGraph, error) {
-	// Comment-only diffs are emitted as a COMMENT ON TYPE statement and do
-	// not require touching the type itself.
-	oldCopy := d.old
-	oldCopy.Description = d.new.Description
-	if cmp.Equal(oldCopy, d.new) {
+	// Comment-only diffs are emitted as a COMMENT ON TYPE statement and do not require touching
+	// the type itself.
+	if cmp.Equal(d.old.Attributes, d.new.Attributes) {
 		commentStmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
 		if len(commentStmts) == 0 {
 			return partialSQLGraph{}, nil
@@ -112,12 +104,30 @@ func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQL
 		}, nil
 	}
 
-	// Anything beyond a description change requires altering the type's
-	// attribute list. Phase 2 (drop dependent functions → drop type → recreate
-	// type → recreate functions) is not implemented yet. For now we surface
-	// ErrNotImplemented so the user gets an explicit error rather than a
-	// silent drop.
-	return partialSQLGraph{}, fmt.Errorf("altering composite type attributes: %w", ErrNotImplemented)
+	added, ok := appendedCompositeTypeAttributes(d.old.Attributes, d.new.Attributes)
+	if !ok {
+		// identifyCompositeTypesToRecreate marks such a type for a DROP + CREATE, so Alter is only
+		// reached for a layout PostgreSQL can reproduce with ALTER TYPE.
+		return partialSQLGraph{}, fmt.Errorf("altering composite type attributes: %w", ErrNotImplemented)
+	}
+
+	alterVertexId := buildCompositeTypeVertexId(d.new.SchemaQualifiedName, diffTypeAddAlter)
+	stmts := buildAlterCompositeTypeAttributeStatements(d.new, added)
+	stmts = append(stmts, commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)...)
+
+	// An attribute added to the type is resolved against the new layout by anything created
+	// afterwards, so every new consumer has to run after the ALTER as well.
+	deps := c.consumerDepsForAddAlter(d.new)
+	deps = append(deps, c.compositeTypeDepsForAddAlter(d.new)...)
+
+	return partialSQLGraph{
+		vertices: []sqlVertex{{
+			id:         alterVertexId,
+			priority:   sqlPrioritySooner,
+			statements: stmts,
+		}},
+		dependencies: deps,
+	}, nil
 }
 
 func buildCompositeTypeVertexId(name schema.SchemaQualifiedName, d diffType) sqlVertexId {
@@ -136,19 +146,61 @@ func buildCreateCompositeTypeDDL(ct schema.CompositeType) string {
 	}
 	var attrDefs []string
 	for _, a := range ct.Attributes {
-		def := fmt.Sprintf("\t%s %s", schema.EscapeIdentifier(a.Name), a.Type)
-		if !a.Collation.IsEmpty() {
-			def += fmt.Sprintf(" COLLATE %s", a.Collation.GetFQEscapedName())
-		}
-		attrDefs = append(attrDefs, def)
+		attrDefs = append(attrDefs, buildCompositeTypeAttributeDef(a))
 	}
 	return fmt.Sprintf("CREATE TYPE %s AS (\n%s\n)", ct.GetFQEscapedName(), strings.Join(attrDefs, ",\n"))
 }
 
-// dependsOnAnyRecreatedType reports whether any of the given composite-type
-// references is in the set of types being recreated (their attribute list is
-// changing). Used to force-recreate functions and procedures so PostgreSQL
-// resolves their argument/return types against the new layout.
+func buildCompositeTypeAttributeDef(a schema.CompositeTypeAttribute) string {
+	def := fmt.Sprintf("\t%s %s", schema.EscapeIdentifier(a.Name), a.Type)
+	if !a.Collation.IsEmpty() {
+		def += fmt.Sprintf(" COLLATE %s", a.Collation.GetFQEscapedName())
+	}
+	return def
+}
+
+// appendedCompositeTypeAttributes returns the attributes that turn oldAttributes into
+// newAttributes, and whether ALTER TYPE can do it. PostgreSQL appends every added attribute after
+// the existing ones and cannot reorder, insert in the middle, drop or retype an attribute that a
+// view or a rule reads (it refuses with "cannot drop/alter ... because other objects depend on
+// it"). Attribute-level reads are not modelled here — only the type-level dependency is — so the
+// in-place path is limited to the change that can never be blocked: the old layout is a prefix of
+// the new one and the additions are the exact new suffix. Anything else is resolved by
+// dropping and re-creating the type with its dependents.
+func appendedCompositeTypeAttributes(oldAttributes, newAttributes []schema.CompositeTypeAttribute) ([]schema.CompositeTypeAttribute, bool) {
+	if len(newAttributes) < len(oldAttributes) {
+		return nil, false
+	}
+	for i, oldAttr := range oldAttributes {
+		if !cmp.Equal(oldAttr, newAttributes[i]) {
+			return nil, false
+		}
+	}
+	return newAttributes[len(oldAttributes):], true
+}
+
+// buildAlterCompositeTypeAttributeStatements renders the ALTER TYPE statements that append the
+// given attributes.
+func buildAlterCompositeTypeAttributeStatements(ct schema.CompositeType, added []schema.CompositeTypeAttribute) []Statement {
+	alterPrefix := fmt.Sprintf("ALTER TYPE %s", ct.GetFQEscapedName())
+	var stmts []Statement
+	for _, attr := range added {
+		ddl := fmt.Sprintf("%s ADD ATTRIBUTE %s %s", alterPrefix, schema.EscapeIdentifier(attr.Name), attr.Type)
+		if !attr.Collation.IsEmpty() {
+			ddl += fmt.Sprintf(" COLLATE %s", attr.Collation.GetFQEscapedName())
+		}
+		stmts = append(stmts, Statement{
+			DDL:         ddl,
+			Timeout:     statementTimeoutDefault,
+			LockTimeout: lockTimeoutDefault,
+		})
+	}
+	return stmts
+}
+
+// dependsOnAnyRecreatedType reports whether any of the given composite-type references is in the
+// set of types being recreated (their attribute list is changing). Used to force-recreate functions
+// and procedures so PostgreSQL resolves their argument/return types against the new layout.
 func dependsOnAnyRecreatedType(deps []schema.SchemaQualifiedName, recreated map[string]bool) bool {
 	for _, d := range deps {
 		if recreated[d.GetName()] {
@@ -158,21 +210,57 @@ func dependsOnAnyRecreatedType(deps []schema.SchemaQualifiedName, recreated map[
 	return false
 }
 
-// consumerDepsForAddAlter returns dependency edges that force the
-// composite type's CREATE to run before any consumer's CREATE/ALTER in
-// the new schema.
+func dependsOnCompositeType(deps []schema.SchemaQualifiedName, ctName string) bool {
+	for _, d := range deps {
+		if d.GetName() == ctName {
+			return true
+		}
+	}
+	return false
+}
+
+// consumerDepsForAddAlter returns dependency edges that force the composite type's CREATE or ALTER
+// to run before any new consumer that references the type is created or altered.
 func (c *compositeTypeSQLVertexGenerator) consumerDepsForAddAlter(ct schema.CompositeType) []dependency {
 	addVertexId := buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeAddAlter)
+	ctName := ct.GetName()
 
 	var deps []dependency
 	for _, t := range c.newSchema.Tables {
+		if !dependsOnCompositeType(t.DependsOnCompositeTypes, ctName) {
+			continue
+		}
 		deps = append(deps, mustRun(addVertexId).before(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		// A column added to an existing table gets its own vertex, so the table vertex alone is
+		// not enough to order the type before the column that uses it.
+		for _, column := range t.Columns {
+			deps = append(deps, mustRun(addVertexId).before(buildColumnVertexId(column.Name, diffTypeAddAlter)))
+		}
 	}
 	for _, f := range c.newSchema.Functions {
-		deps = append(deps, mustRun(addVertexId).before(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
+		if dependsOnCompositeType(f.DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(addVertexId).before(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
+		}
 	}
 	for _, p := range c.newSchema.Procedures {
-		deps = append(deps, mustRun(addVertexId).before(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
+		if dependsOnCompositeType(p.DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(addVertexId).before(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, v := range c.newSchema.Views {
+		if dependsOnCompositeType(v.DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(addVertexId).before(buildTableVertexId(v.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, mv := range c.newSchema.MaterializedViews {
+		if dependsOnCompositeType(mv.DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(addVertexId).before(buildMaterializedViewVertexId(mv.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, other := range c.newSchema.CompositeTypes {
+		if dependsOnCompositeType(other.DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(addVertexId).before(buildCompositeTypeVertexId(other.SchemaQualifiedName, diffTypeAddAlter)))
+		}
 	}
 	return deps
 }
@@ -187,53 +275,93 @@ func (c *compositeTypeSQLVertexGenerator) compositeTypeDepsForAddAlter(ct schema
 	return deps
 }
 
-// consumerDepsForDelete returns dependency edges that force the
-// composite type's DROP to run after every consumer in the old schema is
-// dropped or (in the case of a pure delete) altered to no longer reference
-// the type.
+// consumerDepsForDelete returns dependency edges that force the composite type's DROP to run after
+// every consumer in the old schema is dropped or altered to no longer reference the type.
 //
-// When a consumer (function/procedure) STILL references this type in the
-// new schema — i.e. the type is being recreated because its attributes
-// changed and the consumer is force-recreated alongside it — we must NOT
-// add the `typeDelete > consumerAddAlter` edge: doing so would force the
-// consumer to be created BEFORE the type is dropped, which contradicts
-// the required order
+// When a consumer still references this type in the new schema — i.e. the type is being recreated
+// because its attributes changed and the consumer is force-recreated alongside it — we must NOT add
+// the `typeDelete > consumerAddAlter` edge: doing so would force the consumer to be created BEFORE
+// the type is dropped, which contradicts the required order
 //
 //	consumerDelete < typeDelete < typeAdd < consumerAddAlter
 //
-// Tables are unconditional because we explicitly refuse type-recreation
-// when a table column depends on the type (see buildSchemaDiff), so the
-// recreation edge case never arises for tables.
+// and closes a cycle. Tables are special only in that a table column typed with a re-created type is
+// refused up front (see identifyCompositeTypesToRecreate), so a table that depends on a re-created
+// type never reaches this code; a table that depends on a dropped type always loses the dependency.
 func (c *compositeTypeSQLVertexGenerator) consumerDepsForDelete(ct schema.CompositeType) []dependency {
 	deleteVertexId := buildCompositeTypeVertexId(ct.SchemaQualifiedName, diffTypeDelete)
 	ctName := ct.GetName()
 
-	newFunctionsByName := make(map[string]schema.Function, len(c.newSchema.Functions))
-	for _, f := range c.newSchema.Functions {
-		newFunctionsByName[f.GetName()] = f
-	}
-	newProceduresByName := make(map[string]schema.Procedure, len(c.newSchema.Procedures))
-	for _, p := range c.newSchema.Procedures {
-		newProceduresByName[p.GetName()] = p
-	}
+	newTablesByName := buildSchemaObjByNameMap(c.newSchema.Tables)
+	newFunctionsByName := buildSchemaObjByNameMap(c.newSchema.Functions)
+	newProceduresByName := buildSchemaObjByNameMap(c.newSchema.Procedures)
+	newViewsByName := buildSchemaObjByNameMap(c.newSchema.Views)
+	newMaterializedViewsByName := buildSchemaObjByNameMap(c.newSchema.MaterializedViews)
+	newCompositeTypesByName := buildSchemaObjByNameMap(c.newSchema.CompositeTypes)
 
 	var deps []dependency
 	for _, t := range c.oldSchema.Tables {
+		if !dependsOnCompositeType(t.DependsOnCompositeTypes, ctName) {
+			continue
+		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeDelete)))
-		deps = append(deps, mustRun(deleteVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		for _, column := range t.Columns {
+			deps = append(deps, mustRun(deleteVertexId).after(buildColumnVertexId(column.Name, diffTypeDelete)))
+			deps = append(deps, mustRun(deleteVertexId).after(buildColumnVertexId(column.Name, diffTypeAddAlter)))
+		}
+		// A table column typed with a re-created type is refused up-front, so a table that still
+		// depends on the type here keeps it only when the type is not being dropped at all.
+		if !dependsOnCompositeType(newTablesByName[t.GetName()].DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(deleteVertexId).after(buildTableVertexId(t.SchemaQualifiedName, diffTypeAddAlter)))
+		}
 	}
 	for _, f := range c.oldSchema.Functions {
+		if !dependsOnCompositeType(f.DependsOnCompositeTypes, ctName) {
+			continue
+		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeDelete)))
-		newDeps := newFunctionsByName[f.GetName()].DependsOnCompositeTypes
-		if !consumerStillDependsOnType(newDeps, ctName) && !dependsOnAnyRecreatedType(newDeps, c.recreatedCompositeTypes) {
+		if !dependsOnCompositeType(newFunctionsByName[f.GetName()].DependsOnCompositeTypes, ctName) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildFunctionVertexId(f.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
 	for _, p := range c.oldSchema.Procedures {
+		if !dependsOnCompositeType(p.DependsOnCompositeTypes, ctName) {
+			continue
+		}
 		deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeDelete)))
-		newDeps := newProceduresByName[p.GetName()].DependsOnCompositeTypes
-		if !consumerStillDependsOnType(newDeps, ctName) && !dependsOnAnyRecreatedType(newDeps, c.recreatedCompositeTypes) {
+		if !dependsOnCompositeType(newProceduresByName[p.GetName()].DependsOnCompositeTypes, ctName) {
 			deps = append(deps, mustRun(deleteVertexId).after(buildProcedureVertexId(p.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, v := range c.oldSchema.Views {
+		if !dependsOnCompositeType(v.DependsOnCompositeTypes, ctName) {
+			continue
+		}
+		deps = append(deps, mustRun(deleteVertexId).after(buildViewVertexId(v.SchemaQualifiedName, diffTypeDelete)))
+		if !dependsOnCompositeType(newViewsByName[v.GetName()].DependsOnCompositeTypes, ctName) {
+			// The view is replaced in place, which drops the reference to the type.
+			deps = append(deps, mustRun(deleteVertexId).after(buildTableVertexId(v.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, mv := range c.oldSchema.MaterializedViews {
+		if !dependsOnCompositeType(mv.DependsOnCompositeTypes, ctName) {
+			continue
+		}
+		deps = append(deps, mustRun(deleteVertexId).after(buildMaterializedViewVertexId(mv.SchemaQualifiedName, diffTypeDelete)))
+		if !dependsOnCompositeType(newMaterializedViewsByName[mv.GetName()].DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(deleteVertexId).after(buildMaterializedViewVertexId(mv.SchemaQualifiedName, diffTypeAddAlter)))
+		}
+	}
+	for _, other := range c.oldSchema.CompositeTypes {
+		if !dependsOnCompositeType(other.DependsOnCompositeTypes, ctName) {
+			continue
+		}
+		deps = append(deps, mustRun(deleteVertexId).after(buildCompositeTypeVertexId(other.SchemaQualifiedName, diffTypeDelete)))
+		// A composite type still typed with a re-created type is force re-created alongside it
+		// (see identifyCompositeTypesToRecreate), so the edge to its add/alter must be skipped:
+		// it would contradict compositeTypeDelete < typeDelete < typeAdd < compositeTypeAdd.
+		if !dependsOnCompositeType(newCompositeTypesByName[other.GetName()].DependsOnCompositeTypes, ctName) {
+			deps = append(deps, mustRun(deleteVertexId).after(buildCompositeTypeVertexId(other.SchemaQualifiedName, diffTypeAddAlter)))
 		}
 	}
 	return deps
@@ -247,13 +375,4 @@ func (c *compositeTypeSQLVertexGenerator) compositeTypeDepsForDelete(ct schema.C
 		deps = append(deps, mustRun(deleteVertexId).before(buildCompositeTypeVertexId(dep, diffTypeDelete)))
 	}
 	return deps
-}
-
-func consumerStillDependsOnType(deps []schema.SchemaQualifiedName, ctName string) bool {
-	for _, d := range deps {
-		if d.GetName() == ctName {
-			return true
-		}
-	}
-	return false
 }

@@ -16,7 +16,13 @@ has not been accepting external pull requests, so changes land on this fork's
 feature areas on top of it:
 
 - User-defined composite types (including nested and array dependencies) and
-  user-defined domains, with drop-and-recreate of dependent routines
+  user-defined domains, with drop-and-recreate of dependent routines.
+  A composite type's attributes are appended in place with `ALTER TYPE … ADD
+  ATTRIBUTE`; any other attribute change drops and re-creates the type, with
+  the views, materialized views, functions, procedures and other types that
+  reference it dropped first and created again afterwards. Changing a type a
+  table column uses is refused. Virtual generated columns (PostgreSQL 18) are
+  compared and re-created as virtual
 - `COMMENT ON` support for tables, views, materialized views, columns,
   routines, types, and domains
 - Privilege diffs (`GRANT`/`REVOKE`) for tables, views, materialized views,
@@ -30,6 +36,8 @@ feature areas on top of it:
   recreated composite types or domains), with dependent object re-creation
 - SQL-standard function bodies (`BEGIN ATOMIC`), canonical function and view
   definition comparison, plan validation with `check_function_bodies` disabled
+- Re-creation of the foreign keys backed by a re-created unique constraint or
+  primary key, which PostgreSQL otherwise refuses to drop
 - Schema-qualified object support, table persistence drift, ordering fixes
   (policies in their own vertex, routines after signature relations)
 

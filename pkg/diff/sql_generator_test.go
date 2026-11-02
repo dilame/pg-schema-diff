@@ -65,6 +65,18 @@ func TestBuildColumnDefinition(t *testing.T) {
 			expected: `"price_with_tax" numeric(10,2) GENERATED ALWAYS AS (price * 1.1) STORED NOT NULL`,
 		},
 		{
+			name: "Virtual generated column",
+			column: schema.Column{
+				Name:                 "unclaimed_amount",
+				Type:                 "numeric",
+				IsGenerated:          true,
+				GenerationIsVirtual:  true,
+				GenerationExpression: "amount * ((capacity - filled))::numeric",
+				IsNullable:           false,
+			},
+			expected: `"unclaimed_amount" numeric GENERATED ALWAYS AS (amount * ((capacity - filled))::numeric) VIRTUAL NOT NULL`,
+		},
+		{
 			name: "Regular column with NOT NULL",
 			column: schema.Column{
 				Name:       "email",
