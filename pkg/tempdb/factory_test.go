@@ -194,7 +194,8 @@ func (suite *onInstanceTempDbFactorySuite) TestCreate_CreateAndDropFlow() {
 		}
 	}
 	suite.Equal(internalschema.Schema{
-		NamedSchemas: []internalschema.NamedSchema{publicSchema},
+		NamedSchemas:                 []internalschema.NamedSchema{publicSchema},
+		NotNullConstraintsCatalogued: schema.NotNullConstraintsCatalogued,
 	}, schema)
 
 	// Drop database
