@@ -1,7 +1,7 @@
 -- name: GetSchemas :many
 SELECT
     pg_namespace.nspname::TEXT AS schema_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     COALESCE(
         pg_catalog.obj_description(pg_namespace.oid, 'pg_namespace'), ''
     )::TEXT AS description
@@ -9,9 +9,9 @@ FROM pg_catalog.pg_namespace
 INNER JOIN pg_catalog.pg_roles AS owner_role
     ON pg_namespace.nspowner = owner_role.oid
 WHERE
-    nspname NOT IN ('pg_catalog', 'information_schema')
-    AND nspname !~ '^pg_toast'
-    AND nspname !~ '^pg_temp'
+    pg_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND pg_namespace.nspname !~ '^pg_toast'
+    AND pg_namespace.nspname !~ '^pg_temp'
     -- Exclude schemas owned by extensions
     AND NOT EXISTS (
         SELECT depend.objid
@@ -59,14 +59,15 @@ WHERE pa.grantee_oid != pa.owner_oid OR pa.grantee_oid = 0
 ORDER BY pa.schema_name, grantee, pa.privilege_type;
 
 -- name: GetDefaultPrivileges :many
--- Returns one row per (default privilege rule, grantee, privilege) triple, i.e. one aclitem of
--- one schema-scoped `pg_default_acl` row. Only rules scoped to a schema
--- (`ALTER DEFAULT PRIVILEGES ... IN SCHEMA ...`, defaclnamespace != 0) are returned: a
--- database-wide rule is not attached to any schema, so it cannot be expressed by a
--- schema-scoped declarative source and would show up as spurious drift against a temporary
--- database.
--- Privileges granted to the rule's own target role are excluded: Postgres materializes the
--- object owner's implicit grants into defaclacl as soon as any explicit grant is added.
+-- Returns one row per (default privilege rule,
+-- grantee, privilege) triple, i.e. one aclitem of one schema-scoped
+-- `pg_default_acl` row. Only rules scoped to a schema (`ALTER DEFAULT
+-- PRIVILEGES ... IN SCHEMA ...`, defaclnamespace != 0) are returned: a
+-- database-wide rule is not attached to any schema, so it cannot be expressed
+-- by a schema-scoped declarative source and would show up as spurious drift
+-- against a temporary database. Privileges granted to the rule's own target
+-- role are excluded: Postgres materializes the object owner's implicit grants
+-- into defaclacl as soon as any explicit grant is added.
 WITH parsed_acl AS (
     SELECT
         defacl.defaclrole AS target_role_oid,
@@ -107,7 +108,7 @@ SELECT
     c.oid,
     c.relname::TEXT AS table_name,
     table_namespace.nspname::TEXT AS table_schema_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     c.relreplident::TEXT AS replica_identity,
     c.relrowsecurity AS rls_enabled,
     c.relforcerowsecurity AS rls_forced,
@@ -214,27 +215,28 @@ SELECT
         SELECT
             JSONB_BUILD_OBJECT(
                 'schema', proc_namespace.nspname,
-                'name', proc.proname,
+                'name', proc_relation.proname,
                 'identity_arguments',
-                pg_catalog.pg_get_function_identity_arguments(proc.oid)
+                pg_catalog.pg_get_function_identity_arguments(proc_relation.oid)
             )::TEXT
         FROM pg_catalog.pg_depend AS depend
         INNER JOIN
-            pg_catalog.pg_proc AS proc
+            pg_catalog.pg_proc AS proc_relation
             ON
                 depend.refclassid = 'pg_proc'::REGCLASS
-                AND depend.refobjid = proc.oid
+                AND depend.refobjid = proc_relation.oid
         INNER JOIN
             pg_catalog.pg_namespace AS proc_namespace
-            ON proc.pronamespace = proc_namespace.oid
+            ON proc_relation.pronamespace = proc_namespace.oid
         WHERE
             depend.classid = 'pg_attrdef'::REGCLASS
             AND depend.objid = d.oid
             AND depend.deptype = 'n'
     )::TEXT [] AS default_depends_on_functions,
     (a.attgenerated = 's') AS is_generated,
-    -- The functions the column's default calls, as JSON objects of schema, name and identity
-    -- arguments. PostgreSQL refuses to drop such a function while the default exists.
+    -- The functions the column's default calls, as JSON objects of schema, name
+    -- and identity arguments. PostgreSQL refuses to drop such a function while
+    -- the default exists.
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN
@@ -294,26 +296,27 @@ SELECT
         SELECT
             JSONB_BUILD_OBJECT(
                 'schema', proc_namespace.nspname,
-                'name', proc.proname,
+                'name', proc_relation.proname,
                 'identity_arguments',
-                pg_catalog.pg_get_function_identity_arguments(proc.oid)
+                pg_catalog.pg_get_function_identity_arguments(proc_relation.oid)
             )::TEXT
         FROM pg_catalog.pg_depend AS depend
         INNER JOIN
-            pg_catalog.pg_proc AS proc
+            pg_catalog.pg_proc AS proc_relation
             ON
                 depend.refclassid = 'pg_proc'::REGCLASS
-                AND depend.refobjid = proc.oid
+                AND depend.refobjid = proc_relation.oid
         INNER JOIN
             pg_catalog.pg_namespace AS proc_namespace
-            ON proc.pronamespace = proc_namespace.oid
+            ON proc_relation.pronamespace = proc_namespace.oid
         WHERE
             depend.classid = 'pg_class'::REGCLASS
             AND depend.objid = c.oid
             AND depend.deptype = 'n'
     )::TEXT [] AS depends_on_functions,
-    -- The functions the index's expressions or predicate call, as JSON objects of schema, name and
-    -- identity arguments. PostgreSQL refuses to drop such a function while the index exists.
+    -- The functions the index's expressions or predicate call, as JSON objects
+    -- of schema, name and identity arguments. PostgreSQL refuses to drop such a
+    -- function while the index exists.
     COALESCE(con.conislocal, false) AS constraint_is_local
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_index AS i ON (c.oid = i.indexrelid)
@@ -451,7 +454,7 @@ SELECT
     pg_proc.oid,
     pg_proc.proname::TEXT AS func_name,
     proc_namespace.nspname::TEXT AS func_schema_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     proc_lang.lanname::TEXT AS func_lang,
     COALESCE(
         pg_catalog.pg_get_function_result(pg_proc.oid), ''
@@ -466,7 +469,7 @@ SELECT
     ARRAY(
         SELECT
             JSON_BUILD_OBJECT(
-                'grantee', COALESCE(grantee_role.rolname, ''),
+                'grantee', COALESCE(role_r.rolname, ''),
                 'privilege', acl.privilege_type,
                 'is_grantable', acl.is_grantable
             )::TEXT
@@ -474,11 +477,12 @@ SELECT
             ACLEXPLODE(
                 COALESCE(pg_proc.proacl, ACLDEFAULT('f', pg_proc.proowner))
             ) AS acl
-        LEFT JOIN pg_catalog.pg_roles AS grantee_role
-            ON acl.grantee = grantee_role.oid
+        LEFT JOIN pg_catalog.pg_roles AS role_r
+            ON acl.grantee = role_r.oid
         WHERE acl.grantee != pg_proc.proowner OR acl.grantee = 0
-        ORDER BY COALESCE(grantee_role.rolname, ''), acl.privilege_type
-    )::TEXT [] AS privileges,
+        -- sqlfluff's RF01 cannot resolve an alias of a table function.
+        ORDER BY COALESCE(role_r.rolname, ''), acl.privilege_type -- noqa: RF01
+    )::TEXT [] AS privileges, -- noqa: RF04
     pg_catalog.pg_get_function_identity_arguments(
         pg_proc.oid
     ) AS func_identity_arguments,
@@ -558,9 +562,9 @@ WHERE
     (
         att.atttypid = sqlc.arg(type_oid)
         OR att.atttypid = (
-            SELECT typarray
+            SELECT pg_type.typarray
             FROM pg_catalog.pg_type
-            WHERE oid = sqlc.arg(type_oid)
+            WHERE pg_type.oid = sqlc.arg(type_oid)
         )
     )
     AND att.attnum > 0
@@ -624,8 +628,8 @@ SELECT
     ) AS func_identity_arguments,
     -- O (enabled), D (disabled), R (replica only) or A (always).
     pg_catalog.pg_get_triggerdef(trig.oid) AS trigger_def,
-    -- The functions the trigger calls, its own function and those its WHEN condition calls, as
-    -- JSON objects of schema, name and identity arguments.
+    -- The functions the trigger calls, its own function and those its WHEN
+    -- condition calls, as JSON objects of schema, name and identity arguments.
     trig.tgconstraint != 0 AS is_constraint
 FROM pg_catalog.pg_trigger AS trig
 INNER JOIN pg_catalog.pg_class AS owning_c ON trig.tgrelid = owning_c.oid
@@ -647,7 +651,7 @@ WHERE
 SELECT
     seq_c.relname::TEXT AS sequence_name,
     seq_ns.nspname::TEXT AS sequence_schema_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     COALESCE(owner_attr.attname, '')::TEXT AS owner_column_name,
     COALESCE(owner_ns.nspname, '')::TEXT AS owner_schema_name,
     COALESCE(owner_c.relname, '')::TEXT AS owner_table_name,
@@ -726,12 +730,13 @@ WHERE
     AND depend.deptype = 'n';
 
 -- name: GetDependsOnRelations :many
--- Returns the relations (tables, views, materialized views) the given object depends on, either
--- directly (`refclassid = 'pg_class'`, e.g. a policy's USING expression) or through a relation's
--- row type (`refclassid = 'pg_type'`, e.g. a function/procedure argument, its RETURNS type, or a
--- RETURNS TABLE column, including the row type's automatically-created array type such as
--- `some_table[]`).
--- Used to order a statement after the relations PostgreSQL resolves at that statement's CREATE
+-- Returns the relations (tables, views,
+-- materialized views) the given object depends on, either directly (`refclassid
+-- = 'pg_class'`, e.g. a policy's USING expression) or through a relation's row
+-- type (`refclassid = 'pg_type'`, e.g. a function/procedure argument, its
+-- RETURNS type, or a RETURNS TABLE column, including the row type's
+-- automatically-created array type such as `some_table[]`). Used to order a
+-- statement after the relations PostgreSQL resolves at that statement's CREATE
 -- time.
 SELECT DISTINCT
     pg_class.relname::TEXT AS relation_name,
@@ -775,12 +780,14 @@ WHERE
 
 
 -- name: GetDependsOnRelationColumns :many
--- Returns the individual relation columns the given object depends on. PostgreSQL records a
--- reference to a column (rather than the whole relation) for a SQL-standard body (`BEGIN ATOMIC`),
--- which resolves its references at CREATE time and writes each one to pg_depend with the column's
--- attribute number. A string-body SQL function records no such reference; nor does plpgsql, whose
--- body is not resolved at CREATE time. Used to drop and re-create a function before a column it
--- reads is altered or dropped.
+-- Returns the individual relation
+-- columns the given object depends on. PostgreSQL records a reference to a
+-- column (rather than the whole relation) for a SQL-standard body (`BEGIN
+-- ATOMIC`), which resolves its references at CREATE time and writes each one to
+-- pg_depend with the column's attribute number. A string-body SQL function
+-- records no such reference; nor does plpgsql, whose body is not resolved at
+-- CREATE time. Used to drop and re-create a function before a column it reads
+-- is altered or dropped.
 SELECT DISTINCT
     pg_class.relname::TEXT AS relation_name,
     relation_namespace.nspname::TEXT AS relation_schema_name,
@@ -829,9 +836,10 @@ WHERE
 
 
 -- name: GetCompositeTypes :many
--- Returns one row per (composite type, attribute) pair, ordered so that the consumer
--- can rebuild attribute lists in their declared order. Types with zero attributes still
--- get a single row with attribute_name = '' so the type itself is not lost.
+-- Returns one row per (composite type, attribute)
+-- pair, ordered so that the consumer can rebuild attribute lists in their
+-- declared order. Types with zero attributes still get a single row with
+-- attribute_name = '' so the type itself is not lost.
 SELECT
     pg_type.oid AS type_oid,
     rel.oid AS type_rel_oid,
@@ -852,9 +860,9 @@ INNER JOIN
     ON pg_type.typnamespace = type_namespace.oid
 INNER JOIN
     pg_catalog.pg_class AS rel
-    -- A user-defined composite type's underlying class has relkind = 'c'. Implicit
-    -- row types created for tables/views/sequences have relkind in ('r','p','v','m','S')
-    -- and must be excluded.
+    -- A user-defined composite type's underlying class has relkind = 'c'.
+    -- Implicit row types created for tables/views/sequences have relkind in
+    -- ('r','p','v','m','S') and must be excluded.
     ON pg_type.typrelid = rel.oid AND rel.relkind = 'c'
 LEFT JOIN
     pg_catalog.pg_attribute AS att
@@ -886,10 +894,10 @@ ORDER BY pg_type.oid, att.attnum;
 
 
 -- name: GetDomains :many
--- Returns the user-defined domains (typtype = 'd'). The base type is formatted
--- with its typmod (e.g. `numeric(10,2)`) so it round-trips through CREATE DOMAIN.
--- A collation is only reported when it differs from the base type's collation,
--- mirroring what pg_dump emits.
+-- Returns the user-defined domains (typtype = 'd'). The
+-- base type is formatted with its typmod (e.g. `numeric(10,2)`) so it
+-- round-trips through CREATE DOMAIN. A collation is only reported when it
+-- differs from the base type's collation, mirroring what pg_dump emits.
 SELECT
     pg_type.oid,
     pg_type.typname::TEXT AS domain_name,
@@ -939,12 +947,13 @@ ORDER BY pg_type.oid;
 
 
 -- name: GetDomainConstraints :many
--- Returns the CHECK constraints attached to the given domain. The definition is
--- taken verbatim from pg_get_constraintdef so that expressions (including calls
--- to user-defined functions and a trailing NOT VALID) round-trip exactly.
--- Only contype = 'c' is returned: since Postgres 18 a domain's NOT NULL is also a
--- pg_constraint row (contype = 'n'), and it is modelled separately so that the
--- extracted schema is identical across supported Postgres versions.
+-- Returns the CHECK constraints attached to
+-- the given domain. The definition is taken verbatim from pg_get_constraintdef
+-- so that expressions (including calls to user-defined functions and a trailing
+-- NOT VALID) round-trip exactly. Only contype = 'c' is returned: since Postgres
+-- 18 a domain's NOT NULL is also a pg_constraint row (contype = 'n'), and it is
+-- modelled separately so that the extracted schema is identical across
+-- supported Postgres versions.
 SELECT
     con.oid,
     con.conname::TEXT AS constraint_name,
@@ -960,7 +969,7 @@ ORDER BY con.conname;
 SELECT
     pg_type.typname::TEXT AS enum_name,
     type_namespace.nspname::TEXT AS enum_schema_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     (SELECT
         ARRAY_AGG(
             pg_enum.enumlabel
@@ -1054,7 +1063,7 @@ WHERE
 SELECT
     n.nspname::TEXT AS schema_name,
     c.relname::TEXT AS view_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     c.reloptions::TEXT [] AS rel_options,
     (
         SELECT
@@ -1101,16 +1110,16 @@ SELECT
             pg_catalog.pg_namespace AS dep_ns
             ON dep_c.relnamespace = dep_ns.oid
         -- Cast to text because pgv4/pq does not support unmarshalling JSON
-        -- arrays into []json.RawMessage.
-        -- Instead, they must be unmarshalled as string arrays.
-        -- https://github.com/lib/pq/pull/466
-        -- Only this object's own rewrite rule counts: `d.refobjid = c.oid` alone also matches the
-        -- rules of every other view that reads this one, which would report those readers as
-        -- dependencies of this object.
+        -- arrays into []json.RawMessage. Instead, they must be unmarshalled as
+        -- string arrays. https://github.com/lib/pq/pull/466 Only this object's
+        -- own rewrite rule counts: `d.refobjid = c.oid` alone also matches the
+        -- rules of every other view that reads this one, which would report
+        -- those readers as dependencies of this object.
         WHERE d.refobjid = c.oid AND r.ev_class = c.oid AND dep_c.oid != c.oid
     )::TEXT [] AS table_dependencies,
-    -- The view's output columns, in attribute order. The diff uses them to decide whether a
-    -- changed definition can be replaced in place or has to be dropped and re-created.
+    -- The view's output columns, in attribute order. The diff uses them to
+    -- decide whether a changed definition can be replaced in place or has to be
+    -- dropped and re-created.
     ARRAY(
         SELECT a.attname::TEXT
         FROM pg_catalog.pg_attribute AS a
@@ -1123,7 +1132,8 @@ SELECT
         WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
         ORDER BY a.attnum
     )::TEXT [] AS column_types,
-    -- The comments on the view's output columns, in attribute order; empty for none.
+    -- The comments on the view's output columns, in attribute order; empty for
+    -- none.
     ARRAY(
         SELECT COALESCE(pg_catalog.col_description(c.oid, a.attnum), '')
         FROM pg_catalog.pg_attribute AS a
@@ -1134,7 +1144,8 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
-    -- The view's rewrite rule: pg_depend records the functions the definition calls against it.
+    -- The view's rewrite rule: pg_depend records the functions the definition
+    -- calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
@@ -1160,10 +1171,11 @@ WHERE
 SELECT
     n.nspname::TEXT AS schema_name,
     c.relname::TEXT AS view_name,
-    owner_role.rolname::TEXT AS owner,
+    owner_role.rolname::TEXT AS owner, -- noqa: RF04
     c.reloptions::TEXT [] AS rel_options,
     COALESCE(ts.spcname, '')::TEXT AS tablespace_name,
-    -- The materialized view's output columns and their comments, in attribute order.
+    -- The materialized view's output columns and their comments, in attribute
+    -- order.
     ARRAY(
         SELECT a.attname::TEXT
         FROM pg_catalog.pg_attribute AS a
@@ -1228,20 +1240,19 @@ SELECT
             pg_catalog.pg_namespace AS dep_ns
             ON dep_c.relnamespace = dep_ns.oid
         -- Cast to text because pgv4/pq does not support unmarshalling JSON
-        -- arrays into []json.RawMessage.
-        -- Instead, they must be unmarshalled as string arrays.
-        -- https://github.com/lib/pq/pull/466
-        -- Only this object's own rewrite rule counts: `d.refobjid = c.oid` alone also matches the
-        -- rules of every other view that reads this one, which would report those readers as
-        -- dependencies of this object.
+        -- arrays into []json.RawMessage. Instead, they must be unmarshalled as
+        -- string arrays. https://github.com/lib/pq/pull/466 Only this object's
+        -- own rewrite rule counts: `d.refobjid = c.oid` alone also matches the
+        -- rules of every other view that reads this one, which would report
+        -- those readers as dependencies of this object.
         WHERE d.refobjid = c.oid AND r.ev_class = c.oid AND dep_c.oid != c.oid
     )::TEXT [] AS table_dependencies,
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
-    -- The materialized view's rewrite rule: pg_depend records the functions the definition calls
-    -- against it.
+    -- The materialized view's rewrite rule: pg_depend records the functions the
+    -- definition calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
@@ -1352,4 +1363,8 @@ LEFT JOIN pg_catalog.pg_roles AS grantee_role
 -- Exclude privileges granted to the table owner (these are implicit)
 WHERE pa.grantee_oid != pa.owner_oid OR pa.grantee_oid = 0
 ORDER BY
-    pa.table_schema_name, pa.table_name, pa.column_name, grantee, pa.privilege_type;
+    pa.table_schema_name,
+    pa.table_name,
+    pa.column_name,
+    grantee,
+    pa.privilege_type;
