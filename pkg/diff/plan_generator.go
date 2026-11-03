@@ -298,7 +298,41 @@ func assertValidPlan(ctx context.Context,
 		return fmt.Errorf("fetching schema from migrated database: %w", err)
 	}
 
-	return assertMigratedSchemaMatchesTarget(migratedSchema, newSchema, planOptions)
+	return assertMigratedSchemaMatchesTarget(migratedSchema, newSchema, currentSchema, planOptions)
+}
+
+// restoreNotNullConstraintLocality gives back the NOT NULL constraints of partitions the locality
+// they have in the schema the temporary database was reconstructed from. Recreating a partitioned
+// table's primary key on a partition is done with ADD CONSTRAINT ... USING INDEX, which makes the
+// partition's inherited NOT NULL constraint local; when the plan later drops the parent's NOT NULL,
+// PostgreSQL keeps that local constraint, although the database the plan was generated for had an
+// inherited one there and loses it with the parent's. The constraint itself, its name and the
+// column's nullability still come from the migrated database; only the locality is taken back.
+func restoreNotNullConstraintLocality(migrated, current schema.Schema) schema.Schema {
+	currentTablesByName := buildSchemaObjByNameMap(current.Tables)
+	tables := append([]schema.Table(nil), migrated.Tables...)
+	for i := range tables {
+		if tables[i].ParentTable == nil {
+			continue
+		}
+		currentTable, ok := currentTablesByName[tables[i].GetName()]
+		if !ok {
+			continue
+		}
+		currentColumnsByName := buildSchemaObjByNameMap(currentTable.Columns)
+		columns := append([]schema.Column(nil), tables[i].Columns...)
+		for j := range columns {
+			currentColumn, ok := currentColumnsByName[columns[j].Name]
+			if !ok || currentColumn.IsNullable || columns[j].IsNullable {
+				continue
+			}
+			columns[j].NotNullConstraintInherited = currentColumn.NotNullConstraintInherited
+			columns[j].NotNullConstraintName = currentColumn.NotNullConstraintName
+		}
+		tables[i].Columns = columns
+	}
+	migrated.Tables = tables
+	return migrated
 }
 
 func setMaxConnectionsIfNotSet(db *sql.DB, defaultMax int) {
@@ -399,11 +433,12 @@ func clearSkippedPrivileges(s schema.Schema) schema.Schema {
 	return s
 }
 
-func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema schema.Schema, planOptions *planOptions) error {
+func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema, currentSchema schema.Schema, planOptions *planOptions) error {
 	// Clear privileges from both schemas since privilege statements are skipped during validation
 	// (roles don't exist in temp DB). We make copies to avoid modifying the original schemas.
 	migratedSchema = clearSkippedPrivileges(migratedSchema)
 	targetSchema = clearSkippedPrivileges(targetSchema)
+	migratedSchema = restoreNotNullConstraintLocality(migratedSchema, currentSchema)
 
 	toTargetSchemaStmts, err := generateMigrationStatements(migratedSchema, targetSchema, planOptions)
 	if err != nil {

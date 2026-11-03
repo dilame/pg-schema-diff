@@ -827,7 +827,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving enum diff: %w", err)
 	}
 
-	attachPartitionGenerator := newAttachPartitionSQLVertexGenerator(diff.new.Tables, diff.new.Indexes, diff.tableDiffs.adds)
+	attachPartitionGenerator := newAttachPartitionSQLVertexGenerator(diff.new.Indexes, diff.tableDiffs.adds)
 	attachPartitionsPartialGraph, err := generatePartialGraph(legacyToNewSqlVertexGenerator[schema.Table, tableDiff](attachPartitionGenerator), diff.tableDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving attach partition diff: %w", err)
@@ -2313,12 +2313,6 @@ func (isg *indexSQLVertexGenerator) addIdxStmtsWithHazards(index schema.Index) (
 		return nil, fmt.Errorf("can't create an invalid index: %w", ErrNotImplemented)
 	}
 
-	if isg.attachPartitionSQLVertexGenerator.isIndexCreatedByTableAttach(index) {
-		// Attaching the partition to the base table created by the same plan creates this index and
-		// its constraint, exactly as the source schema had them.
-		return nil, nil
-	}
-
 	isOnPartitionedTable, err := isg.isIndexOnPartitionedTable(index)
 	if err != nil {
 		return nil, err
@@ -2883,7 +2877,6 @@ func getTargetColumns(targetColumnNames []string, columnsByName map[string]schem
 
 type attachPartitionSQLVertexGenerator struct {
 	indexesInNewSchemaByTableName map[string][]schema.Index
-	tablesInNewSchemaByName       map[string]schema.Table
 	addedTablesByName             map[string]schema.Table
 
 	// isPartitionAttachedAfterIdxBuildsByTableName is a map of table name to whether or not the table partition will be
@@ -2893,10 +2886,9 @@ type attachPartitionSQLVertexGenerator struct {
 	sqlVertexGenerator[schema.Table, tableDiff]
 }
 
-func newAttachPartitionSQLVertexGenerator(newSchemaTables []schema.Table, newSchemaIndexes []schema.Index, addedTables []schema.Table) *attachPartitionSQLVertexGenerator {
+func newAttachPartitionSQLVertexGenerator(newSchemaIndexes []schema.Index, addedTables []schema.Table) *attachPartitionSQLVertexGenerator {
 	asg := &attachPartitionSQLVertexGenerator{
 		indexesInNewSchemaByTableName: buildIndexesByTableNameMap(newSchemaIndexes),
-		tablesInNewSchemaByName:       buildSchemaObjByNameMap(newSchemaTables),
 		addedTablesByName:             buildSchemaObjByNameMap(addedTables),
 
 		isPartitionAttachedAfterIdxBuildsByTableName: make(map[string]bool),
@@ -2940,14 +2932,13 @@ func (a *attachPartitionSQLVertexGenerator) GetAddAlterDependencies(table, old s
 		mustRun(a.GetSQLVertexId(table, diffTypeAddAlter)).after(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)),
 	}
 
-	if a.isPartitionOfAddedBaseTable(table) {
-		// When the base table is created by the same plan, attach the partition after the base table's
-		// indexes are built: PostgreSQL then creates the child's index and constraint itself, exactly
-		// as it does for the source schema this plan reconstructs (a table created with the base
-		// table's primary key already in place). Creating them here as well would collide.
-		a.isPartitionAttachedAfterIdxBuildsByTableName[table.GetName()] = true
+	if _, baseTableIsNew := a.addedTablesByName[table.ParentTable.GetName()]; baseTableIsNew {
+		// If the base table is new, we should force the partition to be attached before we build any non-local indexes.
+		// This allows us to create fresh schemas where the base table has a PK but none of the children tables
+		// have the PK (this is useful when creating the fresh database schema for migration validation)
+		// If we attach the partition after the index is built, the index will be automatically built by Postgres
 		for _, idx := range a.indexesInNewSchemaByTableName[table.ParentTable.GetName()] {
-			deps = append(deps, mustRun(a.GetSQLVertexId(table, diffTypeAddAlter)).after(buildIndexVertexId(idx.GetSchemaQualifiedName(), diffTypeAddAlter)))
+			deps = append(deps, mustRun(a.GetSQLVertexId(table, diffTypeAddAlter)).before(buildIndexVertexId(idx.GetSchemaQualifiedName(), diffTypeAddAlter)))
 		}
 		return deps, nil
 	}
@@ -2961,55 +2952,6 @@ func (a *attachPartitionSQLVertexGenerator) GetAddAlterDependencies(table, old s
 
 func (a *attachPartitionSQLVertexGenerator) isPartitionAlreadyAttachedBeforeIndexBuilds(table schema.SchemaQualifiedName) bool {
 	return !a.isPartitionAttachedAfterIdxBuildsByTableName[table.GetName()]
-}
-
-// isPartitionOfAddedBaseTable reports whether the table is a partition and its parent is created by
-// the same plan.
-func (a *attachPartitionSQLVertexGenerator) isPartitionOfAddedBaseTable(table schema.Table) bool {
-	if table.ParentTable == nil {
-		return false
-	}
-	_, ok := a.addedTablesByName[table.ParentTable.GetName()]
-	return ok
-}
-
-// isIndexCreatedByTableAttach reports whether the index belongs to a partition of a table the plan
-// creates and corresponds to one of the parent's indexes: attaching the partition to the parent
-// creates the child index and its constraint, under the name PostgreSQL derives from the parent's.
-func (a *attachPartitionSQLVertexGenerator) isIndexCreatedByTableAttach(index schema.Index) bool {
-	table, ok := a.tablesInNewSchemaByName[index.OwningRelName.GetName()]
-	if !ok || !a.isPartitionOfAddedBaseTable(table) {
-		return false
-	}
-	for _, parentIndex := range a.indexesInNewSchemaByTableName[table.ParentTable.GetName()] {
-		if derivedChildIndexName(table, parentIndex) == index.Name {
-			return true
-		}
-	}
-	return false
-}
-
-// derivedChildIndexName returns the name PostgreSQL gives the index it creates on a partition when
-// the partition is attached (ChooseIndexName): the child table's name after the suffix the parent
-// index's kind picks — "pkey" for a primary key, the columns and "key" for a unique constraint, the
-// columns and "idx" for a plain index.
-func derivedChildIndexName(childTable schema.Table, parentIndex schema.Index) string {
-	childName := schema.UnescapeIdentifier(childTable.EscapedName)
-	suffix := strings.Join(parentIndex.Columns, "_")
-	if parentIndex.Constraint != nil {
-		if parentIndex.Constraint.Type == "p" {
-			suffix = "pkey"
-		} else {
-			suffix += "_key"
-		}
-	} else {
-		suffix += "_idx"
-	}
-	name := childName + "_" + suffix
-	if len(name) > maxPostgresIdentifierSize {
-		name = name[:maxPostgresIdentifierSize]
-	}
-	return name
 }
 
 func (a *attachPartitionSQLVertexGenerator) GetDeleteDependencies(_ schema.Table) ([]dependency, error) {
