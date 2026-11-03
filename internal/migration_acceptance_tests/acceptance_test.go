@@ -47,9 +47,13 @@ type (
 
 		// expectedHazardTypes should contain all the unique migration hazard types that are expected to be within the
 		// generated plan
-		expectedHazardTypes       []diff.MigrationHazardType
-		expectedPlanErrorIs       error
-		expectedPlanErrorContains string
+		expectedHazardTypes []diff.MigrationHazardType
+		// expectedHazardTypesBeforePG18, when non-nil, replaces expectedHazardTypes on servers before PostgreSQL 18.
+		// PostgreSQL 18 catalogues the names of NOT NULL constraints; before that a difference in the name alone is
+		// not part of the schema, so the plan it produces (and its hazards) is different.
+		expectedHazardTypesBeforePG18 []diff.MigrationHazardType
+		expectedPlanErrorIs           error
+		expectedPlanErrorContains     string
 		// expectedPlanDDL is used to assert the exact DDL (of the statements) that  generated. This is useful when asserting
 		// exactly how a migration is performed
 		expectedPlanDDL []string
@@ -131,6 +135,8 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	rootDb, err := sql.Open("pgx", engine.GetPostgresDatabaseDSN())
 	require.NoError(t, err)
 	defer rootDb.Close()
+	var serverVersionNum int
+	require.NoError(t, rootDb.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
 	for _, r := range tc.roles {
 		_, err := rootDb.Exec(fmt.Sprintf("CREATE ROLE %s", r))
 		require.NoError(t, err)
@@ -177,7 +183,11 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		// It shouldn't be necessary, but we'll run all checks below this point just in case rather than exiting early
 		assert.Empty(t, plan.Statements)
 	}
-	assert.ElementsMatch(t, tc.expectedHazardTypes, getUniqueHazardTypesFromStatements(plan.Statements), prettySprintPlan(plan))
+	expectedHazardTypes := tc.expectedHazardTypes
+	if tc.expectedHazardTypesBeforePG18 != nil && serverVersionNum < 180000 {
+		expectedHazardTypes = tc.expectedHazardTypesBeforePG18
+	}
+	assert.ElementsMatch(t, expectedHazardTypes, getUniqueHazardTypesFromStatements(plan.Statements), prettySprintPlan(plan))
 
 	// Apply the plan
 	require.NoError(t, applyPlan(oldDb, plan), prettySprintPlan(plan))

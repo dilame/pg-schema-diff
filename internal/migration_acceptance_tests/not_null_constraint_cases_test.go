@@ -61,10 +61,31 @@ var notNullConstraintCases = []acceptanceTestCase{
 			CREATE TABLE foo_1 PARTITION OF foo (id CONSTRAINT local_nn NOT NULL) FOR VALUES IN ('a');
 		`},
 		// The constraint is the partition's own, so it cannot be renamed in place: the plan detaches
-		// the partition, renames and attaches it back.
+		// the partition, renames and attaches it back. Before PostgreSQL 18 the name is not part of
+		// the schema at all, so no statement is emitted.
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
+		expectedHazardTypesBeforePG18: []diff.MigrationHazardType{},
+	},
+	{
+		name: "replace a partition's local NOT NULL constraint with the parent's",
+		oldSchemaDDL: []string{`
+			CREATE TABLE foo (id int, tag text) PARTITION BY LIST (tag);
+			CREATE TABLE foo_1 PARTITION OF foo (id NOT NULL) FOR VALUES IN ('a');
+		`},
+		newSchemaDDL: []string{`
+			CREATE TABLE foo (id int NOT NULL, tag text) PARTITION BY LIST (tag);
+			CREATE TABLE foo_1 PARTITION OF foo FOR VALUES IN ('a');
+		`},
+		// On PostgreSQL 18 the partition's constraint cannot be dropped while it is attached: the
+		// plan detaches the partition, re-creates the constraint under the parent's name and
+		// attaches it back. Earlier versions track no constraint name, so they only need the
+		// parent's SET NOT NULL.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
+		expectedHazardTypesBeforePG18: []diff.MigrationHazardType{},
 	},
 }
 
