@@ -1491,6 +1491,8 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 		expectedSchema = clearNotNullConstraintNames(expectedSchema)
 		fetchedSchema = clearNotNullConstraintNames(fetchedSchema)
 	}
+	// The flag reports what the server catalogues, not a fact of the expected schema.
+	expectedSchema.NotNullConstraintsCatalogued = fetchedSchema.NotNullConstraintsCatalogued
 	expectedNormalized := expectedSchema.Normalize()
 	fetchedNormalized := fetchedSchema.Normalize()
 	assert.Equal(t, expectedNormalized, fetchedNormalized, "expected=\n%# v \n fetched=%# v\n", pretty.Formatter(expectedNormalized), pretty.Formatter(fetchedNormalized))
