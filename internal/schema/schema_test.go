@@ -284,8 +284,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash:           "2585fa12d058419a",
-			expectedHashBeforePG15: "3c2aa716f60a8074",
+			expectedHash:           "9a5b2f53d1a84d4e",
+			expectedHashBeforePG15: "718610d24f9c20ac",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -467,8 +467,9 @@ var (
 							SchemaName:  "schema_2",
 							EscapedName: "\"foo\"",
 						},
-						ConstraintDef: "FOREIGN KEY (id, version) REFERENCES schema_2.foo(id, version) ON UPDATE CASCADE ON DELETE CASCADE NOT VALID",
-						IsValid:       false,
+						ConstraintDef:   "FOREIGN KEY (id, version) REFERENCES schema_2.foo(id, version) ON UPDATE CASCADE ON DELETE CASCADE NOT VALID",
+						IsValid:         false,
+						ReferencedIndex: SchemaQualifiedName{SchemaName: "schema_2", EscapedName: "\"foo_pkey\""},
 					},
 				},
 				Sequences: []Sequence{
@@ -708,9 +709,9 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash:           "c80e3b9576edfd5d",
-			expectedHashBeforePG18: "c95bbd3951b7fd8e",
-			expectedHashBeforePG15: "eaeaf875f90871d1",
+			expectedHash:           "b0b661c54294bff0",
+			expectedHashBeforePG18: "27ae25af296618d1",
+			expectedHashBeforePG15: "2016cda926a7259c",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -965,18 +966,20 @@ var (
 				},
 				ForeignKeyConstraints: []ForeignKeyConstraint{
 					{
-						EscapedName:   "\"foo_fk_fk\"",
-						OwningTable:   SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_fk\""},
-						ForeignTable:  SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
-						ConstraintDef: "FOREIGN KEY (author, id) REFERENCES foo(author, id) ON UPDATE CASCADE ON DELETE CASCADE",
-						IsValid:       true,
+						EscapedName:     "\"foo_fk_fk\"",
+						OwningTable:     SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_fk\""},
+						ForeignTable:    SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
+						ConstraintDef:   "FOREIGN KEY (author, id) REFERENCES foo(author, id) ON UPDATE CASCADE ON DELETE CASCADE",
+						IsValid:         true,
+						ReferencedIndex: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_pkey\""},
 					},
 					{
-						EscapedName:   "\"foo_fk_1_fk\"",
-						OwningTable:   SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_fk_1\""},
-						ForeignTable:  SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_1\""},
-						ConstraintDef: "FOREIGN KEY (author, content) REFERENCES foo_1(author, content) NOT VALID",
-						IsValid:       false,
+						EscapedName:     "\"foo_fk_1_fk\"",
+						OwningTable:     SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_fk_1\""},
+						ForeignTable:    SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_1\""},
+						ConstraintDef:   "FOREIGN KEY (author, content) REFERENCES foo_1(author, content) NOT VALID",
+						IsValid:         false,
+						ReferencedIndex: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_1_local_idx\""},
 					},
 				},
 				Sequences: []Sequence{

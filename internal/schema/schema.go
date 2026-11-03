@@ -155,6 +155,7 @@ func (s Schema) Normalize() Schema {
 
 func normalizeTable(t Table) Table {
 	t.DependsOnDomains = sortSchemaObjectsByName(t.DependsOnDomains)
+	t.DependsOnCompositeTypes = sortSchemaObjectsByName(t.DependsOnCompositeTypes)
 	// Don't normalize columns order. their order is derived from the postgres catalogs
 	// (relevant to data packing)
 	var normCheckConstraints []CheckConstraint
@@ -197,6 +198,7 @@ func normalizeView(v View) View {
 
 	v.Privileges = sortSchemaObjectsByName(v.Privileges)
 	v.DependsOnFunctions = sortSchemaObjectsByName(v.DependsOnFunctions)
+	v.DependsOnCompositeTypes = sortSchemaObjectsByName(v.DependsOnCompositeTypes)
 
 	return v
 }
@@ -209,6 +211,7 @@ func normalizeMaterializedView(mv MaterializedView) MaterializedView {
 	}
 	mv.TableDependencies = normTableDeps
 	mv.DependsOnFunctions = sortSchemaObjectsByName(mv.DependsOnFunctions)
+	mv.DependsOnCompositeTypes = sortSchemaObjectsByName(mv.DependsOnCompositeTypes)
 	mv.Privileges = sortSchemaObjectsByName(mv.Privileges)
 	return mv
 }
@@ -432,6 +435,11 @@ type Table struct {
 	// DependsOnDomains is the list of domains used as the type of at least one of the
 	// table's columns. The table must be created/altered after those domains exist.
 	DependsOnDomains []SchemaQualifiedName
+	// DependsOnCompositeTypes is the list of user-defined composite types used as the type of
+	// at least one of the table's columns (including through an array type). The table must be
+	// created/altered after those types exist, and a type cannot be dropped while a column of
+	// the table still uses it.
+	DependsOnCompositeTypes []SchemaQualifiedName
 }
 
 func (t Table) IsPartitioned() bool {
@@ -522,7 +530,10 @@ type (
 		//   (price * 1.1)
 		// Only populated if IsGenerated is true.
 		GenerationExpression string
-		IsNullable           bool
+		// GenerationIsVirtual reports a virtual generated column (PostgreSQL 18), computed on read
+		// instead of stored. IsGenerated is true for both kinds.
+		GenerationIsVirtual bool
+		IsNullable          bool
 		// NotNullConstraintName is the name of the column's own NOT NULL constraint when that name
 		// is not the one PostgreSQL generates by default for the column. An empty string means the
 		// default. PostgreSQL 18 catalogues NOT NULL constraints (contype = 'n'); earlier versions
@@ -670,6 +681,10 @@ type ForeignKeyConstraint struct {
 	IsValid       bool
 	// Description is the comment attached to the constraint (pg_description). Empty means no comment.
 	Description string
+	// ReferencedIndex is the unique index or primary-key constraint on ForeignTable that backs this
+	// foreign key (pg_constraint.conindid). PostgreSQL refuses to drop it while the foreign key
+	// exists, so the foreign key is dropped and re-created when that index is re-created.
+	ReferencedIndex SchemaQualifiedName
 }
 
 func (f ForeignKeyConstraint) GetName() string {
@@ -920,7 +935,12 @@ type View struct {
 	// them against the view's rewrite rule and refuses to drop such a function while the view
 	// exists, so the view is created after them and dropped before them.
 	DependsOnFunctions []SchemaQualifiedName
-	Privileges         []TablePrivilege
+	// DependsOnCompositeTypes is the list of user-defined composite types the view's definition
+	// references (a cast or a column of the type). PostgreSQL records them against the rewrite
+	// rule and refuses to drop such a type while the view exists, so the view is created after
+	// them and dropped before them.
+	DependsOnCompositeTypes []SchemaQualifiedName
+	Privileges              []TablePrivilege
 	// Description is the comment attached to the view (pg_description). Empty means no comment.
 	Description string
 }
@@ -956,6 +976,8 @@ type MaterializedView struct {
 	// DependsOnFunctions is the list of functions the materialized view's definition calls. See
 	// View.DependsOnFunctions.
 	DependsOnFunctions []SchemaQualifiedName
+	// DependsOnCompositeTypes — see View.DependsOnCompositeTypes.
+	DependsOnCompositeTypes []SchemaQualifiedName
 	// Privileges are the grants on the materialized view.
 	Privileges []TablePrivilege
 	// Description is the comment attached to the materialized view (pg_description). Empty means no comment.
@@ -1766,6 +1788,10 @@ func (s *schemaFetcher) buildTable(
 	if err != nil {
 		return Table{}, fmt.Errorf("fetchDependsOnDomains(%s): %w", table.Oid, err)
 	}
+	dependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_class", table.Oid)
+	if err != nil {
+		return Table{}, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", table.Oid, err)
+	}
 	var columns []Column
 	for _, column := range rawColumns {
 		defaultDependsOnFunctions, err := parseJSONFunctionNames(column.DefaultDependsOnFunctions)
@@ -1808,6 +1834,7 @@ func (s *schemaFetcher) buildTable(
 			Default:              column.DefaultValue,
 			IsGenerated:          column.IsGenerated,
 			GenerationExpression: column.GenerationExpression,
+			GenerationIsVirtual:  column.IsGeneratedVirtual,
 			Size:                 int(column.ColumnSize),
 			Identity:             identity,
 			Description:          column.Description,
@@ -1836,18 +1863,19 @@ func (s *schemaFetcher) buildTable(
 		EscapedName: EscapeIdentifier(table.TableName),
 	}
 	return Table{
-		SchemaQualifiedName: schemaQualifiedName,
-		Owner:               table.Owner,
-		Columns:             columns,
-		DependsOnDomains:    dependsOnDomains,
-		CheckConstraints:    checkConsByTable[schemaQualifiedName.GetFQEscapedName()],
-		Policies:            policiesByTable[schemaQualifiedName.GetFQEscapedName()],
-		Privileges:          privilegesByTable[schemaQualifiedName.GetFQEscapedName()],
-		ColumnPrivileges:    columnPrivilegesByTable[schemaQualifiedName.GetFQEscapedName()],
-		IsUnlogged:          table.IsUnlogged,
-		ReplicaIdentity:     ReplicaIdentity(table.ReplicaIdentity),
-		RLSEnabled:          table.RlsEnabled,
-		RLSForced:           table.RlsForced,
+		SchemaQualifiedName:     schemaQualifiedName,
+		Owner:                   table.Owner,
+		Columns:                 columns,
+		DependsOnDomains:        dependsOnDomains,
+		DependsOnCompositeTypes: dependsOnCompositeTypes,
+		CheckConstraints:        checkConsByTable[schemaQualifiedName.GetFQEscapedName()],
+		Policies:                policiesByTable[schemaQualifiedName.GetFQEscapedName()],
+		Privileges:              privilegesByTable[schemaQualifiedName.GetFQEscapedName()],
+		ColumnPrivileges:        columnPrivilegesByTable[schemaQualifiedName.GetFQEscapedName()],
+		IsUnlogged:              table.IsUnlogged,
+		ReplicaIdentity:         ReplicaIdentity(table.ReplicaIdentity),
+		RLSEnabled:              table.RlsEnabled,
+		RLSForced:               table.RlsForced,
 
 		PartitionKeyDef: table.PartitionKeyDef,
 
@@ -2097,9 +2125,10 @@ func (s *schemaFetcher) fetchForeignKeyCons(ctx context.Context) ([]ForeignKeyCo
 				SchemaName:  rawFkCon.ForeignTableSchemaName,
 				EscapedName: EscapeIdentifier(rawFkCon.ForeignTableName),
 			},
-			ConstraintDef: rawFkCon.ConstraintDef,
-			IsValid:       rawFkCon.IsValid,
-			Description:   rawFkCon.Description,
+			ConstraintDef:   rawFkCon.ConstraintDef,
+			IsValid:         rawFkCon.IsValid,
+			Description:     rawFkCon.Description,
+			ReferencedIndex: buildNameFromUnescaped(rawFkCon.ReferencedIndexName, rawFkCon.ReferencedIndexSchemaName),
 		})
 	}
 
@@ -2616,6 +2645,17 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", v.ViewName, err)
 		}
 
+		dependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_rewrite", v.RuleOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", v.ViewName, err)
+		}
+		// A composite type used as the type of an output column is recorded against the view's own
+		// relation, not only against its rewrite rule.
+		outputColumnDependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_class", v.ViewOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", v.ViewName, err)
+		}
+
 		schemaQualifiedName := buildNameFromUnescaped(v.ViewName, v.SchemaName)
 		views = append(views, View{
 			SchemaQualifiedName: schemaQualifiedName,
@@ -2626,8 +2666,10 @@ func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
 
 			TableDependencies:  tableDependencies,
 			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
-			Privileges:         privilegesByView[schemaQualifiedName.GetFQEscapedName()],
-			Description:        v.Description,
+			DependsOnCompositeTypes: dedupeSchemaQualifiedNames(append(
+				dependsOnCompositeTypes, outputColumnDependsOnCompositeTypes...)),
+			Privileges:  privilegesByView[schemaQualifiedName.GetFQEscapedName()],
+			Description: v.Description,
 		})
 	}
 
@@ -2692,6 +2734,17 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 			return nil, fmt.Errorf("fetchDependsOnFunctions(%s): %w", mv.ViewName, err)
 		}
 
+		dependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_rewrite", mv.RuleOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", mv.ViewName, err)
+		}
+		// A composite type used as the type of an output column is recorded against the
+		// materialized view's own relation, not only against its rewrite rule.
+		outputColumnDependsOnCompositeTypes, err := s.fetchDependsOnCompositeTypes(ctx, "pg_class", mv.ViewOid)
+		if err != nil {
+			return nil, fmt.Errorf("fetchDependsOnCompositeTypes(%s): %w", mv.ViewName, err)
+		}
+
 		schemaQualifiedName := buildNameFromUnescaped(mv.ViewName, mv.SchemaName)
 		materializedViews = append(materializedViews, MaterializedView{
 			SchemaQualifiedName: schemaQualifiedName,
@@ -2703,8 +2756,10 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 
 			TableDependencies:  tableDependencies,
 			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
-			Privileges:         privilegesByMaterializedView[schemaQualifiedName.GetFQEscapedName()],
-			Description:        mv.Description,
+			DependsOnCompositeTypes: dedupeSchemaQualifiedNames(append(
+				dependsOnCompositeTypes, outputColumnDependsOnCompositeTypes...)),
+			Privileges:  privilegesByMaterializedView[schemaQualifiedName.GetFQEscapedName()],
+			Description: mv.Description,
 		})
 	}
 

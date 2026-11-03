@@ -349,10 +349,16 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing indexes: %w", err)
 	}
+	// PostgreSQL refuses to drop a unique index or primary-key constraint while a foreign key
+	// depends on it, so the foreign keys backed by a re-created index are re-created around it.
+	recreatedIndexes := make(map[string]bool)
+	for _, idx := range indexesDiff.deletes {
+		recreatedIndexes[idx.GetName()] = true
+	}
 
 	fsg := newForeignKeyConstraintSQLVertexGenerator(oldAndNew[schema.Schema]{old: old, new: new}, tableDiffs)
 	foreignKeyConstraintDiffs, err := diffLists(old.ForeignKeyConstraints, new.ForeignKeyConstraints, func(old, new schema.ForeignKeyConstraint, _, _ int) (foreignKeyConstraintDiff, bool, error) {
-		return buildForeignKeyConstraintDiff(fsg, addedTablesByName, old, new)
+		return buildForeignKeyConstraintDiff(fsg, addedTablesByName, recreatedIndexes, old, new)
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing foreign key constraints: %w", err)
@@ -475,8 +481,15 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		return schemaDiff{}, false, fmt.Errorf("diffing triggers: %w", err)
 	}
 
+	// A view or materialized view whose definition references a composite type that is being
+	// re-created has to be dropped before the type and created again after it: PostgreSQL refuses
+	// the drop while the view still references the type, and the view's stored column types would
+	// otherwise keep naming the dropped type's OID. Mark those for recreation up front; the
+	// cascade below re-creates whatever reads them.
 	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View, _, _ int) (diff viewDiff, requiresRecreation bool, error error) {
-		if recreatedViews[new.GetName()] {
+		if recreatedViews[new.GetName()] ||
+			dependsOnAnyRecreatedType(old.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
+			dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) {
 			return viewDiff{}, true, nil
 		}
 		return buildViewDiff(deletedTablesByName, tableDiffsByName, old, new)
@@ -486,6 +499,10 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	}
 
 	materializedViewDiffs, err := diffLists(old.MaterializedViews, new.MaterializedViews, func(old, new schema.MaterializedView, _, _ int) (diff materializedViewDiff, requiresRecreation bool, error error) {
+		if dependsOnAnyRecreatedType(old.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
+			dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) {
+			return materializedViewDiff{}, true, nil
+		}
 		return buildMaterializedViewDiff(deletedTablesByName, tableDiffsByName, old, new)
 	})
 	if err != nil {
@@ -898,6 +915,9 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, domainsPartialGraph)
 
+	// The generator needs the same recreate-vs-alter decision the diffs were built with: a consumer
+	// that depends on a re-created type is re-created as well, and its create must not be ordered
+	// before that type's drop.
 	compositeTypesBeingRecreated, err := identifyCompositeTypesToRecreate(diff.old.CompositeTypes, diff.new.CompositeTypes, domainsBeingRecreated)
 	if err != nil {
 		return nil, fmt.Errorf("identifying composite types to recreate: %w", err)
@@ -1057,6 +1077,15 @@ func identifyCompositeTypesToRecreate(old, new []schema.CompositeType, recreated
 			continue
 		}
 		if !cmp.Equal(oldType.Attributes, newType.Attributes) {
+			// Appending attributes with ALTER TYPE keeps the type's OID, so nothing that references
+			// it has to be dropped — not even a table column: PostgreSQL accepts ADD ATTRIBUTE on
+			// a type a column uses. Only a layout ALTER cannot produce — a dropped, retyped,
+			// renamed or inserted attribute — needs the drop-and-recreate cascade (see
+			// appendedCompositeTypeAttributes for why the other operations are left out), and a
+			// type a table column uses cannot be dropped at all.
+			if _, appendOnly := appendedCompositeTypeAttributes(oldType.Attributes, newType.Attributes); appendOnly {
+				continue
+			}
 			if oldType.IsUsedByTable {
 				return nil, fmt.Errorf("changing attributes of composite type %s used by a table column: %w", newType.GetFQEscapedName(), ErrNotImplemented)
 			}
@@ -1828,9 +1857,9 @@ func (csg *columnSQLVertexGenerator) Add(column schema.Column) ([]Statement, err
 }
 
 func newColumnRequiresFullTableRewrite(column schema.Column) bool {
-	// Generated columns require computing the expression for every existing row, causing a full
-	// table rewrite.
-	if column.IsGenerated {
+	// A stored generated column requires computing the expression for every existing row, causing
+	// a full table rewrite. A virtual one is computed on read and only adds catalogue entries.
+	if column.IsGenerated && !column.GenerationIsVirtual {
 		return true
 	}
 	// Columns with defaults use PostgreSQL's "fast default" optimization (PostgreSQL 11+) for
@@ -2980,7 +3009,7 @@ func (a *attachPartitionSQLVertexGenerator) GetDeleteDependencies(_ schema.Table
 	return nil, nil
 }
 
-func buildForeignKeyConstraintDiff(fsg sqlVertexGenerator[schema.ForeignKeyConstraint, foreignKeyConstraintDiff], addedTablesByName map[string]schema.Table, old, new schema.ForeignKeyConstraint) (foreignKeyConstraintDiff, bool, error) {
+func buildForeignKeyConstraintDiff(fsg sqlVertexGenerator[schema.ForeignKeyConstraint, foreignKeyConstraintDiff], addedTablesByName map[string]schema.Table, recreatedIndexes map[string]bool, old, new schema.ForeignKeyConstraint) (foreignKeyConstraintDiff, bool, error) {
 	if _, isOnNewTable := addedTablesByName[new.OwningTable.GetName()]; isOnNewTable {
 		// If the owning table is new, then it must be re-created (this occurs if the base table has been
 		// re-created). In other words, a foreign key constraint must be re-created if the owning table or referenced
@@ -2989,6 +3018,12 @@ func buildForeignKeyConstraintDiff(fsg sqlVertexGenerator[schema.ForeignKeyConst
 	}
 	if _, isReferencingNewTable := addedTablesByName[new.ForeignTable.GetName()]; isReferencingNewTable {
 		// Same as above, but for the referenced table
+		return foreignKeyConstraintDiff{}, true, nil
+	}
+	if recreatedIndexes[old.ReferencedIndex.GetName()] {
+		// The unique index or primary-key constraint this foreign key uses is dropped and created
+		// again. PostgreSQL refuses the drop while the foreign key depends on it, so the foreign
+		// key is dropped before and created after, even though its definition does not change.
 		return foreignKeyConstraintDiff{}, true, nil
 	}
 	fkDiff := foreignKeyConstraintDiff{
@@ -3487,7 +3522,11 @@ func buildColumnDefinition(column schema.Column) (string, error) {
 		sb.WriteString(fmt.Sprintf(" COLLATE %s", column.Collation.GetFQEscapedName()))
 	}
 	if column.IsGenerated {
-		sb.WriteString(fmt.Sprintf(" GENERATED ALWAYS AS (%s) STORED", column.GenerationExpression))
+		generationKind := "STORED"
+		if column.GenerationIsVirtual {
+			generationKind = "VIRTUAL"
+		}
+		sb.WriteString(fmt.Sprintf(" GENERATED ALWAYS AS (%s) %s", column.GenerationExpression, generationKind))
 	} else if len(column.Default) > 0 {
 		sb.WriteString(fmt.Sprintf(" DEFAULT %s", column.Default))
 	}

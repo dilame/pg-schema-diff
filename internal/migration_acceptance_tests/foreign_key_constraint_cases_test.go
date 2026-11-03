@@ -925,6 +925,40 @@ var foreignKeyConstraintCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeIndexBuild,
 		},
 	},
+	{
+		name: "recreate a foreign key when the primary key it references is recreated",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT,
+                extra INT,
+                PRIMARY KEY (id)
+            );
+            CREATE TABLE "foobar fk"(
+                fk_id INT,
+                FOREIGN KEY (fk_id) REFERENCES foobar(id)
+            );
+      `,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT,
+                extra INT,
+                PRIMARY KEY (id) INCLUDE (extra)
+            );
+            CREATE TABLE "foobar fk"(
+                fk_id INT,
+                FOREIGN KEY (fk_id) REFERENCES foobar(id)
+            );
+      `,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeIndexDropped,
+			diff.MigrationHazardTypeIndexBuild,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
+	},
 }
 
 func TestForeignKeyConstraintTestCases(t *testing.T) {
