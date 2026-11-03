@@ -1523,9 +1523,9 @@ func fillPartitionNotNullConstraintNames(s Schema) Schema {
 			}
 			// The parent is filtered out of the expected schema; its own constraint carries the
 			// default name for the parent.
-			return UnescapeIdentifier(t.ParentTable.EscapedName) + "_" + column.Name + "_not_null"
+			return DefaultNotNullConstraintName(UnescapeIdentifier(t.ParentTable.EscapedName), column.Name)
 		}
-		return UnescapeIdentifier(t.EscapedName) + "_" + column.Name + "_not_null"
+		return DefaultNotNullConstraintName(UnescapeIdentifier(t.EscapedName), column.Name)
 	}
 
 	for i := range s.Tables {
@@ -1535,7 +1535,7 @@ func fillPartitionNotNullConstraintNames(s Schema) Schema {
 				continue
 			}
 			name := effectiveName(s.Tables[i], columns[j])
-			defaultName := UnescapeIdentifier(s.Tables[i].EscapedName) + "_" + columns[j].Name + "_not_null"
+			defaultName := DefaultNotNullConstraintName(UnescapeIdentifier(s.Tables[i].EscapedName), columns[j].Name)
 			if name == defaultName {
 				name = ""
 			}

@@ -1908,12 +1908,18 @@ func (s *schemaFetcher) fetchNotNullConstraints(ctx context.Context) (map[string
 	return byTable, nil
 }
 
+// DefaultNotNullConstraintName returns the name PostgreSQL generates for a NOT NULL constraint
+// created without an explicit name: "<table>_<column>_not_null", built from the unescaped names.
+func DefaultNotNullConstraintName(tableName, columnName string) string {
+	return fmt.Sprintf("%s_%s_not_null", tableName, columnName)
+}
+
 // notNullConstraintNameIfExplicit returns the constraint name unless it is the default one
 // PostgreSQL generates for that column. PostgreSQL and pg_dump omit the name when it is exactly
-// "<table>_<column>_not_null" (pg_dump compares against the untruncated name), so only a different
-// name is part of the schema and has to be reproduced by the plan.
+// the default (pg_dump compares against the untruncated name), so only a different name is part of
+// the schema and has to be reproduced by the plan.
 func notNullConstraintNameIfExplicit(name, tableName, columnName string) string {
-	if name == fmt.Sprintf("%s_%s_not_null", tableName, columnName) {
+	if name == DefaultNotNullConstraintName(tableName, columnName) {
 		return ""
 	}
 	return name

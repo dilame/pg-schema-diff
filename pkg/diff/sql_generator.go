@@ -2108,7 +2108,7 @@ func notNullConstraintName(tableName schema.SchemaQualifiedName, column schema.C
 	if column.NotNullConstraintName != "" {
 		return column.NotNullConstraintName
 	}
-	return fmt.Sprintf("%s_%s_not_null", schema.UnescapeIdentifier(tableName.EscapedName), column.Name)
+	return schema.DefaultNotNullConstraintName(schema.UnescapeIdentifier(tableName.EscapedName), column.Name)
 }
 
 func (csg *columnSQLVertexGenerator) generateTypeTransformationStatement(
