@@ -136,9 +136,11 @@ var notNullConstraintCases = []acceptanceTestCase{
 			CREATE TABLE foo_1 PARTITION OF foo (id NOT NULL) FOR VALUES IN ('a');
 		`},
 		// The parent's constraint would cascade under the parent's name; the partition's own
-		// constraint cannot simply be added beside it while attached.
+		// constraint cannot simply be added beside it while attached. Before 18 no locality is
+		// catalogued, and the names it would change are not part of the schema.
 		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
+		planErrorOnlyAfterPG18:    true,
 	},
 }
 
