@@ -2111,6 +2111,19 @@ func (q *Queries) GetSequences(ctx context.Context) ([]GetSequencesRow, error) {
 	return items, nil
 }
 
+const getServerVersionNum = `-- name: GetServerVersionNum :one
+SELECT CURRENT_SETTING('server_version_num')::INT
+`
+
+// The server's version, which decides whether NOT NULL constraints and
+// their locality are catalogued at all (PostgreSQL 18 and later).
+func (q *Queries) GetServerVersionNum(ctx context.Context) (int32, error) {
+	row := q.db.QueryRowContext(ctx, getServerVersionNum)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const getTablePrivileges = `-- name: GetTablePrivileges :many
 WITH parsed_acl AS (
     SELECT
