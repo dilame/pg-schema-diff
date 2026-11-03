@@ -66,10 +66,10 @@ var notNullConstraintCases = []acceptanceTestCase{
 		// the name is not part of the schema, so there is nothing to rename.
 		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
-        planErrorOnlyAfterPG18:    true,
-    },
-    {
-        name: "rename a partition's local NOT NULL constraint while the partition has a local primary key",
+		planErrorOnlyAfterPG18:    true,
+	},
+	{
+		name: "rename a partition's local NOT NULL constraint while the partition has a local primary key",
 		oldSchemaDDL: []string{`
 			CREATE TABLE foo (id int, tag text) PARTITION BY LIST (tag);
 			CREATE TABLE foo_1 PARTITION OF foo (id NOT NULL, PRIMARY KEY (id, tag)) FOR VALUES IN ('a');
@@ -78,7 +78,7 @@ var notNullConstraintCases = []acceptanceTestCase{
 			CREATE TABLE foo (id int, tag text) PARTITION BY LIST (tag);
 			CREATE TABLE foo_1 PARTITION OF foo (id CONSTRAINT local_nn NOT NULL, PRIMARY KEY (id, tag)) FOR VALUES IN ('a');
 		`},
-        expectedPlanErrorIs:       diff.ErrNotImplemented,
+		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
 		planErrorOnlyAfterPG18:    true,
 	},
@@ -95,10 +95,10 @@ var notNullConstraintCases = []acceptanceTestCase{
 		// A local-to-inherited transition on an attached partition needs the detach/attach dance.
 		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
-        planErrorOnlyAfterPG18:    true,
-    },
-    {
-        name: "rename a partitioned parent's NOT NULL constraint while the partition gets a local name",
+		planErrorOnlyAfterPG18:    true,
+	},
+	{
+		name: "rename a partitioned parent's NOT NULL constraint while the partition gets a local name",
 		oldSchemaDDL: []string{`
 			CREATE TABLE foo (id int CONSTRAINT old_nn NOT NULL, tag text) PARTITION BY LIST (tag);
 			CREATE TABLE foo_1 PARTITION OF foo FOR VALUES IN ('a');
@@ -107,7 +107,7 @@ var notNullConstraintCases = []acceptanceTestCase{
 			CREATE TABLE foo (id int CONSTRAINT new_nn NOT NULL, tag text) PARTITION BY LIST (tag);
 			CREATE TABLE foo_1 PARTITION OF foo (id CONSTRAINT local_nn NOT NULL) FOR VALUES IN ('a');
 		`},
-        expectedPlanErrorIs:       diff.ErrNotImplemented,
+		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
 		planErrorOnlyAfterPG18:    true,
 	},
@@ -123,10 +123,10 @@ var notNullConstraintCases = []acceptanceTestCase{
 		`},
 		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
-        planErrorOnlyAfterPG18:    true,
-    },
-    {
-        name: "partitioned parent gains NOT NULL while the partition declares its own",
+		planErrorOnlyAfterPG18:    true,
+	},
+	{
+		name: "partitioned parent gains NOT NULL while the partition declares its own",
 		oldSchemaDDL: []string{`
 			CREATE TABLE foo (id int, tag text) PARTITION BY LIST (tag);
 			CREATE TABLE foo_1 PARTITION OF foo FOR VALUES IN ('a');
@@ -135,9 +135,9 @@ var notNullConstraintCases = []acceptanceTestCase{
 			CREATE TABLE foo (id int NOT NULL, tag text) PARTITION BY LIST (tag);
 			CREATE TABLE foo_1 PARTITION OF foo (id NOT NULL) FOR VALUES IN ('a');
 		`},
-        // The parent's constraint would cascade under the parent's name; the partition's own
-        // constraint cannot simply be added beside it while attached.
-        expectedPlanErrorIs:       diff.ErrNotImplemented,
+		// The parent's constraint would cascade under the parent's name; the partition's own
+		// constraint cannot simply be added beside it while attached.
+		expectedPlanErrorIs:       diff.ErrNotImplemented,
 		expectedPlanErrorContains: `"public"."foo_1"`,
 	},
 }
