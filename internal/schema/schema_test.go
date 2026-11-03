@@ -24,6 +24,9 @@ type testCase struct {
 	// expectedHashBeforePG18 is used instead of expectedHash on servers before PostgreSQL 18, where
 	// NOT NULL constraints are not catalogued and the schema hash differs.
 	expectedHashBeforePG18 string
+	// expectedHashBeforePG15 is used instead of the above on servers before PostgreSQL 15, where
+	// the public schema has a different owner and privileges.
+	expectedHashBeforePG15 string
 	expectedErrIs          error
 	expectedErrContains    string
 }
@@ -281,7 +284,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "ea629d77f278478e",
+			expectedHash:           "ea629d77f278478e",
+			expectedHashBeforePG15: "eb35dc919b8dfda",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -706,6 +710,7 @@ var (
 		`},
 			expectedHash:           "5c94961f8c1552",
 			expectedHashBeforePG18: "beccefa166cfbaea",
+			expectedHashBeforePG15: "e5a5dcbc6a5289d4",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1298,7 +1303,8 @@ var (
 				CREATE TYPE pg_temp.color AS ENUM ('red', 'green', 'blue');
 			`},
 			// Assert empty schema hash, since we want to validate specifically that this hash is deterministic
-			expectedHash: "88672a4b111c43a5",
+			expectedHash:           "88672a4b111c43a5",
+			expectedHashBeforePG15: "868ef452ba32df31",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1471,6 +1477,11 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	expectedSchema := fillDefaultObjectOwners(testCase.expectedSchema)
 	var serverVersionNum int
 	require.NoError(t, connPool.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		// PostgreSQL 15 moved the public schema from the bootstrap superuser to pg_database_owner
+		// and cut its privileges down to PUBLIC's USAGE.
+		expectedSchema = replacePublicSchemaBeforePG15(expectedSchema)
+	}
 	if serverVersionNum >= 180000 {
 		// PostgreSQL 18 catalogues NOT NULL constraints and pg_dump prints their names; fill the
 		// ones a partition inherits from its parent.
@@ -1494,10 +1505,36 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	if serverVersionNum < 180000 && testCase.expectedHashBeforePG18 != "" {
 		expectedHash = testCase.expectedHashBeforePG18
 	}
+	if serverVersionNum < 150000 && testCase.expectedHashBeforePG15 != "" {
+		expectedHash = testCase.expectedHashBeforePG15
+	}
 	if expectedHash != "" {
 		// Optionally assert that the hash matches the expected hash
 		assert.Equal(t, expectedHash, fetchedSchemaHash)
 	}
+}
+
+// replacePublicSchemaBeforePG15 swaps the expected public schema for the one PostgreSQL 14 creates:
+// owned by the bootstrap superuser with PUBLIC's USAGE and CREATE. PostgreSQL 15 changed it to
+// pg_database_owner with USAGE only.
+func replacePublicSchemaBeforePG15(s Schema) Schema {
+	publicBeforePG15 := NamedSchema{
+		Name:        publicSchema.Name,
+		Description: publicSchema.Description,
+		Owner:       "postgres",
+		Privileges: []SchemaPrivilege{
+			{Grantee: "", Privilege: "USAGE", IsGrantable: false},
+			{Grantee: "", Privilege: "CREATE", IsGrantable: false},
+		},
+	}
+	namedSchemas := append([]NamedSchema(nil), s.NamedSchemas...)
+	for i := range namedSchemas {
+		if namedSchemas[i].Name == publicSchema.Name && namedSchemas[i].Owner == publicSchema.Owner {
+			namedSchemas[i] = publicBeforePG15
+		}
+	}
+	s.NamedSchemas = namedSchemas
+	return s
 }
 
 // fillPartitionNotNullConstraintNames sets the NOT NULL constraint names PostgreSQL 18 would report

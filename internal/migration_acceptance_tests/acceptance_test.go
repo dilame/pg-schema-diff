@@ -52,8 +52,12 @@ type (
 		// PostgreSQL 18 catalogues the names of NOT NULL constraints; before that a difference in the name alone is
 		// not part of the schema, so the plan it produces (and its hazards) is different.
 		expectedHazardTypesBeforePG18 []diff.MigrationHazardType
-		expectedPlanErrorIs           error
-		expectedPlanErrorContains     string
+		// oldSchemaDDLBeforePG15 and newSchemaDDLBeforePG15, when non-nil, replace oldSchemaDDL and newSchemaDDL
+		// on servers before PostgreSQL 15, when a fixture uses an option those versions do not have.
+		oldSchemaDDLBeforePG15    []string
+		newSchemaDDLBeforePG15    []string
+		expectedPlanErrorIs       error
+		expectedPlanErrorContains string
 		// expectedPlanDDL is used to assert the exact DDL (of the statements) that  generated. This is useful when asserting
 		// exactly how a migration is performed
 		expectedPlanDDL []string
@@ -107,9 +111,6 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	_, err := uuid.NewRandomFromReader(deterministicRandReader)
 	require.NoError(t, err)
 	tc.planOpts = append([]diff.PlanOpt{diff.WithLogger(log.SimpleLogger()), diff.WithRandReader(deterministicRandReader)}, tc.planOpts...)
-	if tc.expectedDBSchemaDDL == nil {
-		tc.expectedDBSchemaDDL = tc.newSchemaDDL
-	}
 	if tc.planFactory == nil {
 		tc.planFactory = func(ctx context.Context, connPool sqldb.Queryable, tempDbFactory tempdb.Factory, newSchemaDDL []string, opts ...diff.PlanOpt) (diff.Plan, error) {
 
@@ -137,6 +138,17 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	defer rootDb.Close()
 	var serverVersionNum int
 	require.NoError(t, rootDb.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		if tc.oldSchemaDDLBeforePG15 != nil {
+			tc.oldSchemaDDL = tc.oldSchemaDDLBeforePG15
+		}
+		if tc.newSchemaDDLBeforePG15 != nil {
+			tc.newSchemaDDL = tc.newSchemaDDLBeforePG15
+		}
+	}
+	if tc.expectedDBSchemaDDL == nil {
+		tc.expectedDBSchemaDDL = tc.newSchemaDDL
+	}
 	for _, r := range tc.roles {
 		_, err := rootDb.Exec(fmt.Sprintf("CREATE ROLE %s", r))
 		require.NoError(t, err)

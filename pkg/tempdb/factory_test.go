@@ -172,17 +172,29 @@ func (suite *onInstanceTempDbFactorySuite) TestCreate_CreateAndDropFlow() {
 	// Get the schema with the exclude options (it should be empty)
 	schema, err = internalschema.GetSchema(context.Background(), tempDb.ConnPool, tempDb.ExcludeMetadataOptions...)
 	suite.Require().NoError(err)
-	suite.Equal(internalschema.Schema{
-		NamedSchemas: []internalschema.NamedSchema{{
-			Name:        "public",
-			Description: "standard public schema",
-			Owner:       "pg_database_owner",
-			Privileges: []internalschema.SchemaPrivilege{{
-				Grantee:     "",
-				Privilege:   "USAGE",
-				IsGrantable: false,
-			}},
+	// PostgreSQL 15 moved the public schema from the bootstrap superuser to pg_database_owner and
+	// cut its privileges down to PUBLIC's USAGE.
+	publicSchema := internalschema.NamedSchema{
+		Name:        "public",
+		Description: "standard public schema",
+		Owner:       "pg_database_owner",
+		Privileges: []internalschema.SchemaPrivilege{{
+			Grantee:     "",
+			Privilege:   "USAGE",
+			IsGrantable: false,
 		}},
+	}
+	var serverVersionNum int
+	suite.Require().NoError(tempDb.ConnPool.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		publicSchema.Owner = "postgres"
+		publicSchema.Privileges = []internalschema.SchemaPrivilege{
+			{Grantee: "", Privilege: "CREATE", IsGrantable: false},
+			{Grantee: "", Privilege: "USAGE", IsGrantable: false},
+		}
+	}
+	suite.Equal(internalschema.Schema{
+		NamedSchemas: []internalschema.NamedSchema{publicSchema},
 	}, schema)
 
 	// Drop database

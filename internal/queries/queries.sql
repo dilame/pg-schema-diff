@@ -383,9 +383,10 @@ WHERE
     AND pg_constraint.conislocal;
 
 -- name: GetNotNullConstraints :many
--- Returns the NOT NULL constraints of every table. PostgreSQL 18 catalogues them in
--- pg_constraint (contype = 'n'); earlier versions have no such rows, so the result is empty
--- there and a NOT NULL column simply has no constraint name.
+-- Returns the NOT NULL constraints of every table. PostgreSQL 18
+-- catalogues them in pg_constraint (contype = 'n'); earlier versions
+-- have no such rows, so the result is empty there and a NOT NULL column
+-- simply has no constraint name.
 SELECT
     pg_constraint.conname::TEXT AS constraint_name,
     pg_class.relname::TEXT AS table_name,
@@ -399,8 +400,8 @@ INNER JOIN
 INNER JOIN
     pg_catalog.pg_attribute AS a
     ON
-        a.attrelid = pg_constraint.conrelid
-        AND a.attnum = pg_constraint.conkey[1]
+        pg_constraint.conrelid = a.attrelid
+        AND pg_constraint.conkey[1] = a.attnum
 WHERE
     table_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
     AND table_namespace.nspname !~ '^pg_toast'
