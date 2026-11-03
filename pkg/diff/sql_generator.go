@@ -1612,6 +1612,13 @@ func buildPartitionNotNullConstraintRenameGraph(oldSchema, newSchema schema.Sche
 			if !ok {
 				continue
 			}
+			// A child's constraint that carries exactly the parent's old and new name is inherited:
+			// renaming or re-creating the parent's constraint cascades to it, and PostgreSQL also
+			// refuses to touch it directly, so there is nothing to emit for the child.
+			if oldName == notNullConstraintName(*childDiff.new.ParentTable, oldParentColumn) &&
+				newName == notNullConstraintName(*childDiff.new.ParentTable, newParentColumn) {
+				continue
+			}
 			changes = append(changes, childNameChange{
 				column:    colDiff.new.Name,
 				oldName:   oldName,

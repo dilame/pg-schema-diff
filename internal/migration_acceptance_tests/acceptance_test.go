@@ -6,6 +6,7 @@ import (
 	"fmt"
 	stdlog "log"
 	"os"
+	"regexp"
 	"testing"
 
 	"github.com/google/uuid"
@@ -194,6 +195,15 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		for _, stmt := range plan.Statements {
 			generatedDDL = append(generatedDDL, stmt.DDL)
 		}
+		// PostgreSQL 15 qualifies a view's column references with the relation ("SELECT foo.id")
+		// where 16 and later omit the qualifier when it is unambiguous. The generated text is the
+		// server's deparse either way, so compare both sides in the same dialect.
+		for i := range tc.expectedPlanDDL {
+			tc.expectedPlanDDL[i] = canonicalizeViewDeparseQualifiers(tc.expectedPlanDDL[i])
+		}
+		for i := range generatedDDL {
+			generatedDDL[i] = canonicalizeViewDeparseQualifiers(generatedDDL[i])
+		}
 		// In the future, we might want to allow users to assert expectations for vanilla options and data packing
 		//
 		// We can also make the system more advanced by using tokens in place of the "randomly" generated UUIDs, such
@@ -213,6 +223,22 @@ func assertValidPlan(t *testing.T, plan diff.Plan) {
 		assert.Greater(t, stmt.Timeout.Nanoseconds(), int64(0), "timeout should be greater than 0. stmt=%+v", stmt)
 		assert.Greater(t, stmt.LockTimeout.Nanoseconds(), int64(0), "lock timeout should be greater than 0. stmt=%+v", stmt)
 	}
+}
+
+var (
+	viewStatementPrefix    = regexp.MustCompile(`^CREATE (OR REPLACE )?(MATERIALIZED )?VIEW `)
+	relationQualifierRegex = regexp.MustCompile(`(^|[^A-Za-z0-9_."])([A-Za-z_][A-Za-z0-9_]*)\.`)
+)
+
+// canonicalizeViewDeparseQualifiers removes the relation qualifier PostgreSQL 15 prints in a view
+// definition when PostgreSQL 16 and later leave it out. It is applied to both the expected and the
+// generated DDL, so the assertion keeps comparing the whole statement; only the deparse dialect,
+// which depends on the server version, is dropped.
+func canonicalizeViewDeparseQualifiers(ddl string) string {
+	if !viewStatementPrefix.MatchString(ddl) {
+		return ddl
+	}
+	return relationQualifierRegex.ReplaceAllString(ddl, "$1")
 }
 
 func directlyRunDDLAndGetDump(t *testing.T, engine *pgengine.Engine, ddl []string) string {
