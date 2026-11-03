@@ -1892,7 +1892,7 @@ func consumerPolicyFunctionDependencies(oldTable, newTable schema.Table) []depen
 			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 		}
 		for _, depRelation := range policy.DependsOnRelations {
-			if depRelation.GetName() == newTable.SchemaQualifiedName.GetName() {
+			if depRelation.GetName() == newTable.GetName() {
 				// The policy's own table; the table vertex already precedes its policies.
 				continue
 			}
@@ -1912,7 +1912,7 @@ func policyFunctionDeleteDependencies(table schema.Table) []dependency {
 			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)).before(buildFunctionVertexId(depFunction, diffTypeDelete)))
 		}
 		for _, depRelation := range policy.DependsOnRelations {
-			if depRelation.GetName() == table.SchemaQualifiedName.GetName() {
+			if depRelation.GetName() == table.GetName() {
 				continue
 			}
 			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)).before(buildRelationVertexId(depRelation, diffTypeDelete)))

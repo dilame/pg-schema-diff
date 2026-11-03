@@ -1624,6 +1624,9 @@ type GetNotNullConstraintsRow struct {
 	ColumnName      string
 }
 
+// Returns the NOT NULL constraints of every table. PostgreSQL 18 catalogues them in
+// pg_constraint (contype = 'n'); earlier versions have no such rows, so the result is empty
+// there and a NOT NULL column simply has no constraint name.
 func (q *Queries) GetNotNullConstraints(ctx context.Context) ([]GetNotNullConstraintsRow, error) {
 	rows, err := q.db.QueryContext(ctx, getNotNullConstraints)
 	if err != nil {
