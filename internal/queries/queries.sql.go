@@ -1594,6 +1594,72 @@ func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedVi
 	return items, nil
 }
 
+const getNotNullConstraints = `-- name: GetNotNullConstraints :many
+SELECT
+    pg_constraint.conname::TEXT AS constraint_name,
+    pg_class.relname::TEXT AS table_name,
+    table_namespace.nspname::TEXT AS table_schema_name,
+    a.attname::TEXT AS column_name,
+    pg_constraint.coninhcount
+FROM pg_catalog.pg_constraint
+INNER JOIN pg_catalog.pg_class ON pg_constraint.conrelid = pg_class.oid
+INNER JOIN
+    pg_catalog.pg_namespace AS table_namespace
+    ON pg_class.relnamespace = table_namespace.oid
+INNER JOIN
+    pg_catalog.pg_attribute AS a
+    ON
+        pg_constraint.conrelid = a.attrelid
+        AND pg_constraint.conkey[1] = a.attnum
+WHERE
+    table_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND table_namespace.nspname !~ '^pg_toast'
+    AND table_namespace.nspname !~ '^pg_temp'
+    AND pg_constraint.contype = 'n'
+`
+
+type GetNotNullConstraintsRow struct {
+	ConstraintName  string
+	TableName       string
+	TableSchemaName string
+	ColumnName      string
+	Coninhcount     int32
+}
+
+// Returns the NOT NULL constraints of every table. PostgreSQL 18
+// catalogues them in pg_constraint (contype = 'n'); earlier versions
+// have no such rows, so the result is empty there and a NOT NULL column
+// simply has no constraint name. coninhcount is non-zero when the
+// constraint is inherited from a partitioned parent.
+func (q *Queries) GetNotNullConstraints(ctx context.Context) ([]GetNotNullConstraintsRow, error) {
+	rows, err := q.db.QueryContext(ctx, getNotNullConstraints)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetNotNullConstraintsRow
+	for rows.Next() {
+		var i GetNotNullConstraintsRow
+		if err := rows.Scan(
+			&i.ConstraintName,
+			&i.TableName,
+			&i.TableSchemaName,
+			&i.ColumnName,
+			&i.Coninhcount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getPolicies = `-- name: GetPolicies :many
 WITH roles AS (
     SELECT
@@ -2043,6 +2109,19 @@ func (q *Queries) GetSequences(ctx context.Context) ([]GetSequencesRow, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const getServerVersionNum = `-- name: GetServerVersionNum :one
+SELECT CURRENT_SETTING('server_version_num')::INT
+`
+
+// The server's version, which decides whether NOT NULL constraints and
+// their locality are catalogued at all (PostgreSQL 18 and later).
+func (q *Queries) GetServerVersionNum(ctx context.Context) (int32, error) {
+	row := q.db.QueryRowContext(ctx, getServerVersionNum)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const getTablePrivileges = `-- name: GetTablePrivileges :many

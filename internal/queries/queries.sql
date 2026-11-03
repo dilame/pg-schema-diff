@@ -382,6 +382,39 @@ WHERE
     AND pg_constraint.contype = 'c'
     AND pg_constraint.conislocal;
 
+-- name: GetServerVersionNum :one
+-- The server's version, which decides whether NOT NULL constraints and
+-- their locality are catalogued at all (PostgreSQL 18 and later).
+SELECT CURRENT_SETTING('server_version_num')::INT;
+
+-- name: GetNotNullConstraints :many
+-- Returns the NOT NULL constraints of every table. PostgreSQL 18
+-- catalogues them in pg_constraint (contype = 'n'); earlier versions
+-- have no such rows, so the result is empty there and a NOT NULL column
+-- simply has no constraint name. coninhcount is non-zero when the
+-- constraint is inherited from a partitioned parent.
+SELECT
+    pg_constraint.conname::TEXT AS constraint_name,
+    pg_class.relname::TEXT AS table_name,
+    table_namespace.nspname::TEXT AS table_schema_name,
+    a.attname::TEXT AS column_name,
+    pg_constraint.coninhcount
+FROM pg_catalog.pg_constraint
+INNER JOIN pg_catalog.pg_class ON pg_constraint.conrelid = pg_class.oid
+INNER JOIN
+    pg_catalog.pg_namespace AS table_namespace
+    ON pg_class.relnamespace = table_namespace.oid
+INNER JOIN
+    pg_catalog.pg_attribute AS a
+    ON
+        pg_constraint.conrelid = a.attrelid
+        AND pg_constraint.conkey[1] = a.attnum
+WHERE
+    table_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND table_namespace.nspname !~ '^pg_toast'
+    AND table_namespace.nspname !~ '^pg_temp'
+    AND pg_constraint.contype = 'n';
+
 -- name: GetForeignKeyConstraints :many
 SELECT
     pg_constraint.conname::TEXT AS constraint_name,

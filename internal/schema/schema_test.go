@@ -20,9 +20,15 @@ type testCase struct {
 	ddl            []string
 	expectedSchema Schema
 	// expectedHash is the expected hash of the schema. If it is not provided, the test will not validate the hash.
-	expectedHash        string
-	expectedErrIs       error
-	expectedErrContains string
+	expectedHash string
+	// expectedHashBeforePG18 is used instead of expectedHash on servers before PostgreSQL 18, where
+	// NOT NULL constraints are not catalogued and the schema hash differs.
+	expectedHashBeforePG18 string
+	// expectedHashBeforePG15 is used instead of the above on servers before PostgreSQL 15, where
+	// the public schema has a different owner and privileges.
+	expectedHashBeforePG15 string
+	expectedErrIs          error
+	expectedErrContains    string
 }
 
 var (
@@ -278,7 +284,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "d2780fd411ecde18",
+			expectedHash:           "2585fa12d058419a",
+			expectedHashBeforePG15: "3c2aa716f60a8074",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -701,7 +708,9 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "460bdcd458ca38bf",
+			expectedHash:           "c80e3b9576edfd5d",
+			expectedHashBeforePG18: "c95bbd3951b7fd8e",
+			expectedHashBeforePG15: "eaeaf875f90871d1",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1294,7 +1303,8 @@ var (
 				CREATE TYPE pg_temp.color AS ENUM ('red', 'green', 'blue');
 			`},
 			// Assert empty schema hash, since we want to validate specifically that this hash is deterministic
-			expectedHash: "88672a4b111c43a5",
+			expectedHash:           "88672a4b111c43a5",
+			expectedHashBeforePG15: "868ef452ba32df31",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1465,6 +1475,24 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	}
 
 	expectedSchema := fillDefaultObjectOwners(testCase.expectedSchema)
+	var serverVersionNum int
+	require.NoError(t, connPool.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		// PostgreSQL 15 moved the public schema from the bootstrap superuser to pg_database_owner
+		// and cut its privileges down to PUBLIC's USAGE.
+		expectedSchema = replacePublicSchemaBeforePG15(expectedSchema)
+	}
+	if serverVersionNum >= 180000 {
+		// PostgreSQL 18 catalogues NOT NULL constraints and pg_dump prints their names; fill the
+		// ones a partition inherits from its parent.
+		expectedSchema = fillPartitionNotNullConstraintNames(expectedSchema)
+	} else {
+		// Before 18 there is nothing to compare: a NOT NULL column simply has no constraint name.
+		expectedSchema = clearNotNullConstraintNames(expectedSchema)
+		fetchedSchema = clearNotNullConstraintNames(fetchedSchema)
+	}
+	// The flag reports what the server catalogues, not a fact of the expected schema.
+	expectedSchema.NotNullConstraintsCatalogued = fetchedSchema.NotNullConstraintsCatalogued
 	expectedNormalized := expectedSchema.Normalize()
 	fetchedNormalized := fetchedSchema.Normalize()
 	assert.Equal(t, expectedNormalized, fetchedNormalized, "expected=\n%# v \n fetched=%# v\n", pretty.Formatter(expectedNormalized), pretty.Formatter(fetchedNormalized))
@@ -1475,10 +1503,97 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	require.NoError(t, err)
 	// same schemas should have the same hashes
 	assert.Equal(t, expectedSchemaHash, fetchedSchemaHash, "hash of expected schema should match fetched hash")
-	if testCase.expectedHash != "" {
-		// Optionally assert that the hash matches the expected hash
-		assert.Equal(t, testCase.expectedHash, fetchedSchemaHash)
+	expectedHash := testCase.expectedHash
+	if serverVersionNum < 180000 && testCase.expectedHashBeforePG18 != "" {
+		expectedHash = testCase.expectedHashBeforePG18
 	}
+	if serverVersionNum < 150000 && testCase.expectedHashBeforePG15 != "" {
+		expectedHash = testCase.expectedHashBeforePG15
+	}
+	if expectedHash != "" {
+		// Optionally assert that the hash matches the expected hash
+		assert.Equal(t, expectedHash, fetchedSchemaHash)
+	}
+}
+
+// replacePublicSchemaBeforePG15 swaps the expected public schema for the one PostgreSQL 14 creates:
+// owned by the bootstrap superuser with PUBLIC's USAGE and CREATE. PostgreSQL 15 changed it to
+// pg_database_owner with USAGE only.
+func replacePublicSchemaBeforePG15(s Schema) Schema {
+	publicBeforePG15 := NamedSchema{
+		Name:        publicSchema.Name,
+		Description: publicSchema.Description,
+		Owner:       "postgres",
+		Privileges: []SchemaPrivilege{
+			{Grantee: "", Privilege: "USAGE", IsGrantable: false},
+			{Grantee: "", Privilege: "CREATE", IsGrantable: false},
+		},
+	}
+	namedSchemas := append([]NamedSchema(nil), s.NamedSchemas...)
+	for i := range namedSchemas {
+		if namedSchemas[i].Name == publicSchema.Name && namedSchemas[i].Owner == publicSchema.Owner {
+			namedSchemas[i] = publicBeforePG15
+		}
+	}
+	s.NamedSchemas = namedSchemas
+	return s
+}
+
+// fillPartitionNotNullConstraintNames marks the NOT NULL constraints PostgreSQL 18 reports on
+// partitions: a column whose parent has a NOT NULL constraint inherits it (the name is the
+// parent's fact and is not stored on the child), while a constraint the child declares itself
+// belongs to the child.
+func fillPartitionNotNullConstraintNames(s Schema) Schema {
+	tablesByName := make(map[string]Table, len(s.Tables))
+	for _, t := range s.Tables {
+		tablesByName[t.GetName()] = t
+	}
+
+	for i := range s.Tables {
+		table := s.Tables[i]
+		if table.ParentTable == nil {
+			continue
+		}
+		parent, parentKnown := tablesByName[table.ParentTable.GetName()]
+		parentColumns := make(map[string]Column, len(parent.Columns))
+		for _, parentColumn := range parent.Columns {
+			parentColumns[parentColumn.Name] = parentColumn
+		}
+
+		columns := append([]Column(nil), table.Columns...)
+		for j := range columns {
+			if columns[j].IsNullable {
+				continue
+			}
+			if columns[j].NotNullConstraintName != "" {
+				// The child's own constraint; keep its name.
+				continue
+			}
+			if !parentKnown {
+				// The parent is filtered out of the expected schema; the constraint exists only
+				// because the parent has one.
+				columns[j].NotNullConstraintInherited = true
+				continue
+			}
+			if parentColumn, ok := parentColumns[columns[j].Name]; ok && !parentColumn.IsNullable {
+				columns[j].NotNullConstraintInherited = true
+			}
+		}
+		s.Tables[i].Columns = columns
+	}
+	return s
+}
+
+func clearNotNullConstraintNames(s Schema) Schema {
+	for i := range s.Tables {
+		columns := append([]Column(nil), s.Tables[i].Columns...)
+		for j := range columns {
+			columns[j].NotNullConstraintName = ""
+			columns[j].NotNullConstraintInherited = false
+		}
+		s.Tables[i].Columns = columns
+	}
+	return s
 }
 
 func fillDefaultObjectOwners(s Schema) Schema {
@@ -1602,5 +1717,84 @@ func TestTriggerDefStmtToCreateOrReplace(t *testing.T) {
 				require.Equal(t, tc.out, out)
 			}
 		})
+	}
+}
+
+func TestNotNullConstraintNames(t *testing.T) {
+	engine, err := pgengine.StartEngine()
+	require.NoError(t, err)
+	defer engine.Close()
+	db, err := engine.CreateDatabase()
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.DropDB())
+	}()
+
+	conn, err := sql.Open("pgx", db.GetDSN())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, conn.Close())
+	}()
+	for _, stmt := range []string{
+		`CREATE TABLE nn_parent (id int, tag text, PRIMARY KEY (id, tag)) PARTITION BY LIST (tag)`,
+		`CREATE TABLE nn_child PARTITION OF nn_parent FOR VALUES IN ('a')`,
+		`CREATE TABLE nn_local_child PARTITION OF nn_parent (tag NOT NULL) FOR VALUES IN ('b')`,
+		`CREATE TABLE nn_local (id int, flag text CONSTRAINT custom_nn NOT NULL)`,
+		`CREATE TABLE nn_plain (id int NOT NULL)`,
+	} {
+		_, err := conn.Exec(stmt)
+		require.NoError(t, err)
+	}
+
+	s, err := GetSchema(context.Background(), conn)
+	require.NoError(t, err)
+
+	var serverVersionNum int
+	require.NoError(t, conn.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+
+	// The name and the owner of every NOT NULL constraint: PostgreSQL 18 catalogues them, a
+	// partition inherits its parent's constraint (whose name is the parent's fact and is not stored
+	// on the child), and a constraint the child declares itself stays local. The name PostgreSQL
+	// generates for a column — "<table>_<column>_not_null" — is never reported, because PostgreSQL
+	// and pg_dump omit it. Before 18 there are no constraints to report at all.
+	type notNullExpectation struct {
+		name      string
+		inherited bool
+	}
+	expected := map[string]map[string]notNullExpectation{
+		"public.nn_parent": {
+			"id": {name: "", inherited: false}, "tag": {name: "", inherited: false},
+		},
+		"public.nn_child": {
+			"id": {name: "", inherited: true}, "tag": {name: "", inherited: true},
+		},
+		"public.nn_local_child": {
+			"id": {name: "", inherited: true}, "tag": {name: "", inherited: false},
+		},
+		"public.nn_local": {"id": {name: ""}, "flag": {name: "custom_nn"}},
+		"public.nn_plain": {"id": {name: ""}},
+	}
+	if serverVersionNum < 180000 {
+		for table, columns := range expected {
+			for column := range columns {
+				expected[table][column] = notNullExpectation{}
+			}
+		}
+	}
+
+	for _, table := range s.Tables {
+		tableName := "public." + UnescapeIdentifier(table.EscapedName)
+		expectedColumns, ok := expected[tableName]
+		if !ok {
+			continue
+		}
+		for _, column := range table.Columns {
+			expectedName, ok := expectedColumns[column.Name]
+			if !ok {
+				continue
+			}
+			assert.Equal(t, expectedName.name, column.NotNullConstraintName, "%s.%s name", tableName, column.Name)
+			assert.Equal(t, expectedName.inherited, column.NotNullConstraintInherited, "%s.%s inherited", tableName, column.Name)
+		}
 	}
 }

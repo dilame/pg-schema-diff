@@ -451,10 +451,11 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             -- check constraint
             ALTER TABLE foobar ADD CONSTRAINT some_check_constraint CHECK ( LENGTH(fizz) > 0 );
             -- partitions
-            CREATE TABLE foobar_1 PARTITION OF foobar FOR VALUES IN ('foo_1');
-            CREATE TABLE foobar_2 PARTITION OF foobar(
+            CREATE TABLE foobar_1 PARTITION OF foobar(
+                foo NOT NULL,
                 bar NOT NULL
-            ) FOR VALUES IN ('foo_2');
+            ) FOR VALUES IN ('foo_1');
+            CREATE TABLE foobar_2 PARTITION OF foobar FOR VALUES IN ('foo_2');
             CREATE TABLE foobar_3 PARTITION OF foobar FOR VALUES IN ('foo_3');
             -- partitioned indexes
             CREATE UNIQUE INDEX foobar_some_idx ON foobar(foo, fizz);
@@ -719,6 +720,12 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE schema_1.foobar ADD CONSTRAINT foobar_fk FOREIGN KEY (foo, bar) REFERENCES foobar_fk(foo, bar);
 			`,
 		},
+		// The re-created table becomes a partition whose NOT NULL constraints are the parent's,
+		// while the existing table carries its own; turning one into the other on an attached
+		// partition is refused.
+		expectedPlanErrorIs:       diff.ErrNotImplemented,
+		expectedPlanErrorContains: `"schema_2"."foobar_1"`,
+		planErrorOnlyAfterPG18:    true,
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeDeletesData,
 		},

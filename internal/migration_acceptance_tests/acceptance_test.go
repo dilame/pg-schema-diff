@@ -6,6 +6,8 @@ import (
 	"fmt"
 	stdlog "log"
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -46,7 +48,18 @@ type (
 
 		// expectedHazardTypes should contain all the unique migration hazard types that are expected to be within the
 		// generated plan
-		expectedHazardTypes       []diff.MigrationHazardType
+		expectedHazardTypes []diff.MigrationHazardType
+		// expectedHazardTypesBeforePG18, when non-nil, replaces expectedHazardTypes on servers before PostgreSQL 18.
+		// PostgreSQL 18 catalogues the names of NOT NULL constraints; before that a difference in the name alone is
+		// not part of the schema, so the plan it produces (and its hazards) is different.
+		expectedHazardTypesBeforePG18 []diff.MigrationHazardType
+		// oldSchemaDDLBeforePG15 and newSchemaDDLBeforePG15, when non-nil, replace oldSchemaDDL and newSchemaDDL
+		// on servers before PostgreSQL 15, when a fixture uses an option those versions do not have.
+		oldSchemaDDLBeforePG15 []string
+		newSchemaDDLBeforePG15 []string
+		// planErrorOnlyAfterPG18 asserts that no error is expected before PostgreSQL 18, where NOT NULL
+		// constraints are not catalogued and the name a case exercises is not part of the schema.
+		planErrorOnlyAfterPG18    bool
 		expectedPlanErrorIs       error
 		expectedPlanErrorContains string
 		// expectedPlanDDL is used to assert the exact DDL (of the statements) that  generated. This is useful when asserting
@@ -102,9 +115,6 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	_, err := uuid.NewRandomFromReader(deterministicRandReader)
 	require.NoError(t, err)
 	tc.planOpts = append([]diff.PlanOpt{diff.WithLogger(log.SimpleLogger()), diff.WithRandReader(deterministicRandReader)}, tc.planOpts...)
-	if tc.expectedDBSchemaDDL == nil {
-		tc.expectedDBSchemaDDL = tc.newSchemaDDL
-	}
 	if tc.planFactory == nil {
 		tc.planFactory = func(ctx context.Context, connPool sqldb.Queryable, tempDbFactory tempdb.Factory, newSchemaDDL []string, opts ...diff.PlanOpt) (diff.Plan, error) {
 
@@ -130,6 +140,19 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	rootDb, err := sql.Open("pgx", engine.GetPostgresDatabaseDSN())
 	require.NoError(t, err)
 	defer rootDb.Close()
+	var serverVersionNum int
+	require.NoError(t, rootDb.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		if tc.oldSchemaDDLBeforePG15 != nil {
+			tc.oldSchemaDDL = tc.oldSchemaDDLBeforePG15
+		}
+		if tc.newSchemaDDLBeforePG15 != nil {
+			tc.newSchemaDDL = tc.newSchemaDDLBeforePG15
+		}
+	}
+	if tc.expectedDBSchemaDDL == nil {
+		tc.expectedDBSchemaDDL = tc.newSchemaDDL
+	}
 	for _, r := range tc.roles {
 		_, err := rootDb.Exec(fmt.Sprintf("CREATE ROLE %s", r))
 		require.NoError(t, err)
@@ -160,7 +183,11 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	}(tempDbFactory)
 
 	plan, err := tc.planFactory(context.Background(), oldDBConnPool, tempDbFactory, tc.newSchemaDDL, tc.planOpts...)
-	if tc.expectedPlanErrorIs != nil || len(tc.expectedPlanErrorContains) > 0 {
+	expectPlanError := tc.expectedPlanErrorIs != nil || len(tc.expectedPlanErrorContains) > 0
+	if tc.planErrorOnlyAfterPG18 && serverVersionNum < 180000 {
+		expectPlanError = false
+	}
+	if expectPlanError {
 		if tc.expectedPlanErrorIs != nil {
 			assert.ErrorIs(t, err, tc.expectedPlanErrorIs)
 		}
@@ -176,7 +203,11 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		// It shouldn't be necessary, but we'll run all checks below this point just in case rather than exiting early
 		assert.Empty(t, plan.Statements)
 	}
-	assert.ElementsMatch(t, tc.expectedHazardTypes, getUniqueHazardTypesFromStatements(plan.Statements), prettySprintPlan(plan))
+	expectedHazardTypes := tc.expectedHazardTypes
+	if tc.expectedHazardTypesBeforePG18 != nil && serverVersionNum < 180000 {
+		expectedHazardTypes = tc.expectedHazardTypesBeforePG18
+	}
+	assert.ElementsMatch(t, expectedHazardTypes, getUniqueHazardTypesFromStatements(plan.Statements), prettySprintPlan(plan))
 
 	// Apply the plan
 	require.NoError(t, applyPlan(oldDb, plan), prettySprintPlan(plan))
@@ -193,6 +224,15 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		var generatedDDL []string
 		for _, stmt := range plan.Statements {
 			generatedDDL = append(generatedDDL, stmt.DDL)
+		}
+		// PostgreSQL 15 qualifies a view's column references with the relation ("SELECT foo.id")
+		// where 16 and later omit the qualifier when it is unambiguous. The generated text is the
+		// server's deparse either way, so compare both sides in the same dialect.
+		for i := range tc.expectedPlanDDL {
+			tc.expectedPlanDDL[i] = canonicalizeViewDeparseQualifiers(serverVersionNum, tc.expectedPlanDDL[i])
+		}
+		for i := range generatedDDL {
+			generatedDDL[i] = canonicalizeViewDeparseQualifiers(serverVersionNum, generatedDDL[i])
 		}
 		// In the future, we might want to allow users to assert expectations for vanilla options and data packing
 		//
@@ -213,6 +253,35 @@ func assertValidPlan(t *testing.T, plan diff.Plan) {
 		assert.Greater(t, stmt.Timeout.Nanoseconds(), int64(0), "timeout should be greater than 0. stmt=%+v", stmt)
 		assert.Greater(t, stmt.LockTimeout.Nanoseconds(), int64(0), "lock timeout should be greater than 0. stmt=%+v", stmt)
 	}
+}
+
+var (
+	viewStatementPrefix = regexp.MustCompile(`^CREATE (OR REPLACE )?(MATERIALIZED )?VIEW `)
+	// viewFromItemRegex captures a FROM or JOIN item: the relation name, optionally schema-qualified
+	// and quoted.
+	viewFromItemRegex = regexp.MustCompile(`(?i)\b(?:from|join)\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)[^A-Za-z0-9_".]`)
+)
+
+// canonicalizeViewDeparseQualifiers removes the relation qualifier PostgreSQL 15 and earlier print
+// in a view definition when PostgreSQL 16 and later leave it out ("SELECT foobar.id" against
+// "SELECT id"). Only qualifiers naming a relation in the statement's own FROM/JOIN items are
+// removed — never a schema qualifier and never anything on 16 or later; the expected and the
+// generated DDL are put in the same deparse dialect before they are compared.
+func canonicalizeViewDeparseQualifiers(serverVersionNum int, ddl string) string {
+	if serverVersionNum >= 160000 || !viewStatementPrefix.MatchString(ddl) {
+		return ddl
+	}
+	seen := make(map[string]bool)
+	for _, match := range viewFromItemRegex.FindAllStringSubmatch(ddl, -1) {
+		parts := strings.Split(match[1], ".")
+		name := strings.Trim(parts[len(parts)-1], `"`)
+		seen[name] = true
+	}
+	for name := range seen {
+		qualifier := regexp.MustCompile(`(^|[^A-Za-z0-9_."])` + regexp.QuoteMeta(name) + `\.`)
+		ddl = qualifier.ReplaceAllString(ddl, "$1")
+	}
+	return ddl
 }
 
 func directlyRunDDLAndGetDump(t *testing.T, engine *pgengine.Engine, ddl []string) string {
