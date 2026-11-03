@@ -284,7 +284,7 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash:           "ea629d77f278478e",
+			expectedHash:           "2585fa12d058419a",
 			expectedHashBeforePG15: "eb35dc919b8dfda",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
@@ -708,8 +708,8 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash:           "5c94961f8c1552",
-			expectedHashBeforePG18: "beccefa166cfbaea",
+			expectedHash:           "c80e3b9576edfd5d",
+			expectedHashBeforePG18: "c95bbd3951b7fd8e",
 			expectedHashBeforePG15: "e5a5dcbc6a5289d4",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
@@ -1537,46 +1537,45 @@ func replacePublicSchemaBeforePG15(s Schema) Schema {
 	return s
 }
 
-// fillPartitionNotNullConstraintNames sets the NOT NULL constraint names PostgreSQL 18 would report
-// for the expected schema: a partition inherits its parent's name, while a NOT NULL constraint the
-// child declares itself takes the child's default name, which pg_dump omits.
+// fillPartitionNotNullConstraintNames marks the NOT NULL constraints PostgreSQL 18 reports on
+// partitions: a column whose parent has a NOT NULL constraint inherits it (the name is the
+// parent's fact and is not stored on the child), while a constraint the child declares itself
+// belongs to the child.
 func fillPartitionNotNullConstraintNames(s Schema) Schema {
 	tablesByName := make(map[string]Table, len(s.Tables))
 	for _, t := range s.Tables {
 		tablesByName[t.GetName()] = t
 	}
 
-	var effectiveName func(t Table, column Column) string
-	effectiveName = func(t Table, column Column) string {
-		if t.ParentTable != nil {
-			if parent, ok := tablesByName[t.ParentTable.GetName()]; ok {
-				for _, parentColumn := range parent.Columns {
-					if parentColumn.Name == column.Name && !parentColumn.IsNullable {
-						return effectiveName(parent, parentColumn)
-					}
-				}
-				// No NOT NULL comes from the parent: the child's own constraint is default-named.
-				return ""
-			}
-			// The parent is filtered out of the expected schema; its own constraint carries the
-			// default name for the parent.
-			return DefaultNotNullConstraintName(UnescapeIdentifier(t.ParentTable.EscapedName), column.Name)
-		}
-		return DefaultNotNullConstraintName(UnescapeIdentifier(t.EscapedName), column.Name)
-	}
-
 	for i := range s.Tables {
-		columns := append([]Column(nil), s.Tables[i].Columns...)
+		table := s.Tables[i]
+		if table.ParentTable == nil {
+			continue
+		}
+		parent, parentKnown := tablesByName[table.ParentTable.GetName()]
+		parentColumns := make(map[string]Column, len(parent.Columns))
+		for _, parentColumn := range parent.Columns {
+			parentColumns[parentColumn.Name] = parentColumn
+		}
+
+		columns := append([]Column(nil), table.Columns...)
 		for j := range columns {
-			if columns[j].IsNullable || columns[j].NotNullConstraintName != "" {
+			if columns[j].IsNullable {
 				continue
 			}
-			name := effectiveName(s.Tables[i], columns[j])
-			defaultName := DefaultNotNullConstraintName(UnescapeIdentifier(s.Tables[i].EscapedName), columns[j].Name)
-			if name == defaultName {
-				name = ""
+			if columns[j].NotNullConstraintName != "" {
+				// The child's own constraint; keep its name.
+				continue
 			}
-			columns[j].NotNullConstraintName = name
+			if !parentKnown {
+				// The parent is filtered out of the expected schema; the constraint exists only
+				// because the parent has one.
+				columns[j].NotNullConstraintInherited = true
+				continue
+			}
+			if parentColumn, ok := parentColumns[columns[j].Name]; ok && !parentColumn.IsNullable {
+				columns[j].NotNullConstraintInherited = true
+			}
 		}
 		s.Tables[i].Columns = columns
 	}
@@ -1588,6 +1587,7 @@ func clearNotNullConstraintNames(s Schema) Schema {
 		columns := append([]Column(nil), s.Tables[i].Columns...)
 		for j := range columns {
 			columns[j].NotNullConstraintName = ""
+			columns[j].NotNullConstraintInherited = false
 		}
 		s.Tables[i].Columns = columns
 	}
@@ -1750,21 +1750,32 @@ func TestNotNullConstraintNames(t *testing.T) {
 	var serverVersionNum int
 	require.NoError(t, conn.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
 
-	// The effective name of every NOT NULL column: PostgreSQL 18 catalogues them, and a partition
-	// inherits its parent's name. Before 18 there are no names at all. The name PostgreSQL generates
-	// for a column — "<table>_<column>_not_null" — is never reported, because PostgreSQL and pg_dump
-	// omit it.
-	expected := map[string]map[string]string{
-		"public.nn_parent":      {"id": "", "tag": ""},
-		"public.nn_child":       {"id": "nn_parent_id_not_null", "tag": "nn_parent_tag_not_null"},
-		"public.nn_local_child": {"id": "nn_parent_id_not_null", "tag": ""},
-		"public.nn_local":       {"id": "", "flag": "custom_nn"},
-		"public.nn_plain":       {"id": ""},
+	// The name and the owner of every NOT NULL constraint: PostgreSQL 18 catalogues them, a
+	// partition inherits its parent's constraint (whose name is the parent's fact and is not stored
+	// on the child), and a constraint the child declares itself stays local. The name PostgreSQL
+	// generates for a column — "<table>_<column>_not_null" — is never reported, because PostgreSQL
+	// and pg_dump omit it. Before 18 there are no constraints to report at all.
+	type notNullExpectation struct {
+		name      string
+		inherited bool
+	}
+	expected := map[string]map[string]notNullExpectation{
+		"public.nn_parent": {
+			"id": {name: "", inherited: false}, "tag": {name: "", inherited: false},
+		},
+		"public.nn_child": {
+			"id": {name: "", inherited: true}, "tag": {name: "", inherited: true},
+		},
+		"public.nn_local_child": {
+			"id": {name: "", inherited: true}, "tag": {name: "", inherited: false},
+		},
+		"public.nn_local": {"id": {name: ""}, "flag": {name: "custom_nn"}},
+		"public.nn_plain": {"id": {name: ""}},
 	}
 	if serverVersionNum < 180000 {
 		for table, columns := range expected {
 			for column := range columns {
-				expected[table][column] = ""
+				expected[table][column] = notNullExpectation{}
 			}
 		}
 	}
@@ -1780,7 +1791,8 @@ func TestNotNullConstraintNames(t *testing.T) {
 			if !ok {
 				continue
 			}
-			assert.Equal(t, expectedName, column.NotNullConstraintName, "%s.%s", tableName, column.Name)
+			assert.Equal(t, expectedName.name, column.NotNullConstraintName, "%s.%s name", tableName, column.Name)
+			assert.Equal(t, expectedName.inherited, column.NotNullConstraintInherited, "%s.%s inherited", tableName, column.Name)
 		}
 	}
 }

@@ -519,12 +519,17 @@ type (
 		// Only populated if IsGenerated is true.
 		GenerationExpression string
 		IsNullable           bool
-		// NotNullConstraintName is the name of the column's NOT NULL constraint when that name is
-		// not the one PostgreSQL generates by default for the column — an inherited name from a
-		// partitioned parent, or one the schema chose explicitly. An empty string means the
+		// NotNullConstraintName is the name of the column's own NOT NULL constraint when that name
+		// is not the one PostgreSQL generates by default for the column. An empty string means the
 		// default. PostgreSQL 18 catalogues NOT NULL constraints (contype = 'n'); earlier versions
 		// do not, so this is always empty there.
 		NotNullConstraintName string
+		// NotNullConstraintInherited reports a partition column whose NOT NULL constraint exists
+		// only because its partitioned parent has one. Such a constraint's name is the parent's
+		// fact: it is not stored here and never diffed on the child, because every change to the
+		// parent's constraint reaches the child. False means the constraint, if the column is NOT
+		// NULL at all, belongs to the table itself.
+		NotNullConstraintInherited bool
 		// HasMissingValOptimization refers to the 'attmissingval' optimization for adding columns with a default.
 		HasMissingValOptimization bool
 		// Size is the number of bytes required to store the value.
@@ -1733,7 +1738,7 @@ func (s *schemaFetcher) buildTable(
 	ctx context.Context,
 	table queries.GetTablesRow,
 	checkConsByTable map[string][]CheckConstraint,
-	notNullConsByTable map[string]map[string]string,
+	notNullConsByTable map[string]map[string]notNullConstraint,
 	policiesByTable map[string][]Policy,
 	privilegesByTable map[string][]TablePrivilege,
 	columnPrivilegesByTable map[string][]ColumnPrivilege,
@@ -1743,6 +1748,10 @@ func (s *schemaFetcher) buildTable(
 		return Table{}, fmt.Errorf("GetColumnsForTable(%s): %w", table.Oid, err)
 	}
 	notNullConsByColumn := notNullConsByTable[buildNameFromUnescaped(table.TableName, table.TableSchemaName).GetFQEscapedName()]
+	var parentNotNullConsByColumn map[string]notNullConstraint
+	if table.ParentTableName != "" {
+		parentNotNullConsByColumn = notNullConsByTable[buildNameFromUnescaped(table.ParentTableName, table.ParentTableSchemaName).GetFQEscapedName()]
+	}
 	dependsOnDomains, err := s.fetchDependsOnDomains(ctx, "pg_class", table.Oid)
 	if err != nil {
 		return Table{}, fmt.Errorf("fetchDependsOnDomains(%s): %w", table.Oid, err)
@@ -1793,9 +1802,13 @@ func (s *schemaFetcher) buildTable(
 			Identity:             identity,
 			Description:          column.Description,
 			// PostgreSQL and pg_dump elide a NOT NULL constraint's name when it is exactly
-			// "<table>_<column>_not_null", so only a different name is part of the schema.
-			NotNullConstraintName: notNullConstraintNameIfExplicit(
-				notNullConsByColumn[column.ColumnName], table.TableName, column.ColumnName),
+			// "<table>_<column>_not_null", so only a different name is part of the schema. A
+			// partition's inherited constraint carries the parent's name, which is the parent's
+			// fact: it is neither stored nor diffed on the child.
+			NotNullConstraintName: notNullConstraintNameOfColumn(
+				notNullConsByColumn, parentNotNullConsByColumn, column.ColumnName, table.TableName, table.ParentTableName != ""),
+			NotNullConstraintInherited: notNullConstraintInherited(
+				notNullConsByColumn, parentNotNullConsByColumn, column.ColumnName, table.ParentTableName != ""),
 
 			DefaultDependsOnFunctions: defaultDependsOnFunctions,
 		})
@@ -1886,26 +1899,67 @@ func (s *schemaFetcher) fetchCheckCons(ctx context.Context) ([]checkConstraintAn
 	return ccs, nil
 }
 
-// fetchNotNullConstraints returns the name of every column's NOT NULL constraint, keyed by the
-// table it belongs to and the column. PostgreSQL 18 catalogues them in pg_constraint; earlier
-// versions return nothing.
-func (s *schemaFetcher) fetchNotNullConstraints(ctx context.Context) (map[string]map[string]string, error) {
+// notNullConstraint is a NOT NULL constraint as PostgreSQL 18 catalogues it.
+type notNullConstraint struct {
+	name string
+	// inheritedCount is non-zero when the constraint is inherited from a partitioned parent.
+	inheritedCount int32
+}
+
+// fetchNotNullConstraints returns every column's NOT NULL constraint, keyed by the table it belongs
+// to and the column. PostgreSQL 18 catalogues them in pg_constraint; earlier versions return
+// nothing.
+func (s *schemaFetcher) fetchNotNullConstraints(ctx context.Context) (map[string]map[string]notNullConstraint, error) {
 	rows, err := s.q.GetNotNullConstraints(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetNotNullConstraints: %w", err)
 	}
 
-	byTable := make(map[string]map[string]string, len(rows))
+	byTable := make(map[string]map[string]notNullConstraint, len(rows))
 	for _, row := range rows {
 		tableName := buildNameFromUnescaped(row.TableName, row.TableSchemaName).GetFQEscapedName()
 		byColumn, ok := byTable[tableName]
 		if !ok {
-			byColumn = make(map[string]string)
+			byColumn = make(map[string]notNullConstraint)
 			byTable[tableName] = byColumn
 		}
-		byColumn[row.ColumnName] = row.ConstraintName
+		byColumn[row.ColumnName] = notNullConstraint{
+			name:           row.ConstraintName,
+			inheritedCount: row.Coninhcount,
+		}
 	}
 	return byTable, nil
+}
+
+// notNullConstraintInherited reports whether a partition column's constraint is the parent's fact:
+// PostgreSQL catalogs it as inherited (coninhcount) and it carries exactly the parent's constraint
+// name. A constraint with the same count but another name is the child's own naming fact (a local
+// primary key merged with the parent's constraint keeps the parent's name, so it stays the parent's
+// fact). Earlier versions catalogue no NOT NULL constraints at all, so nothing is inherited there.
+func notNullConstraintInherited(byColumn, parentByColumn map[string]notNullConstraint, columnName string, isPartition bool) bool {
+	if !isPartition {
+		return false
+	}
+	constraint, ok := byColumn[columnName]
+	if !ok || constraint.inheritedCount == 0 {
+		return false
+	}
+	parentConstraint, ok := parentByColumn[columnName]
+	if !ok {
+		// The parent has no constraint on the column (any more), so the count is the only trace
+		// that PostgreSQL created this one for the child from the parent's.
+		return true
+	}
+	return parentConstraint.name == constraint.name
+}
+
+// notNullConstraintNameOfColumn returns the column's own constraint name, or an empty string when
+// the name is the default or the constraint is inherited from the partitioned parent.
+func notNullConstraintNameOfColumn(byColumn, parentByColumn map[string]notNullConstraint, columnName, tableName string, isPartition bool) string {
+	if notNullConstraintInherited(byColumn, parentByColumn, columnName, isPartition) {
+		return ""
+	}
+	return notNullConstraintNameIfExplicit(byColumn[columnName].name, tableName, columnName)
 }
 
 // DefaultNotNullConstraintName returns the name PostgreSQL generates for a NOT NULL constraint

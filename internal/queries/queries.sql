@@ -386,12 +386,14 @@ WHERE
 -- Returns the NOT NULL constraints of every table. PostgreSQL 18
 -- catalogues them in pg_constraint (contype = 'n'); earlier versions
 -- have no such rows, so the result is empty there and a NOT NULL column
--- simply has no constraint name.
+-- simply has no constraint name. coninhcount is non-zero when the
+-- constraint is inherited from a partitioned parent.
 SELECT
     pg_constraint.conname::TEXT AS constraint_name,
     pg_class.relname::TEXT AS table_name,
     table_namespace.nspname::TEXT AS table_schema_name,
-    a.attname::TEXT AS column_name
+    a.attname::TEXT AS column_name,
+    pg_constraint.coninhcount
 FROM pg_catalog.pg_constraint
 INNER JOIN pg_catalog.pg_class ON pg_constraint.conrelid = pg_class.oid
 INNER JOIN

@@ -7,6 +7,7 @@ import (
 	stdlog "log"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -54,8 +55,11 @@ type (
 		expectedHazardTypesBeforePG18 []diff.MigrationHazardType
 		// oldSchemaDDLBeforePG15 and newSchemaDDLBeforePG15, when non-nil, replace oldSchemaDDL and newSchemaDDL
 		// on servers before PostgreSQL 15, when a fixture uses an option those versions do not have.
-		oldSchemaDDLBeforePG15    []string
-		newSchemaDDLBeforePG15    []string
+		oldSchemaDDLBeforePG15 []string
+		newSchemaDDLBeforePG15 []string
+		// planErrorOnlyAfterPG18 asserts that no error is expected before PostgreSQL 18, where NOT NULL
+		// constraints are not catalogued and the name a case exercises is not part of the schema.
+		planErrorOnlyAfterPG18    bool
 		expectedPlanErrorIs       error
 		expectedPlanErrorContains string
 		// expectedPlanDDL is used to assert the exact DDL (of the statements) that  generated. This is useful when asserting
@@ -179,7 +183,11 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	}(tempDbFactory)
 
 	plan, err := tc.planFactory(context.Background(), oldDBConnPool, tempDbFactory, tc.newSchemaDDL, tc.planOpts...)
-	if tc.expectedPlanErrorIs != nil || len(tc.expectedPlanErrorContains) > 0 {
+	expectPlanError := tc.expectedPlanErrorIs != nil || len(tc.expectedPlanErrorContains) > 0
+	if tc.planErrorOnlyAfterPG18 && serverVersionNum < 180000 {
+		expectPlanError = false
+	}
+	if expectPlanError {
 		if tc.expectedPlanErrorIs != nil {
 			assert.ErrorIs(t, err, tc.expectedPlanErrorIs)
 		}
@@ -221,10 +229,10 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		// where 16 and later omit the qualifier when it is unambiguous. The generated text is the
 		// server's deparse either way, so compare both sides in the same dialect.
 		for i := range tc.expectedPlanDDL {
-			tc.expectedPlanDDL[i] = canonicalizeViewDeparseQualifiers(tc.expectedPlanDDL[i])
+			tc.expectedPlanDDL[i] = canonicalizeViewDeparseQualifiers(serverVersionNum, tc.expectedPlanDDL[i])
 		}
 		for i := range generatedDDL {
-			generatedDDL[i] = canonicalizeViewDeparseQualifiers(generatedDDL[i])
+			generatedDDL[i] = canonicalizeViewDeparseQualifiers(serverVersionNum, generatedDDL[i])
 		}
 		// In the future, we might want to allow users to assert expectations for vanilla options and data packing
 		//
@@ -248,19 +256,32 @@ func assertValidPlan(t *testing.T, plan diff.Plan) {
 }
 
 var (
-	viewStatementPrefix    = regexp.MustCompile(`^CREATE (OR REPLACE )?(MATERIALIZED )?VIEW `)
-	relationQualifierRegex = regexp.MustCompile(`(^|[^A-Za-z0-9_."])([A-Za-z_][A-Za-z0-9_]*)\.`)
+	viewStatementPrefix = regexp.MustCompile(`^CREATE (OR REPLACE )?(MATERIALIZED )?VIEW `)
+	// viewFromItemRegex captures a FROM or JOIN item: the relation name, optionally schema-qualified
+	// and quoted.
+	viewFromItemRegex = regexp.MustCompile(`(?i)\b(?:from|join)\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)[^A-Za-z0-9_".]`)
 )
 
-// canonicalizeViewDeparseQualifiers removes the relation qualifier PostgreSQL 15 prints in a view
-// definition when PostgreSQL 16 and later leave it out. It is applied to both the expected and the
-// generated DDL, so the assertion keeps comparing the whole statement; only the deparse dialect,
-// which depends on the server version, is dropped.
-func canonicalizeViewDeparseQualifiers(ddl string) string {
-	if !viewStatementPrefix.MatchString(ddl) {
+// canonicalizeViewDeparseQualifiers removes the relation qualifier PostgreSQL 15 and earlier print
+// in a view definition when PostgreSQL 16 and later leave it out ("SELECT foobar.id" against
+// "SELECT id"). Only qualifiers naming a relation in the statement's own FROM/JOIN items are
+// removed — never a schema qualifier and never anything on 16 or later; the expected and the
+// generated DDL are put in the same deparse dialect before they are compared.
+func canonicalizeViewDeparseQualifiers(serverVersionNum int, ddl string) string {
+	if serverVersionNum >= 160000 || !viewStatementPrefix.MatchString(ddl) {
 		return ddl
 	}
-	return relationQualifierRegex.ReplaceAllString(ddl, "$1")
+	seen := make(map[string]bool)
+	for _, match := range viewFromItemRegex.FindAllStringSubmatch(ddl, -1) {
+		parts := strings.Split(match[1], ".")
+		name := strings.Trim(parts[len(parts)-1], `"`)
+		seen[name] = true
+	}
+	for name := range seen {
+		qualifier := regexp.MustCompile(`(^|[^A-Za-z0-9_."])` + regexp.QuoteMeta(name) + `\.`)
+		ddl = qualifier.ReplaceAllString(ddl, "$1")
+	}
+	return ddl
 }
 
 func directlyRunDDLAndGetDump(t *testing.T, engine *pgengine.Engine, ddl []string) string {

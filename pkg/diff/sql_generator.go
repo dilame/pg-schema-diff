@@ -805,8 +805,6 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving table diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, tablePartialGraph)
-	partialGraph = concatPartialGraphs(partialGraph,
-		buildPartitionNotNullConstraintRenameGraph(diff.old, diff.new, diff.tableDiffs))
 
 	newTablePoliciesPartialGraph, err := newNewTablePoliciesSQLVertexGenerator().AddAll(diff.tableDiffs.adds)
 	if err != nil {
@@ -1193,6 +1191,11 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		// We attach the partitions separately. So the partition must have all the same check constraints
 		// as the original table
 		table.CheckConstraints = append(table.CheckConstraints, t.tablesInNewSchemaByName[table.ParentTable.GetName()].CheckConstraints...)
+		// A partition created on its own and then attached keeps the NOT NULL constraint name it was
+		// created with, while one created with PARTITION OF carries the parent's name. Give the
+		// inherited constraints the parent's name so the created partition matches the target dump.
+		table.Columns = inheritedNotNullConstraintNames(
+			table.Columns, t.tablesInNewSchemaByName[table.ParentTable.GetName()], *table.ParentTable)
 	}
 
 	var stmts []Statement
@@ -1505,33 +1508,47 @@ func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, e
 		return nil, fmt.Errorf("column privileges on partitions: %w", ErrNotImplemented)
 	}
 
-	var alteredParentColumnsByName map[string]columnDiff
-	if parentDiff, ok := t.tableDiffsByName[diff.new.ParentTable.GetName()]; ok {
-		alteredParentColumnsByName = buildDiffByNameMap[schema.Column, columnDiff](parentDiff.columnsDiff.alters)
-	}
+	parentTable := t.tablesInNewSchemaByName[diff.new.ParentTable.GetName()]
+	parentColumnsByName := buildSchemaObjByNameMap(parentTable.Columns)
 
 	var stmts []Statement
 	// ColumnsDiff should only have nullability changes. Partitioned tables
 	// aren't concerned about old/new columns added
 	for _, colDiff := range diff.columnsDiff.alters {
+		oldHasConstraint := !colDiff.old.IsNullable
+		newHasConstraint := !colDiff.new.IsNullable
+		oldIsLocal := oldHasConstraint && !colDiff.old.NotNullConstraintInherited
+		newIsLocal := newHasConstraint && !colDiff.new.NotNullConstraintInherited
+
+		notNullChanged := colDiff.old.IsNullable != colDiff.new.IsNullable ||
+			colDiff.old.NotNullConstraintName != colDiff.new.NotNullConstraintName ||
+			colDiff.old.NotNullConstraintInherited != colDiff.new.NotNullConstraintInherited
+		if !notNullChanged {
+			continue
+		}
+		parentCol, parentColKnown := parentColumnsByName[colDiff.new.Name]
+		parentHasNotNull := parentColKnown && !parentCol.IsNullable
+		constraintName := notNullConstraintName(diff.new.SchemaQualifiedName, colDiff.new)
+		if oldIsLocal || newIsLocal {
+			// A partition's own constraint cannot be renamed while the parent's constraint shares its
+			// column or turned into an inherited one, and the parent's constraint would cascade over a
+			// child's own one. Each of those would need the partition detached and attached again.
+			if colDiff.old.NotNullConstraintName != colDiff.new.NotNullConstraintName ||
+				(newIsLocal && parentHasNotNull) ||
+				(oldIsLocal && newHasConstraint && !newIsLocal) {
+				return nil, fmt.Errorf("altering partition %s's local NOT NULL constraint %q on column %q: %w",
+					diff.new.GetFQEscapedName(), constraintName, colDiff.new.Name, ErrNotImplemented)
+			}
+		}
+
 		if colDiff.old.IsNullable == colDiff.new.IsNullable {
 			continue
 		}
-
-		if parentCol, ok := alteredParentColumnsByName[colDiff.new.Name]; ok && !colDiff.new.IsNullable {
-			if colDiff.new.IsNullable == parentCol.new.IsNullable && parentCol.new.IsNullable != parentCol.old.IsNullable {
-				// If the parent column's new nullability matches the child column, and the parent column's nullability
-				// is being altered, then we don't need to alter the child column's nullability because the DDL required
-				// to alter the parent's nullability will alter the child's nullability as well.
-				//
-				// This holds only when the child becomes NOT NULL. Dropping the parent's NOT NULL only recurses
-				// while the parent still has it: when another statement of the plan (dropping the primary key
-				// that implied it, for instance) removes the parent's NOT NULL first, the parent's own DROP NOT
-				// NULL becomes a no-op and leaves every partition NOT NULL. PostgreSQL 18 catalogues NOT NULL
-				// constraints, and there dropping the parent's constraint does not reach a child's local one,
-				// so the child has to be altered explicitly.
-				continue
-			}
+		if (newHasConstraint && colDiff.new.NotNullConstraintInherited) ||
+			(!newHasConstraint && colDiff.old.NotNullConstraintInherited) {
+			// The constraint exists only because the parent has one, so the parent's own alteration
+			// reaches the child.
+			continue
 		}
 
 		alterColumnPrefix := fmt.Sprintf("%s ALTER COLUMN %s", alterTablePrefix(diff.new.SchemaQualifiedName), schema.EscapeIdentifier(colDiff.new.Name))
@@ -1558,172 +1575,6 @@ func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, e
 	}
 
 	return stmts, nil
-}
-
-// buildPartitionNotNullConstraintRenameGraph moves a partition's NOT NULL constraint to the name the
-// target schema gives it. PostgreSQL 18 catalogues NOT NULL constraints and refuses to rename an
-// inherited one, refuses to drop it while the partition parent has the matching constraint, and
-// refuses to create a local one while the column already has a constraint. Detaching the partition
-// releases all three restrictions: the child's constraint becomes its own, so it is dropped and
-// created again with the target name, and the partition is attached back afterwards.
-func buildPartitionNotNullConstraintRenameGraph(oldSchema, newSchema schema.Schema, tableDiffs listDiff[schema.Table, tableDiff]) partialSQLGraph {
-	newIndexesByTableName := buildIndexesByTableNameMap(newSchema.Indexes)
-	oldTablesByName := buildSchemaObjByNameMap(oldSchema.Tables)
-	newTablesByName := buildSchemaObjByNameMap(newSchema.Tables)
-
-	type childNameChange struct {
-		column    string
-		oldName   string
-		newName   string
-		isDefault bool
-		// rename is true when the child's old constraint is still there when this runs: the parent
-		// keeps a NOT NULL constraint on the column, so the constraint only changes its name. When
-		// the parent loses it, the constraint goes with it and the child's one is created anew.
-		rename bool
-	}
-	type childChanges struct {
-		parent    schema.SchemaQualifiedName
-		child     schema.SchemaQualifiedName
-		forValues string
-		changes   []childNameChange
-	}
-	byChild := make(map[schema.SchemaQualifiedName]*childChanges)
-	var childOrder []schema.SchemaQualifiedName
-
-	for _, childDiff := range tableDiffs.alters {
-		if childDiff.new.ParentTable == nil {
-			continue
-		}
-		var changes []childNameChange
-		for _, colDiff := range childDiff.columnsDiff.alters {
-			if colDiff.old.IsNullable || colDiff.new.IsNullable {
-				continue
-			}
-			oldName := notNullConstraintName(childDiff.old.SchemaQualifiedName, colDiff.old)
-			newName := notNullConstraintName(childDiff.new.SchemaQualifiedName, colDiff.new)
-			if oldName == newName {
-				continue
-			}
-			oldParentColumn, ok := buildSchemaObjByNameMap(oldTablesByName[childDiff.new.ParentTable.GetName()].Columns)[colDiff.new.Name]
-			if !ok {
-				continue
-			}
-			newParentColumn, ok := buildSchemaObjByNameMap(newTablesByName[childDiff.new.ParentTable.GetName()].Columns)[colDiff.new.Name]
-			if !ok {
-				continue
-			}
-			// A child's constraint that carries exactly the parent's old and new name is inherited:
-			// renaming or re-creating the parent's constraint cascades to it, and PostgreSQL also
-			// refuses to touch it directly, so there is nothing to emit for the child.
-			if oldName == notNullConstraintName(*childDiff.new.ParentTable, oldParentColumn) &&
-				newName == notNullConstraintName(*childDiff.new.ParentTable, newParentColumn) {
-				continue
-			}
-			changes = append(changes, childNameChange{
-				column:    colDiff.new.Name,
-				oldName:   oldName,
-				newName:   newName,
-				isDefault: colDiff.new.NotNullConstraintName == "",
-				rename:    !oldParentColumn.IsNullable && !newParentColumn.IsNullable,
-			})
-		}
-		if len(changes) == 0 {
-			continue
-		}
-		childName := childDiff.new.SchemaQualifiedName
-		if _, ok := byChild[childName]; !ok {
-			childOrder = append(childOrder, childName)
-		}
-		byChild[childName] = &childChanges{
-			parent:    *childDiff.new.ParentTable,
-			child:     childName,
-			forValues: childDiff.new.ForValues,
-			changes:   changes,
-		}
-	}
-
-	var vertices []sqlVertex
-	var deps []dependency
-	for _, childName := range childOrder {
-		change := byChild[childName]
-		vertexId := buildSchemaObjVertexId("not_null_constraint", childName.GetFQEscapedName(), diffTypeAddAlter)
-
-		stmts := []Statement{{
-			DDL: fmt.Sprintf("%s DETACH PARTITION %s", alterTablePrefix(change.parent), childName.GetFQEscapedName()),
-			// Detaching and attaching hold locks on the parent and scan the partition on attach.
-			Timeout:     statementTimeoutDefault,
-			LockTimeout: lockTimeoutDefault,
-			Hazards: []MigrationHazard{{
-				Type: MigrationHazardTypeAcquiresAccessExclusiveLock,
-				Message: "Detaching and re-attaching a partition locks out writes on the partitioned table " +
-					"and scans the partition while it is attached again",
-			}},
-		}}
-		for _, c := range change.changes {
-			if c.rename {
-				stmts = append(stmts, Statement{
-					DDL: fmt.Sprintf("%s RENAME CONSTRAINT %s TO %s", alterTablePrefix(childName),
-						schema.EscapeIdentifier(c.oldName), schema.EscapeIdentifier(c.newName)),
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-				})
-				continue
-			}
-			stmts = append(stmts, Statement{
-				DDL: fmt.Sprintf("%s ALTER COLUMN %s DROP NOT NULL", alterTablePrefix(childName),
-					schema.EscapeIdentifier(c.column)),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-			})
-			if c.isDefault {
-				stmts = append(stmts, Statement{
-					DDL: fmt.Sprintf("%s ALTER COLUMN %s SET NOT NULL", alterTablePrefix(childName),
-						schema.EscapeIdentifier(c.column)),
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-					Hazards:     []MigrationHazard{notNullConstraintScanHazard(childName)},
-				})
-			} else {
-				stmts = append(stmts, Statement{
-					DDL: fmt.Sprintf("%s ADD CONSTRAINT %s NOT NULL %s", alterTablePrefix(childName),
-						schema.EscapeIdentifier(c.newName), schema.EscapeIdentifier(c.column)),
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-					Hazards:     []MigrationHazard{notNullConstraintScanHazard(childName)},
-				})
-			}
-		}
-		stmts = append(stmts, Statement{
-			DDL: fmt.Sprintf("%s ATTACH PARTITION %s %s", alterTablePrefix(change.parent),
-				childName.GetFQEscapedName(), change.forValues),
-			Timeout:     statementTimeoutDefault,
-			LockTimeout: lockTimeoutDefault,
-		})
-
-		vertices = append(vertices, sqlVertex{
-			id:         vertexId,
-			priority:   sqlPrioritySooner,
-			statements: stmts,
-		})
-		// Run after the tables have their target shape (types, added columns) and their regular
-		// alterations, but before the child's indexes: a primary key added to the child implies a
-		// NOT NULL constraint the drop below would otherwise be refused for.
-		deps = append(deps, mustRun(vertexId).after(buildTableVertexId(change.parent, diffTypeAddAlter)))
-		deps = append(deps, mustRun(vertexId).after(buildTableVertexId(childName, diffTypeAddAlter)))
-		for _, idx := range newIndexesByTableName[childName.GetName()] {
-			deps = append(deps, mustRun(vertexId).before(buildIndexVertexId(idx.GetSchemaQualifiedName(), diffTypeAddAlter)))
-		}
-	}
-
-	return partialSQLGraph{vertices: vertices, dependencies: deps}
-}
-
-func notNullConstraintScanHazard(table schema.SchemaQualifiedName) MigrationHazard {
-	return MigrationHazard{
-		Type: MigrationHazardTypeAcquiresAccessExclusiveLock,
-		Message: fmt.Sprintf("Re-creating a NOT NULL constraint on %s requires a full scan of the partition, "+
-			"which will lock out writes while it runs", table.GetFQEscapedName()),
-	}
 }
 
 func alterReplicaIdentityStatement(table schema.SchemaQualifiedName, identity schema.ReplicaIdentity) (Statement, error) {
@@ -2100,6 +1951,25 @@ func (csg *columnSQLVertexGenerator) Alter(diff columnDiff) ([]Statement, error)
 	stmts = append(stmts, commentDDLForAlter(commentTargetColumn(csg.tableName, newColumn.Name), oldColumn.Description, newColumn.Description)...)
 
 	return stmts, nil
+}
+
+// inheritedNotNullConstraintNames resolves the name a new partition's inherited NOT NULL constraints
+// will carry: PostgreSQL gives a child created with PARTITION OF the parent's constraint name, and
+// attaching a table whose constraints carry another name keeps that name.
+func inheritedNotNullConstraintNames(columns []schema.Column, parentTable schema.Table, parent schema.SchemaQualifiedName) []schema.Column {
+	parentColumns := buildSchemaObjByNameMap(parentTable.Columns)
+	resolved := append([]schema.Column(nil), columns...)
+	for i := range resolved {
+		if resolved[i].IsNullable || !resolved[i].NotNullConstraintInherited {
+			continue
+		}
+		if parentColumn, ok := parentColumns[resolved[i].Name]; ok {
+			resolved[i].NotNullConstraintName = notNullConstraintName(parent, parentColumn)
+			// buildColumnDefinition must print the name even though it is the parent's default.
+			resolved[i].NotNullConstraintInherited = false
+		}
+	}
+	return resolved
 }
 
 // notNullConstraintName returns the name of a NOT NULL column's constraint, including the default
