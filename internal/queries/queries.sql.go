@@ -2112,7 +2112,7 @@ func (q *Queries) GetSequences(ctx context.Context) ([]GetSequencesRow, error) {
 }
 
 const getServerVersionNum = `-- name: GetServerVersionNum :one
-SELECT current_setting('server_version_num')::int
+SELECT CURRENT_SETTING('server_version_num')::INT
 `
 
 // The server's version, which decides whether NOT NULL constraints and

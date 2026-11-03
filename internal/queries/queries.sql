@@ -385,7 +385,7 @@ WHERE
 -- name: GetServerVersionNum :one
 -- The server's version, which decides whether NOT NULL constraints and
 -- their locality are catalogued at all (PostgreSQL 18 and later).
-SELECT current_setting('server_version_num')::int;
+SELECT CURRENT_SETTING('server_version_num')::INT;
 
 -- name: GetNotNullConstraints :many
 -- Returns the NOT NULL constraints of every table. PostgreSQL 18
