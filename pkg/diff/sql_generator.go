@@ -796,10 +796,11 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	var partialGraph partialSQLGraph
 
 	tablePartialGraph, err := generatePartialGraph(legacyToNewSqlVertexGenerator[schema.Table, tableDiff](&tableSQLVertexGenerator{
-		randReader:              s.randReader,
-		deletedTablesByName:     deletedTablesByName,
-		tablesInNewSchemaByName: tablesInNewSchemaByName,
-		tableDiffsByName:        buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		randReader:                   s.randReader,
+		deletedTablesByName:          deletedTablesByName,
+		tablesInNewSchemaByName:      tablesInNewSchemaByName,
+		tableDiffsByName:             buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		notNullConstraintsCatalogued: s.planOptions.notNullConstraintsCatalogued,
 	}), diff.tableDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving table diff: %w", err)
@@ -1169,6 +1170,9 @@ type tableSQLVertexGenerator struct {
 	deletedTablesByName     map[string]schema.Table
 	tablesInNewSchemaByName map[string]schema.Table
 	tableDiffsByName        map[string]tableDiff
+	// notNullConstraintsCatalogued tells whether the server stores NOT NULL constraints and their
+	// locality (PostgreSQL 18 and later).
+	notNullConstraintsCatalogued bool
 }
 
 func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
@@ -1529,10 +1533,28 @@ func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, e
 		parentCol, parentColKnown := parentColumnsByName[colDiff.new.Name]
 		parentHasNotNull := parentColKnown && !parentCol.IsNullable
 		constraintName := notNullConstraintName(diff.new.SchemaQualifiedName, colDiff.new)
-		if oldIsLocal || newIsLocal {
+		if !t.notNullConstraintsCatalogued {
+			// Before PostgreSQL 18 the schema records neither constraint names nor locality, so a
+			// child column whose new nullability matches the parent's alteration is reached by the
+			// parent's own statement and must not be altered again. This holds only when the child
+			// becomes NOT NULL: dropping the parent's NOT NULL leaves a child that has its own.
+			if colDiff.old.IsNullable == colDiff.new.IsNullable {
+				continue
+			}
+			if parentDiff, ok := t.tableDiffsByName[diff.new.ParentTable.GetName()]; ok {
+				if alteredParentCol, ok := buildDiffByNameMap[schema.Column, columnDiff](parentDiff.columnsDiff.alters)[colDiff.new.Name]; ok &&
+					!colDiff.new.IsNullable &&
+					colDiff.new.IsNullable == alteredParentCol.new.IsNullable &&
+					alteredParentCol.new.IsNullable != alteredParentCol.old.IsNullable {
+					continue
+				}
+			}
+		}
+		if t.notNullConstraintsCatalogued && (oldIsLocal || newIsLocal) {
 			// A partition's own constraint cannot be renamed while the parent's constraint shares its
 			// column or turned into an inherited one, and the parent's constraint would cascade over a
 			// child's own one. Each of those would need the partition detached and attached again.
+			// Before PostgreSQL 18 no locality is catalogued, so there is nothing to refuse.
 			if colDiff.old.NotNullConstraintName != colDiff.new.NotNullConstraintName ||
 				(newIsLocal && parentHasNotNull) ||
 				(oldIsLocal && newHasConstraint && !newIsLocal) {

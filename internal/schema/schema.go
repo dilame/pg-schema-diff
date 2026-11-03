@@ -67,6 +67,10 @@ type Schema struct {
 	Triggers              []Trigger
 	Views                 []View
 	MaterializedViews     []MaterializedView
+	// NotNullConstraintsCatalogued reports that the server catalogues NOT NULL constraints
+	// (PostgreSQL 18 and later), so a partition's constraint locality is known. Earlier versions
+	// store no constraint names at all.
+	NotNullConstraintsCatalogued bool `hash:"ignore"`
 }
 
 // Normalize normalizes the schema (alphabetically sorts tables and columns in tables).
@@ -1288,6 +1292,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, err
 	}
 
+	serverVersionNum, err := s.q.GetServerVersionNum(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("GetServerVersionNum: %w", err)
+	}
+
 	return Schema{
 		NamedSchemas:          schemas,
 		DefaultPrivileges:     defaultPrivileges,
@@ -1304,6 +1313,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		Triggers:              triggers,
 		Views:                 views,
 		MaterializedViews:     materializedViews,
+		NotNullConstraintsCatalogued: serverVersionNum >= 180000,
 	}, nil
 }
 

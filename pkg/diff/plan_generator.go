@@ -39,6 +39,10 @@ type (
 		randReader                 io.Reader
 		noConcurrentIndexOps       bool
 		disableCheckFunctionBodies bool
+		// notNullConstraintsCatalogued is true when the server stores NOT NULL constraints and their
+		// locality (PostgreSQL 18 and later), so a partition's local constraint can be told apart
+		// from an inherited one.
+		notNullConstraintsCatalogued bool
 	}
 
 	PlanOpt func(opts *planOptions)
@@ -165,6 +169,8 @@ func Generate(
 	if err != nil {
 		return Plan{}, fmt.Errorf("getting new schema: %w", err)
 	}
+
+	planOptions.notNullConstraintsCatalogued = currentSchema.NotNullConstraintsCatalogued || newSchema.NotNullConstraintsCatalogued
 
 	statements, err := generateMigrationStatements(currentSchema, newSchema, planOptions)
 	if err != nil {

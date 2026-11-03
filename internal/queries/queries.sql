@@ -382,6 +382,11 @@ WHERE
     AND pg_constraint.contype = 'c'
     AND pg_constraint.conislocal;
 
+-- name: GetServerVersionNum :one
+-- The server's version, which decides whether NOT NULL constraints and
+-- their locality are catalogued at all (PostgreSQL 18 and later).
+SELECT current_setting('server_version_num')::int;
+
 -- name: GetNotNullConstraints :many
 -- Returns the NOT NULL constraints of every table. PostgreSQL 18
 -- catalogues them in pg_constraint (contype = 'n'); earlier versions
