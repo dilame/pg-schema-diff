@@ -1218,6 +1218,8 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
+    -- False for a view created WITH NO DATA until it is refreshed.
+    c.relispopulated AS is_populated,
     -- The materialized view's rewrite rule: pg_depend records the functions the
     -- definition calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition

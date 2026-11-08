@@ -132,6 +132,39 @@ var materializedViewIndexAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeIndexBuild,
 		},
 	},
+	{
+		name: "Recreate materialized view keeps its unique and plain indexes",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                foo VARCHAR(255)
+            );
+
+            CREATE MATERIALIZED VIEW foobar_view AS
+                SELECT id, foo FROM foobar WHERE id > 0;
+
+            CREATE UNIQUE INDEX foobar_view_id_idx ON foobar_view(id) INCLUDE (foo);
+            CREATE INDEX foobar_view_foo_idx ON foobar_view(foo);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                foo VARCHAR(255)
+            );
+
+            CREATE MATERIALIZED VIEW foobar_view AS
+                SELECT id, foo FROM foobar WHERE id > 100;
+
+            CREATE UNIQUE INDEX foobar_view_id_idx ON foobar_view(id) INCLUDE (foo);
+            CREATE INDEX foobar_view_foo_idx ON foobar_view(foo);
+			`,
+		},
+		// Dropping the view to change its definition drops its indexes; the plan must build both
+		// again and leave the view populated, as it is in the target schema.
+	},
 }
 
 func TestMaterializedViewIndexTestCases(t *testing.T) {

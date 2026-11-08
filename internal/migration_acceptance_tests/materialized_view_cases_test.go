@@ -629,6 +629,7 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
 			"CREATE VIEW \"public\".\"foobar_view\" AS\n SELECT id,\n    foo\n   FROM foobar;",
 			"ALTER VIEW \"public\".\"foobar_view\" OWNER TO \"postgres\"",
 			"CREATE MATERIALIZED VIEW \"public\".\"foobar_mv\" AS\n SELECT id\n   FROM foobar_view\nWITH NO DATA",
+			"REFRESH MATERIALIZED VIEW \"public\".\"foobar_mv\"",
 			"ALTER MATERIALIZED VIEW \"public\".\"foobar_mv\" OWNER TO \"postgres\"",
 		},
 	},

@@ -32,6 +32,10 @@ const (
 	statementTimeoutTableDrop = 20 * time.Minute
 	// statementTimeoutAnalyzeColumn is the statement timeout for analyzing the column of a table
 	statementTimeoutAnalyzeColumn = 20 * time.Minute
+	// statementTimeoutMaterializedViewRefresh is the statement timeout for populating a materialized
+	// view. REFRESH runs the view's query over every row of its relations and may take a while. It
+	// takes an ACCESS EXCLUSIVE lock on the view, so the lock timeout stays at the default.
+	statementTimeoutMaterializedViewRefresh = 20 * time.Minute
 
 	tmpObjNamePrefix = "pgschemadiff_tmp"
 )
@@ -343,14 +347,6 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	addedTablesByName := buildSchemaObjByNameMap(tableDiffs.adds)
 	deletedTablesByName := buildSchemaObjByNameMap(tableDiffs.deletes)
 	tableDiffsByName := buildDiffByNameMap[schema.Table, tableDiff](tableDiffs.alters)
-	indexesDiff, err := diffLists(old.Indexes, new.Indexes, func(oldIndex, newIndex schema.Index, _, _ int) (indexDiff, bool, error) {
-		return buildIndexDiff(indexDiffConfig{
-			addedTablesByName: addedTablesByName,
-		}, oldIndex, newIndex)
-	})
-	if err != nil {
-		return schemaDiff{}, false, fmt.Errorf("diffing indexes: %w", err)
-	}
 
 	fsg := newForeignKeyConstraintSQLVertexGenerator(oldAndNew[schema.Schema]{old: old, new: new}, tableDiffs)
 	foreignKeyConstraintDiffs, err := diffLists(old.ForeignKeyConstraints, new.ForeignKeyConstraints, func(old, new schema.ForeignKeyConstraint, _, _ int) (foreignKeyConstraintDiff, bool, error) {
@@ -495,6 +491,20 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	}
 
 	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs, functionDiffs)
+
+	// Diff the indexes last: an index on a materialized view that this diff re-creates must be
+	// re-created too, and which materialized views are re-created is only final after the cascade
+	// above has moved the ones that read a re-created relation or a dropped function into adds.
+	addedMaterializedViewsByName := buildSchemaObjByNameMap(materializedViewDiffs.adds)
+	indexesDiff, err := diffLists(old.Indexes, new.Indexes, func(oldIndex, newIndex schema.Index, _, _ int) (indexDiff, bool, error) {
+		return buildIndexDiff(indexDiffConfig{
+			addedTablesByName:            addedTablesByName,
+			addedMaterializedViewsByName: addedMaterializedViewsByName,
+		}, oldIndex, newIndex)
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing indexes: %w", err)
+	}
 
 	return schemaDiff{
 		oldAndNew: oldAndNew[schema.Schema]{
@@ -687,6 +697,10 @@ func pruneColumnPrivilegesForDroppedColumns(deletes []schema.ColumnPrivilege, ne
 
 type indexDiffConfig struct {
 	addedTablesByName map[string]schema.Table
+	// addedMaterializedViewsByName is a map of materialized view name to the materialized views
+	// that are new or re-created. A re-created materialized view loses its indexes with the DROP,
+	// so they must be re-created just like the indexes of a re-created table.
+	addedMaterializedViewsByName map[string]schema.MaterializedView
 }
 
 // buildIndexDiff builds the index diff
@@ -696,6 +710,13 @@ func buildIndexDiff(deps indexDiffConfig, old, new schema.Index) (diff indexDiff
 	if _, isOnNewTable := deps.addedTablesByName[new.OwningRelName.GetName()]; isOnNewTable {
 		// If the table is new, then it must be re-created (this occurs if the base table has been
 		// re-created). In other words, an index must be re-created if the owning table is re-created
+		return indexDiff{}, true, nil
+	}
+
+	if _, isOnNewMaterializedView := deps.addedMaterializedViewsByName[new.OwningRelName.GetName()]; isOnNewMaterializedView &&
+		new.OwningRelKind == schema.RelKindMaterializedView {
+		// DROP MATERIALIZED VIEW drops the view's indexes, so an index must be re-created if the
+		// owning materialized view is re-created, even when its definition is unchanged.
 		return indexDiff{}, true, nil
 	}
 

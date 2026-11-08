@@ -25,6 +25,8 @@ feature areas on top of it:
 - In-place replacement of views (`CREATE OR REPLACE VIEW`) when output columns
   stay compatible, including re-creation of dependent views and ordering
   around the relations and functions the definition reads
+- Re-creation of materialized views that come back populated and with their
+  indexes, including plan validation of the populated state
 - Drop-and-recreate of functions whose signature or `BEGIN ATOMIC` body is
   affected by a change (changed result type, altered referenced columns,
   recreated composite types or domains), with dependent object re-creation

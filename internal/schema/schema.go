@@ -928,6 +928,9 @@ type MaterializedView struct {
 	// ViewDefinitionCanonical is ViewDefinition rewritten to the fixed point of
 	// pg_get_viewdef. See View.ViewDefinitionCanonical.
 	ViewDefinitionCanonical string
+	// IsPopulated reports whether the materialized view holds data (pg_class.relispopulated). A
+	// materialized view created WITH NO DATA stays unpopulated until it is refreshed.
+	IsPopulated bool
 	// Options represents key value map of materialized view options, i.e., pg_class.reloptions.
 	Options map[string]string
 	// Tablespace is the tablespace where the materialized view is stored. Empty string means default tablespace.
@@ -2577,6 +2580,7 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 			SchemaQualifiedName: schemaQualifiedName,
 			Owner:               mv.Owner,
 			ViewDefinition:      mv.ViewDefinition,
+			IsPopulated:         mv.IsPopulated,
 			Options:             options,
 			Tablespace:          mv.TablespaceName,
 			Columns:             buildViewColumns(mv.ColumnNames, mv.ColumnTypes, mv.ColumnDescriptions),

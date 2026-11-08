@@ -1530,6 +1530,8 @@ SELECT
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
     view_rule.oid AS rule_oid,
+    -- False for a view created WITH NO DATA until it is refreshed.
+    c.relispopulated AS is_populated,
     -- The materialized view's rewrite rule: pg_depend records the functions the
     -- definition calls against it.
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
@@ -1567,6 +1569,7 @@ type GetMaterializedViewsRow struct {
 	TableDependencies  []string
 	Description        string
 	RuleOid            interface{}
+	IsPopulated        bool
 	ViewDefinition     string
 }
 
@@ -1591,6 +1594,7 @@ func (q *Queries) GetMaterializedViews(ctx context.Context) ([]GetMaterializedVi
 			pq.Array(&i.TableDependencies),
 			&i.Description,
 			&i.RuleOid,
+			&i.IsPopulated,
 			&i.ViewDefinition,
 		); err != nil {
 			return nil, err
