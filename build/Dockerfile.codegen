@@ -2,9 +2,17 @@ FROM golang:1.25-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        ca-certificates \
         git \
         make \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN go install -tags=nowasm github.com/kyleconroy/sqlc/cmd/sqlc@v1.18.0
+# The generated files are produced by sqlc v1.31.1, which needs a Go toolchain newer than the one in
+# the base image; take the release binary instead of building it.
+ARG SQLC_VERSION=1.31.1
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    wget -qO- "https://github.com/sqlc-dev/sqlc/releases/download/v${SQLC_VERSION}/sqlc_${SQLC_VERSION}_linux_${arch}.tar.gz" \
+        | tar -xz -C /usr/local/bin sqlc
 ENTRYPOINT make code_gen

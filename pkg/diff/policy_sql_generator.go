@@ -347,7 +347,7 @@ func (g *newTablePoliciesSQLVertexGenerator) add(table schema.Table) (partialSQL
 			deps = append(deps, mustRun(vertexId).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 		}
 		for _, depRelation := range policy.DependsOnRelations {
-			if depRelation.GetName() == table.SchemaQualifiedName.GetName() {
+			if depRelation.GetName() == table.GetName() {
 				continue
 			}
 			deps = append(deps, mustRun(vertexId).after(buildRelationVertexId(depRelation, diffTypeAddAlter)))
