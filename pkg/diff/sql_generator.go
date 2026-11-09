@@ -224,6 +224,12 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	old = old.Normalize()
 	new = new.Normalize()
 
+	// The fork does not support partitioned tables (see the README): refuse them explicitly
+	// instead of emitting a plan for a shape the project does not use and does not test.
+	if err := refusePartitionedTables(old, new); err != nil {
+		return schemaDiff{}, false, err
+	}
+
 	schemaDiffs, err := diffLists(
 		old.NamedSchemas,
 		new.NamedSchemas,
@@ -516,6 +522,22 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		materializedViewDiffs:     materializedViewDiffs,
 		functionDependentsRebinds: functionDependentsRebinds,
 	}, false, nil
+}
+
+// refusePartitionedTables returns an error when either schema contains a partitioned table or one
+// of its partitions. The fork does not support partitioned tables, so a plan against such a schema
+// is refused explicitly instead of being generated and validated for a shape the project does not
+// use.
+func refusePartitionedTables(schemas ...schema.Schema) error {
+	for _, s := range schemas {
+		for _, t := range s.Tables {
+			if t.IsPartitioned() || t.IsPartition() {
+				return fmt.Errorf("table %s is partitioned: partitioned tables are not supported: %w",
+					t.GetFQEscapedName(), ErrNotImplemented)
+			}
+		}
+	}
+	return nil
 }
 
 func filterSchemaOwnerPrivileges(privileges []schema.SchemaPrivilege, owner string) []schema.SchemaPrivilege {

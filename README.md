@@ -137,7 +137,6 @@ ALTER TABLE "public"."foobar" DROP CONSTRAINT "pgschemadiff_tmpnn_GimngG1rRkODhK
 * A comprehensive set of features to ensure the safety of planned migrations:
   * Operators warned of dangerous operations.
   * Migration plans are validated first against a temporary database exactly as they would be performed against the real database.
-* Strong support of partitions
 # Install
 ## CLI
 Brew:
@@ -230,11 +229,17 @@ for _, stmt := range plan.Statements {
 ```
 
 # Supported Postgres versions
-Supported: 14, 15, 16, 17
+Supported: 14, 15, 16, 17, 18
 Unsupported: <= 13  are not supported. Use at your own risk.
+
+Partitioned tables are explicitly not supported: a plan against a schema that contains a
+partitioned table or one of its partitions fails with a "partitioned tables are not supported"
+error. The fork does not carry partition support, and its tests check that refusal instead of
+partition behaviour.
 
 # Unsupported migrations
 An abridged list of unsupported migrations:
+- Partitioned tables and their partitions
 - Types (Only enums and domains are currently supported)
 - Renaming. The diffing library relies on names to identify the old and new versions of a table, index, etc. If you rename
 an object, it will be treated as a drop and an add

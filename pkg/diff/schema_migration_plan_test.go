@@ -105,7 +105,7 @@ var (
 			},
 		},
 		{
-			name: "Invalid index of partitioned index re-created but original index remains untouched",
+			name: "Partitioned index is refused with the partitioned tables",
 			oldSchema: schema.Schema{
 				Tables: []schema.Table{
 					{
@@ -191,34 +191,7 @@ var (
 					},
 				},
 			},
-			expectedStatements: []Statement{
-				{
-					DDL:         "ALTER INDEX \"public\".\"foobar_1_some_idx\" RENAME TO \"pgschemadiff_tmpidx_foobar_1_some_idx_EBESExQVRheYGRobHB0eHw\"",
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-				},
-				{
-					DDL:         "CREATE INDEX CONCURRENTLY foobar_1_some_idx ON public.foobar_1 USING btree (foo, bar)",
-					Timeout:     statementTimeoutConcurrentIndexBuild,
-					LockTimeout: lockTimeoutDefault,
-					Hazards: []MigrationHazard{
-						buildIndexBuildHazard(),
-					},
-				},
-				{
-					DDL:         "ALTER INDEX \"public\".\"some_idx\" ATTACH PARTITION \"public\".\"foobar_1_some_idx\"",
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-				},
-				{
-					DDL:         "DROP INDEX CONCURRENTLY \"public\".\"pgschemadiff_tmpidx_foobar_1_some_idx_EBESExQVRheYGRobHB0eHw\"",
-					Timeout:     statementTimeoutConcurrentIndexDrop,
-					LockTimeout: lockTimeoutDefault,
-					Hazards: []MigrationHazard{
-						buildIndexDroppedQueryPerfHazard(),
-					},
-				},
-			},
+			expectedDiffErrIs: ErrNotImplemented,
 		},
 		{
 			name: "Fails on duplicate column in old schema",
@@ -252,7 +225,7 @@ var (
 			expectedDiffErrIs:  errDuplicateIdentifier,
 		},
 		{
-			name: "Handle infinite index loop without panicking",
+			name:      "Partitioned index loop is refused with the partitioned tables",
 			oldSchema: schema.Schema{
 				Tables: []schema.Table{
 					{
@@ -341,7 +314,7 @@ var (
 					},
 				},
 			},
-			expectedDiffErrContains: "loop detected",
+			expectedDiffErrIs: ErrNotImplemented,
 		},
 		{
 			name:      "Add materialized view generates WITH NO DATA",
@@ -424,6 +397,22 @@ var (
 					LockTimeout: lockTimeoutDefault,
 				},
 			},
+		},
+		{
+			name:      "Partitioned tables are refused",
+			oldSchema: schema.Schema{},
+			newSchema: schema.Schema{
+				Tables: []schema.Table{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("partitioned"),
+						},
+						PartitionKeyDef: "RANGE (id)",
+					},
+				},
+			},
+			expectedDiffErrIs: ErrNotImplemented,
 		},
 	}
 )
