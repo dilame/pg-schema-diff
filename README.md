@@ -27,6 +27,8 @@ feature areas on top of it:
   around the relations and functions the definition reads
 - Re-creation of materialized views that come back populated and with their
   indexes, including plan validation of the populated state
+- Generated columns in the schema model, plan generation and validation:
+  `GENERATED ALWAYS AS … STORED` and PostgreSQL 18 `VIRTUAL`
 - Drop-and-recreate of functions whose signature or `BEGIN ATOMIC` body is
   affected by a change (changed result type, altered referenced columns,
   recreated composite types or domains), with dependent object re-creation

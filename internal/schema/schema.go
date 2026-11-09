@@ -510,13 +510,15 @@ type (
 		//   CURRENT_TIMESTAMP
 		// If empty, indicates that there is no default value.
 		Default string
-		// If the column is a generated column, this will be true.
-		IsGenerated bool
+		// GeneratedColumnType is pg_attribute.attgenerated: empty for an ordinary column,
+		// GeneratedColumnTypeStored for a stored generated column, and
+		// GeneratedColumnTypeVirtual for a virtual one (PostgreSQL 18+).
+		GeneratedColumnType string
 		// If the column is a generated column, this will be the generation expression.
 		// Examples:
 		//   to_tsvector('simple', title || ' ' || coalesce(artist, ''))
 		//   (price * 1.1)
-		// Only populated if IsGenerated is true.
+		// Only populated if GeneratedColumnType is not empty.
 		GenerationExpression string
 		IsNullable           bool
 		// HasMissingValOptimization refers to the 'attmissingval' optimization for adding columns with a default.
@@ -531,6 +533,16 @@ type (
 		// refuses to drop such a function while the default exists.
 		DefaultDependsOnFunctions []SchemaQualifiedName
 	}
+)
+
+// The values of pg_attribute.attgenerated.
+const (
+	// GeneratedColumnTypeStored is a generated column whose values are computed and stored when
+	// a row is written.
+	GeneratedColumnTypeStored = "s"
+	// GeneratedColumnTypeVirtual is a generated column whose values are computed when the row is
+	// read (PostgreSQL 18 and later).
+	GeneratedColumnTypeVirtual = "v"
 )
 
 func (c Column) GetName() string {
@@ -1777,7 +1789,7 @@ func (s *schemaFetcher) buildTable(
 			//   CURRENT_TIMESTAMP
 			// If empty, indicates that there is no default value.
 			Default:              column.DefaultValue,
-			IsGenerated:          column.IsGenerated,
+			GeneratedColumnType:  column.GenerationType,
 			GenerationExpression: column.GenerationExpression,
 			Size:                 int(column.ColumnSize),
 			Identity:             identity,

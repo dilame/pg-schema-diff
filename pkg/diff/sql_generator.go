@@ -1756,9 +1756,10 @@ func (csg *columnSQLVertexGenerator) Add(column schema.Column) ([]Statement, err
 }
 
 func newColumnRequiresFullTableRewrite(column schema.Column) bool {
-	// Generated columns require computing the expression for every existing row, causing a full
-	// table rewrite.
-	if column.IsGenerated {
+	// A stored generated column requires computing the expression for every existing row, causing a
+	// full table rewrite. A virtual one is computed on read, so adding it does not rewrite the
+	// table.
+	if column.GeneratedColumnType == schema.GeneratedColumnTypeStored {
 		return true
 	}
 	// Columns with defaults use PostgreSQL's "fast default" optimization (PostgreSQL 11+) for
@@ -3360,8 +3361,12 @@ func buildColumnDefinition(column schema.Column) (string, error) {
 	if column.IsCollated() {
 		sb.WriteString(fmt.Sprintf(" COLLATE %s", column.Collation.GetFQEscapedName()))
 	}
-	if column.IsGenerated {
-		sb.WriteString(fmt.Sprintf(" GENERATED ALWAYS AS (%s) STORED", column.GenerationExpression))
+	if column.GeneratedColumnType != "" {
+		generationModifier := "STORED"
+		if column.GeneratedColumnType == schema.GeneratedColumnTypeVirtual {
+			generationModifier = "VIRTUAL"
+		}
+		sb.WriteString(fmt.Sprintf(" GENERATED ALWAYS AS (%s) %s", column.GenerationExpression, generationModifier))
 	} else if len(column.Default) > 0 {
 		sb.WriteString(fmt.Sprintf(" DEFAULT %s", column.Default))
 	}

@@ -47,7 +47,7 @@ func TestBuildColumnDefinition(t *testing.T) {
 			column: schema.Column{
 				Name:                 "search_vector",
 				Type:                 "tsvector",
-				IsGenerated:          true,
+				GeneratedColumnType:  schema.GeneratedColumnTypeStored,
 				GenerationExpression: "to_tsvector('simple', title || ' ' || coalesce(artist, ''))",
 				IsNullable:           true,
 			},
@@ -58,11 +58,22 @@ func TestBuildColumnDefinition(t *testing.T) {
 			column: schema.Column{
 				Name:                 "price_with_tax",
 				Type:                 "numeric(10,2)",
-				IsGenerated:          true,
+				GeneratedColumnType:  schema.GeneratedColumnTypeStored,
 				GenerationExpression: "price * 1.1",
 				IsNullable:           false,
 			},
 			expected: `"price_with_tax" numeric(10,2) GENERATED ALWAYS AS (price * 1.1) STORED NOT NULL`,
+		},
+		{
+			name: "Virtual generated column",
+			column: schema.Column{
+				Name:                 "price_with_tax",
+				Type:                 "numeric(10,2)",
+				GeneratedColumnType:  schema.GeneratedColumnTypeVirtual,
+				GenerationExpression: "price * 1.1",
+				IsNullable:           true,
+			},
+			expected: `"price_with_tax" numeric(10,2) GENERATED ALWAYS AS (price * 1.1) VIRTUAL`,
 		},
 		{
 			name: "Regular column with NOT NULL",
