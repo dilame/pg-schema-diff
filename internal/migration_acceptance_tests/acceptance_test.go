@@ -6,6 +6,7 @@ import (
 	"fmt"
 	stdlog "log"
 	"os"
+	"regexp"
 	"testing"
 
 	"github.com/google/uuid"
@@ -46,7 +47,11 @@ type (
 
 		// expectedHazardTypes should contain all the unique migration hazard types that are expected to be within the
 		// generated plan
-		expectedHazardTypes       []diff.MigrationHazardType
+		expectedHazardTypes []diff.MigrationHazardType
+		// oldSchemaDDLBeforePG15 and newSchemaDDLBeforePG15, when non-nil, replace oldSchemaDDL and newSchemaDDL
+		// on servers before PostgreSQL 15, when a fixture uses an option those versions do not have.
+		oldSchemaDDLBeforePG15    []string
+		newSchemaDDLBeforePG15    []string
 		expectedPlanErrorIs       error
 		expectedPlanErrorContains string
 		// expectedPlanDDL is used to assert the exact DDL (of the statements) that  generated. This is useful when asserting
@@ -102,9 +107,6 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	_, err := uuid.NewRandomFromReader(deterministicRandReader)
 	require.NoError(t, err)
 	tc.planOpts = append([]diff.PlanOpt{diff.WithLogger(log.SimpleLogger()), diff.WithRandReader(deterministicRandReader)}, tc.planOpts...)
-	if tc.expectedDBSchemaDDL == nil {
-		tc.expectedDBSchemaDDL = tc.newSchemaDDL
-	}
 	if tc.planFactory == nil {
 		tc.planFactory = func(ctx context.Context, connPool sqldb.Queryable, tempDbFactory tempdb.Factory, newSchemaDDL []string, opts ...diff.PlanOpt) (diff.Plan, error) {
 
@@ -130,6 +132,19 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	rootDb, err := sql.Open("pgx", engine.GetPostgresDatabaseDSN())
 	require.NoError(t, err)
 	defer rootDb.Close()
+	var serverVersionNum int
+	require.NoError(t, rootDb.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		if tc.oldSchemaDDLBeforePG15 != nil {
+			tc.oldSchemaDDL = tc.oldSchemaDDLBeforePG15
+		}
+		if tc.newSchemaDDLBeforePG15 != nil {
+			tc.newSchemaDDL = tc.newSchemaDDLBeforePG15
+		}
+	}
+	if tc.expectedDBSchemaDDL == nil {
+		tc.expectedDBSchemaDDL = tc.newSchemaDDL
+	}
 	for _, r := range tc.roles {
 		_, err := rootDb.Exec(fmt.Sprintf("CREATE ROLE %s", r))
 		require.NoError(t, err)
@@ -194,6 +209,15 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		for _, stmt := range plan.Statements {
 			generatedDDL = append(generatedDDL, stmt.DDL)
 		}
+		// PostgreSQL 14 and 15 qualify a view's column references with the relation ("SELECT foo.id")
+		// where 16 and later omit the qualifier when it is unambiguous. The generated text is the
+		// server's deparse either way, so compare both sides in the same dialect.
+		for i := range tc.expectedPlanDDL {
+			tc.expectedPlanDDL[i] = canonicalizeViewDeparseQualifiers(tc.expectedPlanDDL[i])
+		}
+		for i := range generatedDDL {
+			generatedDDL[i] = canonicalizeViewDeparseQualifiers(generatedDDL[i])
+		}
 		// In the future, we might want to allow users to assert expectations for vanilla options and data packing
 		//
 		// We can also make the system more advanced by using tokens in place of the "randomly" generated UUIDs, such
@@ -213,6 +237,22 @@ func assertValidPlan(t *testing.T, plan diff.Plan) {
 		assert.Greater(t, stmt.Timeout.Nanoseconds(), int64(0), "timeout should be greater than 0. stmt=%+v", stmt)
 		assert.Greater(t, stmt.LockTimeout.Nanoseconds(), int64(0), "lock timeout should be greater than 0. stmt=%+v", stmt)
 	}
+}
+
+var (
+	viewStatementPrefix    = regexp.MustCompile(`^CREATE (OR REPLACE )?(MATERIALIZED )?VIEW `)
+	relationQualifierRegex = regexp.MustCompile(`(^|[^A-Za-z0-9_."])([A-Za-z_][A-Za-z0-9_]*)\.`)
+)
+
+// canonicalizeViewDeparseQualifiers removes the relation qualifier PostgreSQL 14 and 15 print in a
+// view definition when PostgreSQL 16 and later leave it out. It is applied to both the expected and
+// the generated DDL, so the assertion keeps comparing the whole statement; only the deparse
+// dialect, which depends on the server version, is dropped.
+func canonicalizeViewDeparseQualifiers(ddl string) string {
+	if !viewStatementPrefix.MatchString(ddl) {
+		return ddl
+	}
+	return relationQualifierRegex.ReplaceAllString(ddl, "$1")
 }
 
 func directlyRunDDLAndGetDump(t *testing.T, engine *pgengine.Engine, ddl []string) string {
