@@ -759,7 +759,7 @@ type Function struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the function (pg_description). Empty means no comment.
 	Description string
-	Privileges              []Privilege
+	Privileges  []Privilege
 	// DependsOnDomains is the list of domains referenced by the function's signature
 	// (argument or return types). The function must be created after those domains exist.
 	DependsOnDomains []SchemaQualifiedName
@@ -785,7 +785,7 @@ type Procedure struct {
 	DependsOnCompositeTypes []SchemaQualifiedName
 	// Description is the comment attached to the procedure (pg_description). Empty means no comment.
 	Description string
-	Privileges              []Privilege
+	Privileges  []Privilege
 	// DependsOnDomains — see Function.DependsOnDomains.
 	DependsOnDomains []SchemaQualifiedName
 	// DependsOnRelations — see Function.DependsOnRelations.

@@ -2,9 +2,28 @@ FROM golang:1.25-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        ca-certificates \
         git \
         make \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN go install -tags=nowasm github.com/kyleconroy/sqlc/cmd/sqlc@v1.18.0
+# The generated files are produced by sqlc v1.31.1, which needs a Go toolchain newer than the one in
+# the base image; take the release binary instead of building it. The tarball is verified against
+# the sha256 GitHub publishes for the release asset before it is unpacked.
+ARG SQLC_VERSION=1.31.1
+ARG SQLC_SHA256_AMD64=497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354
+ARG SQLC_SHA256_ARM64=b7cae247740d0c51a1e657479e5b2d21e6fef428f596682a01bc55bf4ab8a23d
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) sqlc_sha256="$SQLC_SHA256_AMD64" ;; \
+        arm64) sqlc_sha256="$SQLC_SHA256_ARM64" ;; \
+        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    wget -qO /tmp/sqlc.tar.gz \
+        "https://github.com/sqlc-dev/sqlc/releases/download/v${SQLC_VERSION}/sqlc_${SQLC_VERSION}_linux_${arch}.tar.gz"; \
+    echo "${sqlc_sha256}  /tmp/sqlc.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/sqlc.tar.gz -C /usr/local/bin sqlc; \
+    rm /tmp/sqlc.tar.gz
 ENTRYPOINT make code_gen
