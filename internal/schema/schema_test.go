@@ -20,9 +20,12 @@ type testCase struct {
 	ddl            []string
 	expectedSchema Schema
 	// expectedHash is the expected hash of the schema. If it is not provided, the test will not validate the hash.
-	expectedHash        string
-	expectedErrIs       error
-	expectedErrContains string
+	expectedHash string
+	// expectedHashBeforePG15 is used instead on servers before PostgreSQL 15, where the public
+	// schema has a different owner and privileges.
+	expectedHashBeforePG15 string
+	expectedErrIs          error
+	expectedErrContains    string
 }
 
 var (
@@ -278,7 +281,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash: "d2780fd411ecde18",
+			expectedHash:           "d2780fd411ecde18",
+			expectedHashBeforePG15: "695eef9e7acfd915",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -701,7 +705,8 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash: "460bdcd458ca38bf",
+			expectedHash:           "460bdcd458ca38bf",
+			expectedHashBeforePG15: "376b8d46a34e7c1d",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1294,7 +1299,8 @@ var (
 				CREATE TYPE pg_temp.color AS ENUM ('red', 'green', 'blue');
 			`},
 			// Assert empty schema hash, since we want to validate specifically that this hash is deterministic
-			expectedHash: "88672a4b111c43a5",
+			expectedHash:           "88672a4b111c43a5",
+			expectedHashBeforePG15: "868ef452ba32df31",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1465,6 +1471,13 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	}
 
 	expectedSchema := fillDefaultObjectOwners(testCase.expectedSchema)
+	var serverVersionNum int
+	require.NoError(t, connPool.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	if serverVersionNum < 150000 {
+		// PostgreSQL 15 moved the public schema from the bootstrap superuser to pg_database_owner
+		// and cut its privileges down to PUBLIC's USAGE.
+		expectedSchema = replacePublicSchemaBeforePG15(expectedSchema)
+	}
 	expectedNormalized := expectedSchema.Normalize()
 	fetchedNormalized := fetchedSchema.Normalize()
 	assert.Equal(t, expectedNormalized, fetchedNormalized, "expected=\n%# v \n fetched=%# v\n", pretty.Formatter(expectedNormalized), pretty.Formatter(fetchedNormalized))
@@ -1475,10 +1488,37 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	require.NoError(t, err)
 	// same schemas should have the same hashes
 	assert.Equal(t, expectedSchemaHash, fetchedSchemaHash, "hash of expected schema should match fetched hash")
-	if testCase.expectedHash != "" {
-		// Optionally assert that the hash matches the expected hash
-		assert.Equal(t, testCase.expectedHash, fetchedSchemaHash)
+	expectedHash := testCase.expectedHash
+	if serverVersionNum < 150000 && testCase.expectedHashBeforePG15 != "" {
+		expectedHash = testCase.expectedHashBeforePG15
 	}
+	if expectedHash != "" {
+		// Optionally assert that the hash matches the expected hash
+		assert.Equal(t, expectedHash, fetchedSchemaHash)
+	}
+}
+
+// replacePublicSchemaBeforePG15 swaps the expected public schema for the one PostgreSQL 14 creates:
+// owned by the bootstrap superuser with PUBLIC's USAGE and CREATE. PostgreSQL 15 changed it to
+// pg_database_owner with USAGE only.
+func replacePublicSchemaBeforePG15(s Schema) Schema {
+	publicBeforePG15 := NamedSchema{
+		Name:        publicSchema.Name,
+		Description: publicSchema.Description,
+		Owner:       "postgres",
+		Privileges: []SchemaPrivilege{
+			{Grantee: "", Privilege: "USAGE", IsGrantable: false},
+			{Grantee: "", Privilege: "CREATE", IsGrantable: false},
+		},
+	}
+	namedSchemas := append([]NamedSchema(nil), s.NamedSchemas...)
+	for i := range namedSchemas {
+		if namedSchemas[i].Name == publicSchema.Name && namedSchemas[i].Owner == publicSchema.Owner {
+			namedSchemas[i] = publicBeforePG15
+		}
+	}
+	s.NamedSchemas = namedSchemas
+	return s
 }
 
 func fillDefaultObjectOwners(s Schema) Schema {

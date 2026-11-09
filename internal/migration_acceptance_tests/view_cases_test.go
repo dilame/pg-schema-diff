@@ -826,6 +826,47 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
             COMMENT ON VIEW outer_view IS 'outer';
             COMMENT ON COLUMN outer_view.id IS 'the outer id';
 		`},
+		// PostgreSQL 14 has no security_invoker option; the views keep the option it does have.
+		oldSchemaDDLBeforePG15: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW inner_view WITH (security_barrier = true) AS
+                SELECT id, foo
+                FROM foobar;
+            ALTER VIEW inner_view OWNER TO view_owner;
+            GRANT SELECT ON inner_view TO reader;
+            COMMENT ON VIEW inner_view IS 'inner';
+            COMMENT ON COLUMN inner_view.id IS 'the id';
+
+            CREATE VIEW outer_view WITH (security_barrier = true) AS
+                SELECT id
+                FROM inner_view;
+            ALTER VIEW outer_view OWNER TO view_owner;
+            GRANT SELECT ON outer_view TO reader;
+            COMMENT ON VIEW outer_view IS 'outer';
+            COMMENT ON COLUMN outer_view.id IS 'the outer id';
+		`},
+		newSchemaDDLBeforePG15: []string{
+			`
+            CREATE TABLE foobar(id INT, foo INT);
+
+            CREATE VIEW inner_view WITH (security_barrier = true) AS
+                SELECT id::BIGINT AS id, foo
+                FROM foobar;
+            ALTER VIEW inner_view OWNER TO view_owner;
+            GRANT SELECT ON inner_view TO reader;
+            COMMENT ON VIEW inner_view IS 'inner';
+            COMMENT ON COLUMN inner_view.id IS 'the id';
+
+            CREATE VIEW outer_view WITH (security_barrier = true) AS
+                SELECT id
+                FROM inner_view;
+            ALTER VIEW outer_view OWNER TO view_owner;
+            GRANT SELECT ON outer_view TO reader;
+            COMMENT ON VIEW outer_view IS 'outer';
+            COMMENT ON COLUMN outer_view.id IS 'the outer id';
+		`},
 		// A retyped column cannot be replaced in place, so both views are dropped and created again,
 		// and each comes back with everything it carried: the database after the plan matches the
 		// target's dump, grants, comments, options and owners included.
