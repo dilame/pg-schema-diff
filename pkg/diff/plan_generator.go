@@ -272,33 +272,45 @@ func assertValidPlan(ctx context.Context,
 	plan Plan,
 	planOptions *planOptions,
 ) error {
+	return withTempDb(ctx, tempDbFactory, planOptions.logger, func(tempDb *tempdb.Database) error {
+		if err := setSchemaForEmptyDatabase(ctx, tempDb, currentSchema, planOptions); err != nil {
+			return fmt.Errorf("inserting schema in temporary database: %w", err)
+		}
+
+		if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements, planOptions.disableCheckFunctionBodies); err != nil {
+			return fmt.Errorf("running migration plan: %w", err)
+		}
+
+		migratedSchema, err := schemaFromTempDb(ctx, tempDb, planOptions)
+		if err != nil {
+			return fmt.Errorf("fetching schema from migrated database: %w", err)
+		}
+
+		return assertMigratedSchemaMatchesTarget(ctx, tempDbFactory, migratedSchema, newSchema, planOptions)
+	})
+}
+
+// withTempDb creates a temporary database, caps its connections and drops it after fn returns.
+func withTempDb(
+	ctx context.Context,
+	tempDbFactory tempdb.Factory,
+	logger log.Logger,
+	fn func(*tempdb.Database) error,
+) error {
 	tempDb, err := tempDbFactory.Create(ctx)
 	if err != nil {
 		return err
 	}
 	defer func(closer tempdb.ContextualCloser) {
 		if err := closer.Close(ctx); err != nil {
-			planOptions.logger.Errorf("an error occurred while dropping the temp database: %s", err)
+			logger.Errorf("an error occurred while dropping the temp database: %s", err)
 		}
 	}(tempDb.ContextualCloser)
 	// Set a max connections if a user has not set one. This is to prevent us from exploding the number of connections
 	// on the database.
 	setMaxConnectionsIfNotSet(tempDb.ConnPool, tempDbMaxConnections)
 
-	if err := setSchemaForEmptyDatabase(ctx, tempDb, currentSchema, planOptions); err != nil {
-		return fmt.Errorf("inserting schema in temporary database: %w", err)
-	}
-
-	if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements, planOptions.disableCheckFunctionBodies); err != nil {
-		return fmt.Errorf("running migration plan: %w", err)
-	}
-
-	migratedSchema, err := schemaFromTempDb(ctx, tempDb, planOptions)
-	if err != nil {
-		return fmt.Errorf("fetching schema from migrated database: %w", err)
-	}
-
-	return assertMigratedSchemaMatchesTarget(migratedSchema, newSchema, planOptions)
+	return fn(tempDb)
 }
 
 func setMaxConnectionsIfNotSet(db *sql.DB, defaultMax int) {
@@ -399,13 +411,30 @@ func clearSkippedPrivileges(s schema.Schema) schema.Schema {
 	return s
 }
 
-func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema schema.Schema, planOptions *planOptions) error {
+func assertMigratedSchemaMatchesTarget(
+	ctx context.Context,
+	tempDbFactory tempdb.Factory,
+	migratedSchema, targetSchema schema.Schema,
+	planOptions *planOptions,
+) error {
 	// Clear privileges from both schemas since privilege statements are skipped during validation
 	// (roles don't exist in temp DB). We make copies to avoid modifying the original schemas.
 	migratedSchema = clearSkippedPrivileges(migratedSchema)
 	targetSchema = clearSkippedPrivileges(targetSchema)
 
-	toTargetSchemaStmts, err := generateMigrationStatements(migratedSchema, targetSchema, planOptions)
+	// The migrated schema is the result of a create-and-read cycle in a temporary database.
+	// PostgreSQL does not always print a definition back the way it parsed it: a trigger whose WHEN
+	// condition compares three or more columns as a row is stored as nested ORs and prints that
+	// way, but parses back into a flat OR. Comparing the migrated schema with the target as it was
+	// read from its source would then report a difference where only the deparse differs. Put the
+	// target through the same cycle, so the two sides are comparable.
+	expectedSchema, err := schemaFromFreshTempDb(ctx, tempDbFactory, targetSchema, planOptions)
+	if err != nil {
+		return fmt.Errorf("inserting target schema in temporary database: %w", err)
+	}
+	expectedSchema = clearSkippedPrivileges(expectedSchema)
+
+	toTargetSchemaStmts, err := generateMigrationStatements(migratedSchema, expectedSchema, planOptions)
 	if err != nil {
 		return fmt.Errorf("building schema diff between migrated database and new schema: %w", err)
 	}
@@ -419,6 +448,29 @@ func assertMigratedSchemaMatchesTarget(migratedSchema, targetSchema schema.Schem
 	}
 
 	return nil
+}
+
+// schemaFromFreshTempDb reconstructs the schema in a new temporary database and reads it back,
+// which is how validation materializes the current schema (see setSchemaForEmptyDatabase).
+func schemaFromFreshTempDb(
+	ctx context.Context,
+	tempDbFactory tempdb.Factory,
+	s schema.Schema,
+	planOptions *planOptions,
+) (schema.Schema, error) {
+	var fetched schema.Schema
+	err := withTempDb(ctx, tempDbFactory, planOptions.logger, func(tempDb *tempdb.Database) error {
+		if err := setSchemaForEmptyDatabase(ctx, tempDb, s, planOptions); err != nil {
+			return fmt.Errorf("inserting schema in temporary database: %w", err)
+		}
+		var err error
+		fetched, err = schemaFromTempDb(ctx, tempDb, planOptions)
+		if err != nil {
+			return fmt.Errorf("fetching schema from temporary database: %w", err)
+		}
+		return nil
+	})
+	return fetched, err
 }
 
 // executeStatementsIgnoreTimeouts executes the statements using the sql connection but ignores any provided timeouts.
