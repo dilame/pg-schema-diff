@@ -105,122 +105,6 @@ var (
 			},
 		},
 		{
-			name: "Invalid index of partitioned index re-created but original index remains untouched",
-			oldSchema: schema.Schema{
-				Tables: []schema.Table{
-					{
-						SchemaQualifiedName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar\""},
-						Columns: []schema.Column{
-							{Name: "id", Type: "integer"},
-							{Name: "foo", Type: "character varying(255)", Default: "''::character varying", Collation: defaultCollation},
-							{Name: "bar", Type: "timestamp without time zone", IsNullable: true, Default: "CURRENT_TIMESTAMP"},
-						},
-						CheckConstraints: nil,
-						ReplicaIdentity:  schema.ReplicaIdentityDefault,
-						PartitionKeyDef:  "LIST(foo)",
-					},
-					{
-						ParentTable:         &schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar\""},
-						SchemaQualifiedName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar_1\""},
-						Columns: []schema.Column{
-							{Name: "id", Type: "integer"},
-							{Name: "foo", Type: "character varying(255)", Default: "''::character varying", Collation: defaultCollation},
-							{Name: "bar", Type: "timestamp without time zone", IsNullable: true, Default: "CURRENT_TIMESTAMP"},
-						},
-						CheckConstraints: nil,
-						ReplicaIdentity:  schema.ReplicaIdentityDefault,
-						ForValues:        "FOR VALUES IN ('some_val')",
-					},
-				},
-				Indexes: []schema.Index{
-					// foobar indexes
-					{
-						OwningRelName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar\""},
-						Name:          "some_idx", Columns: []string{"foo, bar"},
-						GetIndexDefStmt: "CREATE INDEX some_idx ON ONLY public.foobar USING btree (foo, bar)",
-						IsInvalid:       true,
-					},
-					// foobar_1 indexes
-					{
-						OwningRelName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar_1\""},
-						Name:          "foobar_1_some_idx", Columns: []string{"foo", "bar"},
-						GetIndexDefStmt: "CREATE INDEX foobar_1_some_idx ON public.foobar_1 USING btree (foo, bar)",
-						IsInvalid:       true,
-					},
-				},
-			},
-			newSchema: schema.Schema{
-				Tables: []schema.Table{
-					{
-						SchemaQualifiedName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar\""},
-						Columns: []schema.Column{
-							{Name: "id", Type: "integer"},
-							{Name: "foo", Type: "character varying(255)", Default: "''::character varying", Collation: defaultCollation},
-							{Name: "bar", Type: "timestamp without time zone", IsNullable: true, Default: "CURRENT_TIMESTAMP"},
-						},
-						CheckConstraints: nil,
-						ReplicaIdentity:  schema.ReplicaIdentityDefault,
-						PartitionKeyDef:  "LIST(foo)",
-					},
-					{
-						ParentTable:         &schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar\""},
-						SchemaQualifiedName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar_1\""},
-						Columns: []schema.Column{
-							{Name: "id", Type: "integer"},
-							{Name: "foo", Type: "character varying(255)", Default: "''::character varying", Collation: defaultCollation},
-							{Name: "bar", Type: "timestamp without time zone", IsNullable: true, Default: "CURRENT_TIMESTAMP"},
-						},
-						CheckConstraints: nil,
-						ReplicaIdentity:  schema.ReplicaIdentityDefault,
-						ForValues:        "FOR VALUES IN ('some_val')",
-					},
-				},
-				Indexes: []schema.Index{
-					// foobar indexes
-					{
-						OwningRelName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar\""},
-						Name:          "some_idx", Columns: []string{"foo, bar"},
-						GetIndexDefStmt: "CREATE INDEX some_idx ON ONLY public.foobar USING btree (foo, bar)",
-					},
-					// foobar_1 indexes
-					{
-						OwningRelName: schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar_1\""},
-						Name:          "foobar_1_some_idx", Columns: []string{"foo", "bar"},
-						ParentIdx:       &schema.SchemaQualifiedName{SchemaName: "public", EscapedName: "\"some_idx\""},
-						GetIndexDefStmt: "CREATE INDEX foobar_1_some_idx ON public.foobar_1 USING btree (foo, bar)",
-					},
-				},
-			},
-			expectedStatements: []Statement{
-				{
-					DDL:         "ALTER INDEX \"public\".\"foobar_1_some_idx\" RENAME TO \"pgschemadiff_tmpidx_foobar_1_some_idx_EBESExQVRheYGRobHB0eHw\"",
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-				},
-				{
-					DDL:         "CREATE INDEX CONCURRENTLY foobar_1_some_idx ON public.foobar_1 USING btree (foo, bar)",
-					Timeout:     statementTimeoutConcurrentIndexBuild,
-					LockTimeout: lockTimeoutDefault,
-					Hazards: []MigrationHazard{
-						buildIndexBuildHazard(),
-					},
-				},
-				{
-					DDL:         "ALTER INDEX \"public\".\"some_idx\" ATTACH PARTITION \"public\".\"foobar_1_some_idx\"",
-					Timeout:     statementTimeoutDefault,
-					LockTimeout: lockTimeoutDefault,
-				},
-				{
-					DDL:         "DROP INDEX CONCURRENTLY \"public\".\"pgschemadiff_tmpidx_foobar_1_some_idx_EBESExQVRheYGRobHB0eHw\"",
-					Timeout:     statementTimeoutConcurrentIndexDrop,
-					LockTimeout: lockTimeoutDefault,
-					Hazards: []MigrationHazard{
-						buildIndexDroppedQueryPerfHazard(),
-					},
-				},
-			},
-		},
-		{
 			name: "Fails on duplicate column in old schema",
 			oldSchema: schema.Schema{
 				Tables: []schema.Table{
@@ -252,7 +136,7 @@ var (
 			expectedDiffErrIs:  errDuplicateIdentifier,
 		},
 		{
-			name: "Handle infinite index loop without panicking",
+			name: "Partitioned index loop is refused with the partitioned tables",
 			oldSchema: schema.Schema{
 				Tables: []schema.Table{
 					{
@@ -341,7 +225,7 @@ var (
 					},
 				},
 			},
-			expectedDiffErrContains: "loop detected",
+			expectedDiffErrIs: ErrNotImplemented,
 		},
 		{
 			name:      "Add materialized view generates WITH NO DATA",
@@ -424,6 +308,22 @@ var (
 					LockTimeout: lockTimeoutDefault,
 				},
 			},
+		},
+		{
+			name:      "Partitioned tables are refused",
+			oldSchema: schema.Schema{},
+			newSchema: schema.Schema{
+				Tables: []schema.Table{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("partitioned"),
+						},
+						PartitionKeyDef: "RANGE (id)",
+					},
+				},
+			},
+			expectedDiffErrIs: ErrNotImplemented,
 		},
 	}
 )

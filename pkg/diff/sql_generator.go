@@ -224,6 +224,12 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	old = old.Normalize()
 	new = new.Normalize()
 
+	// The fork does not support partitioned tables (see the README): refuse them explicitly
+	// instead of emitting a plan for a shape the project does not use and does not test.
+	if err := refusePartitionedTables(old, new); err != nil {
+		return schemaDiff{}, false, err
+	}
+
 	schemaDiffs, err := diffLists(
 		old.NamedSchemas,
 		new.NamedSchemas,
@@ -334,16 +340,12 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		return schemaDiff{}, false, fmt.Errorf("diffing tables: %w", err)
 	}
 
-	newSchemaTablesByName := buildSchemaObjByNameMap(new.Tables)
 	addedTablesByName := buildSchemaObjByNameMap(tableDiffs.adds)
 	deletedTablesByName := buildSchemaObjByNameMap(tableDiffs.deletes)
 	tableDiffsByName := buildDiffByNameMap[schema.Table, tableDiff](tableDiffs.alters)
 	indexesDiff, err := diffLists(old.Indexes, new.Indexes, func(oldIndex, newIndex schema.Index, _, _ int) (indexDiff, bool, error) {
 		return buildIndexDiff(indexDiffConfig{
-			newSchemaTablesByName:  newSchemaTablesByName,
-			addedTablesByName:      addedTablesByName,
-			oldSchemaIndexesByName: buildSchemaObjByNameMap(old.Indexes),
-			newSchemaIndexesByName: buildSchemaObjByNameMap(new.Indexes),
+			addedTablesByName: addedTablesByName,
 		}, oldIndex, newIndex)
 	})
 	if err != nil {
@@ -518,6 +520,22 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	}, false, nil
 }
 
+// refusePartitionedTables returns an error when either schema contains a partitioned table or one
+// of its partitions. The fork does not support partitioned tables, so a plan against such a schema
+// is refused explicitly instead of being generated and validated for a shape the project does not
+// use.
+func refusePartitionedTables(schemas ...schema.Schema) error {
+	for _, s := range schemas {
+		for _, t := range s.Tables {
+			if t.IsPartitioned() || t.IsPartition() {
+				return fmt.Errorf("table %s is partitioned: partitioned tables are not supported: %w",
+					t.GetFQEscapedName(), ErrNotImplemented)
+			}
+		}
+	}
+	return nil
+}
+
 func filterSchemaOwnerPrivileges(privileges []schema.SchemaPrivilege, owner string) []schema.SchemaPrivilege {
 	if owner == "" {
 		return privileges
@@ -668,27 +686,11 @@ func pruneColumnPrivilegesForDroppedColumns(deletes []schema.ColumnPrivilege, ne
 }
 
 type indexDiffConfig struct {
-	newSchemaTablesByName map[string]schema.Table
-	addedTablesByName     map[string]schema.Table
-
-	// oldSchemaIndexesByName and newSchemaIndexesByName by name are hackaround because the diff function does not yet support hierarchies
-	oldSchemaIndexesByName map[string]schema.Index
-	newSchemaIndexesByName map[string]schema.Index
-
-	// seenIndexByName is used to prevent infinite recursion when diffing indexes
-	seenIndexesByName map[string]bool
+	addedTablesByName map[string]schema.Table
 }
 
 // buildIndexDiff builds the index diff
 func buildIndexDiff(deps indexDiffConfig, old, new schema.Index) (diff indexDiff, requiresRecreation bool, err error) {
-	if deps.seenIndexesByName == nil {
-		deps.seenIndexesByName = make(map[string]bool)
-	} else if deps.seenIndexesByName[new.GetName()] {
-		// Prevent infinite recursion
-		return indexDiff{}, false, fmt.Errorf("loop detected between indexes that starts with %q. %v", new.GetName(), deps.seenIndexesByName)
-	}
-	deps.seenIndexesByName[new.GetName()] = true
-
 	updatedOld := old
 
 	if _, isOnNewTable := deps.addedTablesByName[new.OwningRelName.GetName()]; isOnNewTable {
@@ -697,56 +699,9 @@ func buildIndexDiff(deps indexDiffConfig, old, new schema.Index) (diff indexDiff
 		return indexDiff{}, true, nil
 	}
 
-	if old.ParentIdx == nil {
-		// If the old index didn't belong to a partitioned index (and the new index does), we can resolve the parent
-		// index name diff if the index now belongs to a partitioned index by attaching the index.
-		// We can't switch an index partition from one parent to another; in that instance, we must
-		// re-create the index
-		updatedOld.ParentIdx = new.ParentIdx
-	}
-
-	if old.ParentIdx != nil && new.ParentIdx != nil && (*old.ParentIdx == *new.ParentIdx) {
-		// This is a bad way of recreating the child index when the parent is recreated. Ideally, the diff function
-		// should be able to handle dependency hierarchies, where if a parent is recreated, the child is recreated.
-		// This is hack around because that functionality is not yet implemented
-		oldParentIndex, ok := deps.oldSchemaIndexesByName[new.ParentIdx.GetName()]
-		if !ok {
-			return indexDiff{}, false, fmt.Errorf("could not find parent index %s", new.ParentIdx.GetName())
-		}
-		newParentIndex, ok := deps.newSchemaIndexesByName[new.ParentIdx.GetName()]
-		if !ok {
-			return indexDiff{}, false, fmt.Errorf("could not find parent index %s", new.ParentIdx.GetName())
-		}
-
-		if _, parentRecreated, err := buildIndexDiff(deps, oldParentIndex, newParentIndex); err != nil {
-			return indexDiff{}, false, fmt.Errorf("diffing parent index: %w", err)
-		} else if parentRecreated {
-			// Re-create an index if it's parent is re-created
-			return indexDiff{}, true, nil
-		}
-	}
-
-	isOnPartitionedTable, err := isIndexOnPartitionedTable(deps.newSchemaTablesByName, new)
-	if err != nil {
-		return indexDiff{}, false, fmt.Errorf("checking if index is on partitioned table: %w", err)
-	}
-
-	if !isOnPartitionedTable {
-		if old.Constraint == nil && new.Constraint != nil {
-			// Attach the constraint using the existing index. This cannot be done if the index is on a partitioned table.
-			// In the case of an index being on a partitioned table, it must be re-created
-			updatedOld.Constraint = new.Constraint
-		}
-		if old.Constraint != nil && new.Constraint != nil && old.Constraint.IsLocal && !new.Constraint.IsLocal {
-			// Similar to above. The constraint can just be attached.
-			updatedOld.Constraint.IsLocal = new.Constraint.IsLocal
-		}
-	}
-
-	if isOnPartitionedTable && old.IsInvalid && !new.IsInvalid {
-		// If the index is a partitioned index, it can be made valid automatically by attaching the index partitions
-		// We don't need to re-create it.
-		updatedOld.IsInvalid = new.IsInvalid
+	if old.Constraint == nil && new.Constraint != nil {
+		// Attach the constraint using the existing index.
+		updatedOld.Constraint = new.Constraint
 	}
 
 	// Description-only diffs are emitted as a COMMENT ON ... statement by the index Alter
