@@ -35,6 +35,16 @@ feature areas on top of it:
 - Schema-qualified object support, table persistence drift, ordering fixes
   (policies in their own vertex, routines after signature relations)
 
+The populated state of a materialized view (`pg_class.relispopulated`) is part
+of the schema and of the schema hash used for drift detection: a view that was
+populated and has become empty is drift, not an unchanged schema.
+
+A plan that adds or re-creates a materialized view which is populated in the
+target schema runs `REFRESH MATERIALIZED VIEW` as the role applying the plan,
+before the view's owner changes. That role must be able to read every relation
+the view's query reads; if it cannot, the plan fails at the refresh with
+PostgreSQL's `permission denied for table …`.
+
 The tooling attempts to use native postgres migration operations to perform online migrations and avoid locking wherever possible. Not all migrations will
 be lock-free and some might require downtime, but the hazards system will warn you ahead of time when that's the case.
 Stateful online migration techniques, like shadow tables, aren't yet supported.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/stretchr/testify/assert"
@@ -329,6 +330,55 @@ func (suite *planGeneratorTestSuite) TestValidate_RejectsPlanThatLeavesRecreated
 	suite.Require().Error(err, "validation must reject a plan that leaves the re-created view unpopulated")
 	suite.ErrorContains(err, "validating plan failed")
 	suite.ErrorContains(err, `REFRESH MATERIALIZED VIEW "public"."foobar_view"`)
+}
+
+func (suite *planGeneratorTestSuite) TestGenerate_RefreshNamesUnreadableRelationWhenApplyingRoleCannotReadIt() {
+	ctx := context.Background()
+	adminPool := suite.mustGetTestDBPool()
+	defer adminPool.Close()
+
+	roleName := fmt.Sprintf("limited_refresh_%d", time.Now().UnixNano())
+	_, err := adminPool.ExecContext(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN", schema.EscapeIdentifier(roleName)))
+	suite.Require().NoError(err)
+	defer func() {
+		_, _ = adminPool.ExecContext(ctx, fmt.Sprintf("DROP ROLE %s", schema.EscapeIdentifier(roleName)))
+	}()
+
+	// The applying role can create the view (CREATE ... WITH NO DATA reads nothing), but it
+	// cannot read the table the view's query reads.
+	_, err = adminPool.ExecContext(ctx, `CREATE TABLE public.secret_base(id INT)`)
+	suite.Require().NoError(err)
+	_, err = adminPool.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA work AUTHORIZATION %s", schema.EscapeIdentifier(roleName)))
+	suite.Require().NoError(err)
+	defer func() {
+		_, _ = adminPool.ExecContext(ctx, "DROP SCHEMA work CASCADE")
+	}()
+
+	graph, err := newMaterializedViewSQLVertexGenerator().Add(schema.MaterializedView{
+		SchemaQualifiedName: schema.SchemaQualifiedName{
+			SchemaName:  "work",
+			EscapedName: schema.EscapeIdentifier("mv"),
+		},
+		Owner:          roleName,
+		ViewDefinition: "SELECT id FROM public.secret_base",
+		IsPopulated:    true,
+	})
+	suite.Require().NoError(err)
+
+	limitedPool, err := sql.Open("pgx", suite.db.GetConnOpts().With("user", roleName).ToDSN())
+	suite.Require().NoError(err)
+	defer limitedPool.Close()
+
+	var planErr error
+	for _, stmt := range graph.statements() {
+		if _, err := limitedPool.ExecContext(ctx, stmt.DDL); err != nil {
+			planErr = err
+			break
+		}
+	}
+	suite.Require().Error(planErr, "the refresh must fail when the applying role cannot read the view's relations")
+	suite.ErrorContains(planErr, "permission denied for table secret_base",
+		"the failure names the relation the applying role must be able to read")
 }
 
 func TestSimpleMigratorTestSuite(t *testing.T) {
