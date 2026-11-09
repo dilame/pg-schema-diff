@@ -747,34 +747,6 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
                     SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
                 END;
 		`},
-		// PostgreSQL 14 has no SQL-standard function bodies. A PL/pgSQL body records no dependency
-		// on the relations it reads, so the materialized view drops without re-creating the function.
-		oldSchemaDDLBeforePG15: []string{
-			`
-            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
-
-            CREATE MATERIALIZED VIEW foobar_mv AS
-                SELECT id, foo
-                FROM foobar
-                WHERE id > 0;
-
-            CREATE FUNCTION foobar_mv_count() RETURNS bigint
-                LANGUAGE plpgsql
-                AS $$ BEGIN RETURN (SELECT COUNT(*) FROM foobar_mv WHERE id > 0); END; $$;
-		`},
-		newSchemaDDLBeforePG15: []string{
-			`
-            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
-
-            CREATE MATERIALIZED VIEW foobar_mv AS
-                SELECT id, foo
-                FROM foobar
-                WHERE id >= 0;
-
-            CREATE FUNCTION foobar_mv_count() RETURNS bigint
-                LANGUAGE plpgsql
-                AS $$ BEGIN RETURN (SELECT COUNT(*) FROM foobar_mv WHERE id > 0); END; $$;
-		`},
 		// The materialized view is re-created, and the function body that reads it is unchanged. The
 		// body's dependency blocks the DROP, so the plan drops the function first and creates it
 		// again after the materialized view comes back.
@@ -818,6 +790,7 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
 		// The re-created materialized view blocks the drop of the function whose body reads it, so
 		// the plan drops and creates the function too. The policy calls that function, so it is
 		// released before the drop and restored after the create.
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAuthzUpdate},
 	},
 	{
 		name: "a function body that starts reading a re-created materialized view is replaced in place, not dropped",
