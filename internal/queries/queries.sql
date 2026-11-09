@@ -197,17 +197,20 @@ SELECT
     COALESCE(collation_namespace.nspname, '')::TEXT AS collation_schema_name,
     COALESCE(
         CASE
-            WHEN a.attgenerated = 's' THEN ''
+            WHEN a.attgenerated != '' THEN ''
             ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid)
         END, ''
     )::TEXT AS default_value,
     COALESCE(
         CASE
-            WHEN a.attgenerated = 's'
+            WHEN a.attgenerated != ''
                 THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid)
             ELSE ''
         END, ''
     )::TEXT AS generation_expression,
+    -- Empty for an ordinary column, 's' for stored and 'v' for virtual
+    -- generated columns (PostgreSQL 18+).
+    a.attgenerated::TEXT AS generation_type,
     COALESCE(
         pg_catalog.col_description(a.attrelid, a.attnum), ''
     )::TEXT AS description,
@@ -233,7 +236,6 @@ SELECT
             AND depend.objid = d.oid
             AND depend.deptype = 'n'
     )::TEXT [] AS default_depends_on_functions,
-    (a.attgenerated = 's') AS is_generated,
     -- The functions the column's default calls, as JSON objects of schema, name
     -- and identity arguments. PostgreSQL refuses to drop such a function while
     -- the default exists.

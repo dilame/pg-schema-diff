@@ -381,6 +381,55 @@ func (suite *planGeneratorTestSuite) TestGenerate_RefreshNamesUnreadableRelation
 		"the failure names the relation the applying role must be able to read")
 }
 
+func (suite *planGeneratorTestSuite) TestGenerate_ValidatesSchemaWithGeneratedColumns() {
+	ctx := context.Background()
+	connPool := suite.mustGetTestDBPool()
+	defer connPool.Close()
+
+	var serverVersionNum int
+	suite.Require().NoError(connPool.QueryRowContext(ctx,
+		`SELECT CURRENT_SETTING('server_version_num')::INT`).Scan(&serverVersionNum))
+
+	// PostgreSQL 18 introduced virtual generated columns (attgenerated = 'v'). A schema that
+	// carries one must survive plan validation: the tool reconstructs the current schema in a
+	// temporary database, and reading a virtual column as an ordinary default made that CREATE
+	// TABLE fail with "cannot use column reference in DEFAULT expression".
+	storedColumn := `unclaimed_amount numeric GENERATED ALWAYS AS (amount * (capacity - filled)) STORED NOT NULL`
+	virtualColumn := `open_amount numeric GENERATED ALWAYS AS (amount * (capacity - filled)) VIRTUAL`
+	columnDefs := []string{
+		"amount numeric NOT NULL",
+		"capacity smallint NOT NULL",
+		"filled smallint DEFAULT 0 NOT NULL",
+		storedColumn,
+	}
+	if serverVersionNum >= 180000 {
+		columnDefs = append(columnDefs, virtualColumn)
+	}
+	ddl := []string{fmt.Sprintf("CREATE TABLE generated_columns(\n\t%s\n)", strings.Join(columnDefs, ",\n\t"))}
+	suite.mustApplyDDLToTestDb(ddl)
+
+	tempDbFactory := suite.mustBuildTempDbFactory(ctx)
+	defer tempDbFactory.Close()
+
+	plan, err := Generate(ctx, DBSchemaSource(connPool), DDLSchemaSource(ddl), WithTempDbFactory(tempDbFactory))
+	suite.Require().NoError(err, "plan validation must accept an unchanged schema with generated columns")
+	suite.Empty(plan.Statements)
+
+	fetched, err := schema.GetSchema(ctx, connPool)
+	suite.Require().NoError(err)
+	suite.Require().Len(fetched.Tables, 1)
+	columnsByName := make(map[string]schema.Column)
+	for _, column := range fetched.Tables[0].Columns {
+		columnsByName[column.Name] = column
+	}
+	suite.Equal(schema.GeneratedColumnTypeStored, columnsByName["unclaimed_amount"].GeneratedColumnType)
+	suite.NotEmpty(columnsByName["unclaimed_amount"].GenerationExpression)
+	suite.Empty(columnsByName["unclaimed_amount"].Default)
+	if serverVersionNum >= 180000 {
+		suite.Equal(schema.GeneratedColumnTypeVirtual, columnsByName["open_amount"].GeneratedColumnType)
+	}
+}
+
 func TestSimpleMigratorTestSuite(t *testing.T) {
 	suite.Run(t, new(planGeneratorTestSuite))
 }
