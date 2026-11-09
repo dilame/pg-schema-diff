@@ -716,6 +716,70 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
 		// carried: the database after the plan matches the target's dump.
 	},
 	{
+		name: "re-create a materialized view a SQL-standard function body reads",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar
+                WHERE id > 0;
+
+            CREATE FUNCTION foobar_mv_count() RETURNS bigint
+                LANGUAGE sql
+                BEGIN ATOMIC
+                    SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
+                END;
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar
+                WHERE id >= 0;
+
+            CREATE FUNCTION foobar_mv_count() RETURNS bigint
+                LANGUAGE sql
+                BEGIN ATOMIC
+                    SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
+                END;
+		`},
+		// PostgreSQL 14 has no SQL-standard function bodies. A PL/pgSQL body records no dependency
+		// on the relations it reads, so the materialized view drops without re-creating the function.
+		oldSchemaDDLBeforePG15: []string{
+			`
+            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar
+                WHERE id > 0;
+
+            CREATE FUNCTION foobar_mv_count() RETURNS bigint
+                LANGUAGE plpgsql
+                AS $$ BEGIN RETURN (SELECT COUNT(*) FROM foobar_mv WHERE id > 0); END; $$;
+		`},
+		newSchemaDDLBeforePG15: []string{
+			`
+            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar
+                WHERE id >= 0;
+
+            CREATE FUNCTION foobar_mv_count() RETURNS bigint
+                LANGUAGE plpgsql
+                AS $$ BEGIN RETURN (SELECT COUNT(*) FROM foobar_mv WHERE id > 0); END; $$;
+		`},
+		// The materialized view is re-created, and the function body that reads it is unchanged. The
+		// body's dependency blocks the DROP, so the plan drops the function first and creates it
+		// again after the materialized view comes back.
+	},
+	{
 		name:  "grant SELECT on a materialized view",
 		roles: []string{"reader"},
 		oldSchemaDDL: []string{
