@@ -132,11 +132,13 @@ func recreatedRelationNames(
 }
 
 // cascadeRecreatedRelationFunctions re-creates every function whose SQL-standard body
-// (`BEGIN ATOMIC`) reads a relation the plan re-creates, and reports whether it moved any. Only
-// such a body records the relations it reads in pg_depend, and PostgreSQL refuses to drop a
-// relation those entries point at. The function generator already orders the function's drop before,
-// and its create after, every relation in DependsOnRelations. Functions that call a re-created
-// function are handled by cascadeRecreatedFunctions.
+// (`BEGIN ATOMIC`) reads, in the source schema, a relation the plan re-creates, and reports whether
+// it moved any. Only such a body records the relations it reads in pg_depend, and PostgreSQL
+// refuses to drop a relation those entries point at, so only the old body blocks the DROP. A
+// relation that only the new body reads does not block it, and the in-place `CREATE OR REPLACE` is
+// already ordered after the relation's add. The function generator orders the function's drop
+// before, and its create after, every relation in DependsOnRelations. Functions that call a
+// re-created function are handled by cascadeRecreatedFunctions.
 func cascadeRecreatedRelationFunctions(
 	functionDiffs listDiff[schema.Function, functionDiff],
 	recreatedRelations map[string]bool,
@@ -144,8 +146,7 @@ func cascadeRecreatedRelationFunctions(
 	progressed := false
 	var remaining []functionDiff
 	for _, alter := range functionDiffs.alters {
-		if readsAnyRecreatedRelation(alter.old.DependsOnRelations, recreatedRelations) ||
-			readsAnyRecreatedRelation(alter.new.DependsOnRelations, recreatedRelations) {
+		if readsAnyRecreatedRelation(alter.old.DependsOnRelations, recreatedRelations) {
 			functionDiffs.deletes = append(functionDiffs.deletes, alter.old)
 			functionDiffs.adds = append(functionDiffs.adds, alter.new)
 			progressed = true

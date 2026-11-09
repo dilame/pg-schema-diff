@@ -423,11 +423,6 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		return schemaDiff{}, false, fmt.Errorf("diffing functions: %w", err)
 	}
 	functionDiffs = cascadeRecreatedFunctions(functionDiffs)
-	droppedFunctions := droppedFunctionNames(functionDiffs)
-	if err := refuseUnrebindableFunctionDependents(tableDiffs, old.Indexes, droppedFunctions); err != nil {
-		return schemaDiff{}, false, err
-	}
-	tableDiffs, functionDependentsRebinds := detachFunctionDependents(tableDiffs, droppedFunctions)
 
 	procedureDiffs, err := diffLists(old.Procedures, new.Procedures, func(old, new schema.Procedure, _, _ int) (procedureDiff, bool, error) {
 		if dependsOnAnyRecreatedType(new.DependsOnCompositeTypes, compositeTypesBeingRecreated) ||
@@ -448,29 +443,6 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing procedures: %w", err)
-	}
-
-	triggerDiffs, err := diffLists(old.Triggers, new.Triggers, func(old, new schema.Trigger, _, _ int) (triggerDiff, bool, error) {
-		if _, isOnNewTable := addedTablesByName[new.OwningTable.GetName()]; isOnNewTable {
-			// If the table is new, then it must be re-created (this occurs if the base table has been
-			// re-created). In other words, a trigger must be re-created if the owning table is re-created
-			return triggerDiff{}, true, nil
-		}
-		if keepsCallingDroppedFunction(old.DependsOnFunctions, new.DependsOnFunctions, droppedFunctions) {
-			// A trigger that keeps calling a function the plan drops cannot be replaced in place
-			// between the drop and the create, so it is dropped before the function and created
-			// again after the functions it calls, with its comment and enabled state.
-			return triggerDiff{}, true, nil
-		}
-		return triggerDiff{
-			oldAndNew[schema.Trigger]{
-				old: old,
-				new: new,
-			},
-		}, false, nil
-	})
-	if err != nil {
-		return schemaDiff{}, false, fmt.Errorf("diffing triggers: %w", err)
 	}
 
 	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View, _, _ int) (diff viewDiff, requiresRecreation bool, error error) {
@@ -505,6 +477,38 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 			break
 		}
 		functionDiffs = cascadeRecreatedFunctions(functionDiffs)
+	}
+
+	// Snapshot the dropped functions only now: the cascade above can add functions to the
+	// dropped set, and a policy or a column default that calls one of them has to be detached
+	// and restored like for any other dropped function.
+	droppedFunctions := droppedFunctionNames(functionDiffs)
+	if err := refuseUnrebindableFunctionDependents(tableDiffs, old.Indexes, droppedFunctions); err != nil {
+		return schemaDiff{}, false, err
+	}
+	tableDiffs, functionDependentsRebinds := detachFunctionDependents(tableDiffs, droppedFunctions)
+
+	triggerDiffs, err := diffLists(old.Triggers, new.Triggers, func(old, new schema.Trigger, _, _ int) (triggerDiff, bool, error) {
+		if _, isOnNewTable := addedTablesByName[new.OwningTable.GetName()]; isOnNewTable {
+			// If the table is new, then it must be re-created (this occurs if the base table has been
+			// re-created). In other words, a trigger must be re-created if the owning table is re-created
+			return triggerDiff{}, true, nil
+		}
+		if keepsCallingDroppedFunction(old.DependsOnFunctions, new.DependsOnFunctions, droppedFunctions) {
+			// A trigger that keeps calling a function the plan drops cannot be replaced in place
+			// between the drop and the create, so it is dropped before the function and created
+			// again after the functions it calls, with its comment and enabled state.
+			return triggerDiff{}, true, nil
+		}
+		return triggerDiff{
+			oldAndNew[schema.Trigger]{
+				old: old,
+				new: new,
+			},
+		}, false, nil
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing triggers: %w", err)
 	}
 
 	// Diff the indexes last: an index on a materialized view that this diff re-creates must be

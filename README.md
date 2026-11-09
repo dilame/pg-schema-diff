@@ -31,7 +31,8 @@ feature areas on top of it:
   `GENERATED ALWAYS AS … STORED` and PostgreSQL 18 `VIRTUAL`
 - Drop-and-recreate of functions whose signature or `BEGIN ATOMIC` body is
   affected by a change (changed result type, altered referenced columns,
-  recreated composite types or domains), with dependent object re-creation
+  recreated composite types or domains), or whose body reads a re-created view
+  or materialized view, with dependent object re-creation
 - SQL-standard function bodies (`BEGIN ATOMIC`), canonical function and view
   definition comparison, plan validation with `check_function_bodies` disabled
 - Schema-qualified object support, table persistence drift, ordering fixes

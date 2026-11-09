@@ -747,9 +747,13 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
                     SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
                 END;
 		`},
-		// PostgreSQL 14 has no SQL-standard function bodies. A PL/pgSQL body records no dependency
-		// on the relations it reads, so the materialized view drops without re-creating the function.
-		oldSchemaDDLBeforePG15: []string{
+		// The materialized view is re-created, and the function body that reads it is unchanged. The
+		// body's dependency blocks the DROP, so the plan drops the function first and creates it
+		// again after the materialized view comes back.
+	},
+	{
+		name: "re-create a materialized view a SQL-standard function body reads, and a policy calls the function",
+		oldSchemaDDL: []string{
 			`
             CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
 
@@ -759,10 +763,14 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
                 WHERE id > 0;
 
             CREATE FUNCTION foobar_mv_count() RETURNS bigint
-                LANGUAGE plpgsql
-                AS $$ BEGIN RETURN (SELECT COUNT(*) FROM foobar_mv WHERE id > 0); END; $$;
+                LANGUAGE sql
+                BEGIN ATOMIC
+                    SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
+                END;
+
+            CREATE POLICY p ON foobar USING (foobar_mv_count() > 0);
 		`},
-		newSchemaDDLBeforePG15: []string{
+		newSchemaDDL: []string{
 			`
             CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
 
@@ -772,12 +780,57 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
                 WHERE id >= 0;
 
             CREATE FUNCTION foobar_mv_count() RETURNS bigint
-                LANGUAGE plpgsql
-                AS $$ BEGIN RETURN (SELECT COUNT(*) FROM foobar_mv WHERE id > 0); END; $$;
+                LANGUAGE sql
+                BEGIN ATOMIC
+                    SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
+                END;
+
+            CREATE POLICY p ON foobar USING (foobar_mv_count() > 0);
 		`},
-		// The materialized view is re-created, and the function body that reads it is unchanged. The
-		// body's dependency blocks the DROP, so the plan drops the function first and creates it
-		// again after the materialized view comes back.
+		// The re-created materialized view blocks the drop of the function whose body reads it, so
+		// the plan drops and creates the function too. The policy calls that function, so it is
+		// released before the drop and restored after the create.
+		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAuthzUpdate},
+	},
+	{
+		name: "a function body that starts reading a re-created materialized view is replaced in place, not dropped",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar
+                WHERE id > 0;
+
+            CREATE FUNCTION foobar_mv_count() RETURNS bigint
+                LANGUAGE sql
+                BEGIN ATOMIC
+                    SELECT COUNT(*) FROM foobar WHERE id > 0;
+                END;
+
+            CREATE POLICY p ON foobar USING (foobar_mv_count() > 0);
+		`},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(id INT PRIMARY KEY, foo INT);
+
+            CREATE MATERIALIZED VIEW foobar_mv AS
+                SELECT id, foo
+                FROM foobar
+                WHERE id >= 0;
+
+            CREATE FUNCTION foobar_mv_count() RETURNS bigint
+                LANGUAGE sql
+                BEGIN ATOMIC
+                    SELECT COUNT(*) FROM foobar_mv WHERE id > 0;
+                END;
+
+            CREATE POLICY p ON foobar USING (foobar_mv_count() > 0);
+		`},
+		// Only the new body reads the re-created materialized view, so the old body does not block
+		// its drop. The function is replaced in place after the view comes back instead of being
+		// dropped and created again.
 	},
 	{
 		name:  "grant SELECT on a materialized view",
