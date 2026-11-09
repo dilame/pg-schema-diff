@@ -430,6 +430,37 @@ func (suite *planGeneratorTestSuite) TestGenerate_ValidatesSchemaWithGeneratedCo
 	}
 }
 
+func (suite *planGeneratorTestSuite) TestGenerate_ValidatesSchemaWithTriggerWhenComparingThreeColumnsAsARow() {
+	ctx := context.Background()
+
+	// PostgreSQL expands a row comparison of three or more columns into nested ORs of IS DISTINCT
+	// FROM and prints the nested form, but parses that text back into a flat OR of the same terms.
+	// Creating a trigger from the printed definition therefore prints differently the second time.
+	ddl := []string{`
+		CREATE TABLE foobar(id INT PRIMARY KEY, a INT, b INT, c INT);
+		CREATE FUNCTION foobar_notify() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
+		CREATE CONSTRAINT TRIGGER foobar_trigger
+			AFTER UPDATE ON foobar
+			DEFERRABLE INITIALLY DEFERRED
+			FOR EACH ROW
+			WHEN ((OLD.a, OLD.b, OLD.c) IS DISTINCT FROM (NEW.a, NEW.b, NEW.c))
+			EXECUTE FUNCTION foobar_notify();
+	`}
+	suite.mustApplyDDLToTestDb(ddl)
+
+	connPool := suite.mustGetTestDBPool()
+	defer connPool.Close()
+
+	tempDbFactory := suite.mustBuildTempDbFactory(ctx)
+	defer tempDbFactory.Close()
+
+	// The source and the target are the same schema, so a plan is empty and validation has nothing
+	// to change. It must not report the trigger's WHEN condition as a difference.
+	plan, err := Generate(ctx, DBSchemaSource(connPool), DDLSchemaSource(ddl), WithTempDbFactory(tempDbFactory))
+	suite.Require().NoError(err, "plan validation must accept an unchanged schema whose trigger compares three columns as a row")
+	suite.Empty(plan.Statements)
+}
+
 func TestSimpleMigratorTestSuite(t *testing.T) {
 	suite.Run(t, new(planGeneratorTestSuite))
 }
