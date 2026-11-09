@@ -325,6 +325,121 @@ var (
 			},
 			expectedDiffErrIs: ErrNotImplemented,
 		},
+		{
+			name:      "Add populated materialized view generates WITH NO DATA and REFRESH",
+			oldSchema: schema.Schema{},
+			newSchema: schema.Schema{
+				MaterializedViews: []schema.MaterializedView{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("test_mv"),
+						},
+						ViewDefinition: " SELECT 1 AS x",
+						IsPopulated:    true,
+					},
+				},
+			},
+			expectedStatements: []Statement{
+				{
+					DDL:         "CREATE MATERIALIZED VIEW \"public\".\"test_mv\" AS\n SELECT 1 AS x\nWITH NO DATA",
+					Timeout:     statementTimeoutDefault,
+					LockTimeout: lockTimeoutDefault,
+				},
+				{
+					DDL:         "REFRESH MATERIALIZED VIEW \"public\".\"test_mv\"",
+					Timeout:     statementTimeoutMaterializedViewRefresh,
+					LockTimeout: lockTimeoutDefault,
+				},
+			},
+		},
+		{
+			name: "Alter populated materialized view (recreation) generates WITH NO DATA and REFRESH",
+			oldSchema: schema.Schema{
+				MaterializedViews: []schema.MaterializedView{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("test_mv"),
+						},
+						ViewDefinition: " SELECT 1 AS x",
+						IsPopulated:    true,
+					},
+				},
+			},
+			newSchema: schema.Schema{
+				MaterializedViews: []schema.MaterializedView{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("test_mv"),
+						},
+						ViewDefinition: " SELECT 2 AS x",
+						IsPopulated:    true,
+					},
+				},
+			},
+			expectedStatements: []Statement{
+				{
+					DDL:         "DROP MATERIALIZED VIEW \"public\".\"test_mv\"",
+					Timeout:     statementTimeoutDefault,
+					LockTimeout: lockTimeoutDefault,
+				},
+				{
+					DDL:         "CREATE MATERIALIZED VIEW \"public\".\"test_mv\" AS\n SELECT 2 AS x\nWITH NO DATA",
+					Timeout:     statementTimeoutDefault,
+					LockTimeout: lockTimeoutDefault,
+				},
+				{
+					DDL:         "REFRESH MATERIALIZED VIEW \"public\".\"test_mv\"",
+					Timeout:     statementTimeoutMaterializedViewRefresh,
+					LockTimeout: lockTimeoutDefault,
+				},
+			},
+		},
+		{
+			name: "Materialized view becomes populated (recreation) generates WITH NO DATA and REFRESH",
+			oldSchema: schema.Schema{
+				MaterializedViews: []schema.MaterializedView{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("test_mv"),
+						},
+						ViewDefinition: " SELECT 1 AS x",
+					},
+				},
+			},
+			newSchema: schema.Schema{
+				MaterializedViews: []schema.MaterializedView{
+					{
+						SchemaQualifiedName: schema.SchemaQualifiedName{
+							SchemaName:  "public",
+							EscapedName: schema.EscapeIdentifier("test_mv"),
+						},
+						ViewDefinition: " SELECT 1 AS x",
+						IsPopulated:    true,
+					},
+				},
+			},
+			expectedStatements: []Statement{
+				{
+					DDL:         "DROP MATERIALIZED VIEW \"public\".\"test_mv\"",
+					Timeout:     statementTimeoutDefault,
+					LockTimeout: lockTimeoutDefault,
+				},
+				{
+					DDL:         "CREATE MATERIALIZED VIEW \"public\".\"test_mv\" AS\n SELECT 1 AS x\nWITH NO DATA",
+					Timeout:     statementTimeoutDefault,
+					LockTimeout: lockTimeoutDefault,
+				},
+				{
+					DDL:         "REFRESH MATERIALIZED VIEW \"public\".\"test_mv\"",
+					Timeout:     statementTimeoutMaterializedViewRefresh,
+					LockTimeout: lockTimeoutDefault,
+				},
+			},
+		},
 	}
 )
 

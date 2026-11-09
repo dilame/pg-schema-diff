@@ -2,9 +2,12 @@ package diff
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/stretchr/testify/assert"
@@ -189,6 +192,193 @@ func (suite *planGeneratorTestSuite) TestGenerate_CannotValidateWithoutTempDbFac
 		WithDoNotValidatePlan(),
 	)
 	suite.ErrorContains(err, "tempDbFactory is required")
+}
+
+func (suite *planGeneratorTestSuite) TestGenerate_RecreatedMaterializedViewComesBackPopulatedWithItsIndexes() {
+	ctx := context.Background()
+	oldDDL := []string{`
+		CREATE TABLE foobar(id INT PRIMARY KEY, foo VARCHAR(255));
+		INSERT INTO foobar VALUES (1, 'one'), (2, 'two');
+		CREATE MATERIALIZED VIEW foobar_view AS
+			SELECT id, foo FROM foobar WHERE id > 0;
+		CREATE UNIQUE INDEX foobar_view_id_idx ON foobar_view(id) INCLUDE (foo);
+		CREATE INDEX foobar_view_foo_idx ON foobar_view(foo);
+	`}
+	newDDL := []string{`
+		CREATE TABLE foobar(id INT PRIMARY KEY, foo VARCHAR(255));
+		CREATE MATERIALIZED VIEW foobar_view AS
+			SELECT id, foo FROM foobar WHERE id >= 0;
+		CREATE UNIQUE INDEX foobar_view_id_idx ON foobar_view(id) INCLUDE (foo);
+		CREATE INDEX foobar_view_foo_idx ON foobar_view(foo);
+	`}
+	suite.mustApplyDDLToTestDb(oldDDL)
+
+	connPool := suite.mustGetTestDBPool()
+	defer connPool.Close()
+
+	tempDbFactory := suite.mustBuildTempDbFactory(ctx)
+	defer tempDbFactory.Close()
+
+	plan, err := Generate(ctx, DBSchemaSource(connPool), DDLSchemaSource(newDDL), WithTempDbFactory(tempDbFactory))
+	suite.Require().NoError(err)
+
+	var planDDL []string
+	for _, stmt := range plan.Statements {
+		planDDL = append(planDDL, stmt.DDL)
+	}
+	suite.Contains(planDDL, `REFRESH MATERIALIZED VIEW "public"."foobar_view"`,
+		"the re-created view must be populated in the same plan")
+	suite.Contains(planDDL, `CREATE UNIQUE INDEX CONCURRENTLY foobar_view_id_idx ON public.foobar_view USING btree (id) INCLUDE (foo)`,
+		"the re-created view must get its unique index back")
+	suite.Contains(planDDL, `CREATE INDEX CONCURRENTLY foobar_view_foo_idx ON public.foobar_view USING btree (foo)`,
+		"the re-created view must get its plain index back")
+
+	suite.mustApplyMigrationPlan(connPool, plan)
+
+	var isPopulated bool
+	suite.Require().NoError(connPool.QueryRowContext(ctx, `
+		SELECT c.relispopulated
+		FROM pg_catalog.pg_class AS c
+		INNER JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = 'foobar_view'
+	`).Scan(&isPopulated))
+	suite.True(isPopulated, "the view must be populated after the plan")
+
+	var rowCount int
+	suite.Require().NoError(connPool.QueryRowContext(ctx, `SELECT COUNT(*) FROM foobar_view`).Scan(&rowCount))
+	suite.Equal(2, rowCount, "the refresh must have run the new definition over the table's rows")
+
+	rows, err := connPool.QueryContext(ctx, `
+		SELECT indexname
+		FROM pg_catalog.pg_indexes
+		WHERE schemaname = 'public' AND tablename = 'foobar_view'
+		ORDER BY indexname
+	`)
+	suite.Require().NoError(err)
+	defer rows.Close()
+	var indexNames []string
+	for rows.Next() {
+		var name string
+		suite.Require().NoError(rows.Scan(&name))
+		indexNames = append(indexNames, name)
+	}
+	suite.Require().NoError(rows.Err())
+	suite.Equal([]string{"foobar_view_foo_idx", "foobar_view_id_idx"}, indexNames,
+		"both indexes of the re-created view must exist after the plan")
+}
+
+func (suite *planGeneratorTestSuite) TestValidate_RejectsPlanThatLeavesRecreatedMaterializedViewUnpopulated() {
+	ctx := context.Background()
+	oldDDL := []string{`
+		CREATE TABLE foobar(id INT PRIMARY KEY, foo VARCHAR(255));
+		CREATE MATERIALIZED VIEW foobar_view AS
+			SELECT id, foo FROM foobar WHERE id > 0;
+		CREATE UNIQUE INDEX foobar_view_id_idx ON foobar_view(id);
+	`}
+	newDDL := []string{`
+		CREATE TABLE foobar(id INT PRIMARY KEY, foo VARCHAR(255));
+		CREATE MATERIALIZED VIEW foobar_view AS
+			SELECT id, foo FROM foobar WHERE id >= 0;
+		CREATE UNIQUE INDEX foobar_view_id_idx ON foobar_view(id);
+	`}
+	suite.mustApplyDDLToTestDb(oldDDL)
+
+	currentPool := suite.mustGetTestDBPool()
+	defer currentPool.Close()
+
+	targetDB, err := suite.pgEngine.CreateDatabase()
+	suite.Require().NoError(err)
+	defer targetDB.DropDB()
+	targetPool, err := sql.Open("pgx", targetDB.GetDSN())
+	suite.Require().NoError(err)
+	defer targetPool.Close()
+	for _, stmt := range newDDL {
+		_, err := targetPool.ExecContext(ctx, stmt)
+		suite.Require().NoError(err)
+	}
+
+	currentSchema, err := schema.GetSchema(ctx, currentPool)
+	suite.Require().NoError(err)
+	targetSchema, err := schema.GetSchema(ctx, targetPool)
+	suite.Require().NoError(err)
+	suite.Require().Len(currentSchema.MaterializedViews, 1)
+	suite.True(currentSchema.MaterializedViews[0].IsPopulated)
+	suite.Require().Len(targetSchema.MaterializedViews, 1)
+	suite.True(targetSchema.MaterializedViews[0].IsPopulated)
+
+	tempDbFactory := suite.mustBuildTempDbFactory(ctx)
+	defer tempDbFactory.Close()
+
+	plan, err := Generate(ctx, DBSchemaSource(currentPool), DDLSchemaSource(newDDL),
+		WithTempDbFactory(tempDbFactory), WithDoNotValidatePlan())
+	suite.Require().NoError(err)
+
+	var withoutRefresh []Statement
+	for _, stmt := range plan.Statements {
+		if strings.HasPrefix(stmt.DDL, "REFRESH MATERIALIZED VIEW") {
+			continue
+		}
+		withoutRefresh = append(withoutRefresh, stmt)
+	}
+	suite.Require().Len(withoutRefresh, len(plan.Statements)-1,
+		"the generated plan must refresh the re-created view exactly once")
+
+	err = assertValidPlan(ctx, tempDbFactory, currentSchema, targetSchema, Plan{Statements: withoutRefresh}, &planOptions{
+		logger:     log.SimpleLogger(),
+		randReader: rand.Reader,
+	})
+	suite.Require().Error(err, "validation must reject a plan that leaves the re-created view unpopulated")
+	suite.ErrorContains(err, "validating plan failed")
+	suite.ErrorContains(err, `REFRESH MATERIALIZED VIEW "public"."foobar_view"`)
+}
+
+func (suite *planGeneratorTestSuite) TestGenerate_RefreshNamesUnreadableRelationWhenApplyingRoleCannotReadIt() {
+	ctx := context.Background()
+	adminPool := suite.mustGetTestDBPool()
+	defer adminPool.Close()
+
+	roleName := fmt.Sprintf("limited_refresh_%d", time.Now().UnixNano())
+	_, err := adminPool.ExecContext(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN", schema.EscapeIdentifier(roleName)))
+	suite.Require().NoError(err)
+	defer func() {
+		_, _ = adminPool.ExecContext(ctx, fmt.Sprintf("DROP ROLE %s", schema.EscapeIdentifier(roleName)))
+	}()
+
+	// The applying role can create the view (CREATE ... WITH NO DATA reads nothing), but it
+	// cannot read the table the view's query reads.
+	_, err = adminPool.ExecContext(ctx, `CREATE TABLE public.secret_base(id INT)`)
+	suite.Require().NoError(err)
+	_, err = adminPool.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA work AUTHORIZATION %s", schema.EscapeIdentifier(roleName)))
+	suite.Require().NoError(err)
+	defer func() {
+		_, _ = adminPool.ExecContext(ctx, "DROP SCHEMA work CASCADE")
+	}()
+
+	graph, err := newMaterializedViewSQLVertexGenerator().Add(schema.MaterializedView{
+		SchemaQualifiedName: schema.SchemaQualifiedName{
+			SchemaName:  "work",
+			EscapedName: schema.EscapeIdentifier("mv"),
+		},
+		Owner:          roleName,
+		ViewDefinition: "SELECT id FROM public.secret_base",
+		IsPopulated:    true,
+	})
+	suite.Require().NoError(err)
+
+	limitedPool, err := sql.Open("pgx", suite.db.GetConnOpts().With("user", roleName).ToDSN())
+	suite.Require().NoError(err)
+	defer limitedPool.Close()
+
+	var planErr error
+	for _, stmt := range graph.statements() {
+		if _, err := limitedPool.ExecContext(ctx, stmt.DDL); err != nil {
+			planErr = err
+			break
+		}
+	}
+	suite.Require().Error(planErr, "the refresh must fail when the applying role cannot read the view's relations")
+	suite.ErrorContains(planErr, "permission denied for table secret_base",
+		"the failure names the relation the applying role must be able to read")
 }
 
 func TestSimpleMigratorTestSuite(t *testing.T) {

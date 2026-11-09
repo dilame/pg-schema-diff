@@ -154,6 +154,18 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}
+	if mv.IsPopulated {
+		// The view holds data in the target schema, and the CREATE above deliberately left it
+		// empty. Populate it in the same plan so it comes back in the state it had. REFRESH runs
+		// before ownership moves to mv.Owner: the plan's applying role owns the new view at this
+		// point, so it can read the relations the query reads. Not CONCURRENTLY: PostgreSQL refuses
+		// that for a materialized view that is not already populated.
+		stmts = append(stmts, Statement{
+			DDL:         fmt.Sprintf("REFRESH MATERIALIZED VIEW %s", mv.GetFQEscapedName()),
+			Timeout:     statementTimeoutMaterializedViewRefresh,
+			LockTimeout: lockTimeoutDefault,
+		})
+	}
 	privilegeGenerator := newPrivilegeSQLVertexGenerator(mv.SchemaQualifiedName)
 	for _, privilege := range mv.Privileges {
 		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
