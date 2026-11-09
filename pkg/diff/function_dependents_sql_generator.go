@@ -115,6 +115,57 @@ func cascadeRecreatedFunctions(functionDiffs listDiff[schema.Function, functionD
 	return functionDiffs
 }
 
+// recreatedRelationNames returns the names of the views and materialized views the plan drops and
+// creates again.
+func recreatedRelationNames(
+	viewDiffs listDiff[schema.View, viewDiff],
+	materializedViewDiffs listDiff[schema.MaterializedView, materializedViewDiff],
+) map[string]bool {
+	names := make(map[string]bool)
+	for _, v := range viewDiffs.deletes {
+		names[v.GetName()] = true
+	}
+	for _, mv := range materializedViewDiffs.deletes {
+		names[mv.GetName()] = true
+	}
+	return names
+}
+
+// cascadeRecreatedRelationFunctions re-creates every function whose SQL-standard body
+// (`BEGIN ATOMIC`) reads a relation the plan re-creates, and reports whether it moved any. Only
+// such a body records the relations it reads in pg_depend, and PostgreSQL refuses to drop a
+// relation those entries point at. The function generator already orders the function's drop before,
+// and its create after, every relation in DependsOnRelations. Functions that call a re-created
+// function are handled by cascadeRecreatedFunctions.
+func cascadeRecreatedRelationFunctions(
+	functionDiffs listDiff[schema.Function, functionDiff],
+	recreatedRelations map[string]bool,
+) (listDiff[schema.Function, functionDiff], bool) {
+	progressed := false
+	var remaining []functionDiff
+	for _, alter := range functionDiffs.alters {
+		if readsAnyRecreatedRelation(alter.old.DependsOnRelations, recreatedRelations) ||
+			readsAnyRecreatedRelation(alter.new.DependsOnRelations, recreatedRelations) {
+			functionDiffs.deletes = append(functionDiffs.deletes, alter.old)
+			functionDiffs.adds = append(functionDiffs.adds, alter.new)
+			progressed = true
+			continue
+		}
+		remaining = append(remaining, alter)
+	}
+	functionDiffs.alters = remaining
+	return functionDiffs, progressed
+}
+
+func readsAnyRecreatedRelation(dependencies []schema.RelationDependency, recreatedRelations map[string]bool) bool {
+	for _, dependency := range dependencies {
+		if recreatedRelations[dependency.GetName()] {
+			return true
+		}
+	}
+	return false
+}
+
 // refuseUnrebindableFunctionDependents fails the plan when a check constraint or an index of a
 // table the plan keeps calls a function the plan drops. See the comment at the top of this file.
 func refuseUnrebindableFunctionDependents(

@@ -490,7 +490,22 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		return schemaDiff{}, false, fmt.Errorf("diffing materialized views: %w", err)
 	}
 
-	viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs, functionDiffs)
+	// A relation the plan re-creates (a view or materialized view dropped and created again) cannot
+	// be dropped while a SQL-standard function body reads it: PostgreSQL records that dependency and
+	// refuses the DROP. Such functions are re-created around the relation too (their generator orders
+	// the drop before, and the create after, every relation they read). Re-creating a function can
+	// make the views that call it need re-creation, and a re-created view can in turn require more
+	// functions, so repeat until nothing changes.
+	for {
+		viewDiffs, materializedViewDiffs = cascadeRecreatedRelationViews(viewDiffs, materializedViewDiffs, functionDiffs)
+
+		var progressed bool
+		functionDiffs, progressed = cascadeRecreatedRelationFunctions(functionDiffs, recreatedRelationNames(viewDiffs, materializedViewDiffs))
+		if !progressed {
+			break
+		}
+		functionDiffs = cascadeRecreatedFunctions(functionDiffs)
+	}
 
 	// Diff the indexes last: an index on a materialized view that this diff re-creates must be
 	// re-created too, and which materialized views are re-created is only final after the cascade
