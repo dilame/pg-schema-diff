@@ -225,7 +225,7 @@ var (
 			expectedDiffErrIs:  errDuplicateIdentifier,
 		},
 		{
-			name:      "Partitioned index loop is refused with the partitioned tables",
+			name: "Partitioned index loop is refused with the partitioned tables",
 			oldSchema: schema.Schema{
 				Tables: []schema.Table{
 					{

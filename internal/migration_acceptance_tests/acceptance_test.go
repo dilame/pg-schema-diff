@@ -7,6 +7,7 @@ import (
 	stdlog "log"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -184,6 +185,14 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 		}
 		return
 	}
+	// Partitioned tables are not supported by this fork (see the README). The inherited
+	// partition cases document the shapes the tool must refuse, so they assert the explicit
+	// "not supported" error instead of a plan.
+	if declaresPartitionedTables(tc.oldSchemaDDL) || declaresPartitionedTables(tc.newSchemaDDL) {
+		require.ErrorIs(t, err, diff.ErrNotImplemented, prettySprintPlan(plan))
+		require.ErrorContains(t, err, "partitioned tables are not supported", prettySprintPlan(plan))
+		return
+	}
 	require.NoError(t, err)
 
 	assertValidPlan(t, plan)
@@ -253,6 +262,20 @@ func canonicalizeViewDeparseQualifiers(ddl string) string {
 		return ddl
 	}
 	return relationQualifierRegex.ReplaceAllString(ddl, "$1")
+}
+
+// declaresPartitionedTables reports whether the DDL declares a partitioned table, one of its
+// partitions, or attaches a partition. The fork refuses such schemas; see the README.
+func declaresPartitionedTables(ddl []string) bool {
+	for _, stmt := range ddl {
+		upper := strings.ToUpper(stmt)
+		if strings.Contains(upper, "PARTITION BY") ||
+			strings.Contains(upper, "PARTITION OF") ||
+			strings.Contains(upper, "ATTACH PARTITION") {
+			return true
+		}
+	}
+	return false
 }
 
 func directlyRunDDLAndGetDump(t *testing.T, engine *pgengine.Engine, ddl []string) string {
