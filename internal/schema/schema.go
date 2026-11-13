@@ -80,6 +80,9 @@ func (s Schema) Normalize() Schema {
 	s.NamedSchemas = normNamedSchemas
 	s.DefaultPrivileges = sortSchemaObjectsByName(s.DefaultPrivileges)
 	s.Extensions = sortSchemaObjectsByName(s.Extensions)
+	for i := range s.Enums {
+		s.Enums[i].Privileges = sortSchemaObjectsByName(s.Enums[i].Privileges)
+	}
 	s.Enums = sortSchemaObjectsByName(s.Enums)
 
 	// Composite type attribute order is meaningful (it determines the layout of every value
@@ -88,6 +91,7 @@ func (s Schema) Normalize() Schema {
 	for _, compositeType := range sortSchemaObjectsByName(s.CompositeTypes) {
 		compositeType.DependsOnCompositeTypes = sortSchemaObjectsByName(compositeType.DependsOnCompositeTypes)
 		compositeType.DependsOnDomains = sortSchemaObjectsByName(compositeType.DependsOnDomains)
+		compositeType.Privileges = sortSchemaObjectsByName(compositeType.Privileges)
 		normCompositeTypes = append(normCompositeTypes, compositeType)
 	}
 	s.CompositeTypes = normCompositeTypes
@@ -98,6 +102,7 @@ func (s Schema) Normalize() Schema {
 		d.Constraints = sortSchemaObjectsByName(d.Constraints)
 		d.DependsOnFunctions = sortSchemaObjectsByName(d.DependsOnFunctions)
 		d.DependsOnDomains = sortSchemaObjectsByName(d.DependsOnDomains)
+		d.Privileges = sortSchemaObjectsByName(d.Privileges)
 		normDomains = append(normDomains, d)
 	}
 	s.Domains = normDomains
@@ -326,6 +331,8 @@ type Enum struct {
 	// Owner is the role that owns the enum type.
 	Owner  string
 	Labels []string
+	// Privileges are the explicit privileges granted on the type (pg_type.typacl).
+	Privileges []Privilege
 	// Description is the comment attached to the enum type (pg_description). Empty means no comment.
 	Description string
 }
@@ -349,6 +356,8 @@ func (a CompositeTypeAttribute) GetName() string {
 type CompositeType struct {
 	SchemaQualifiedName
 	Attributes []CompositeTypeAttribute
+	// Privileges are the explicit privileges granted on the type (pg_type.typacl).
+	Privileges []Privilege
 	// DependsOnCompositeTypes is the list of user-defined composite types referenced
 	// by this composite type's attributes, including references through array types.
 	DependsOnCompositeTypes []SchemaQualifiedName
@@ -399,6 +408,8 @@ type Domain struct {
 	DependsOnDomains []SchemaQualifiedName
 	// Description is the comment attached to the domain (pg_description). Empty means no comment.
 	Description string
+	// Privileges are the explicit privileges granted on the domain (pg_type.typacl).
+	Privileges []Privilege
 }
 
 type Table struct {
@@ -1422,22 +1433,58 @@ func (s *schemaFetcher) fetchExtensions(ctx context.Context) ([]Extension, error
 	return extensions, nil
 }
 
+func (s *schemaFetcher) fetchTypePrivileges(ctx context.Context) (map[string][]Privilege, error) {
+	rawPrivileges, err := s.q.GetTypePrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetTypePrivileges: %w", err)
+	}
+
+	privilegesByName := make(map[string][]Privilege)
+	for _, rawPrivilege := range rawPrivileges {
+		name := buildNameFromUnescaped(rawPrivilege.PaTypeName, rawPrivilege.PaTypeSchemaName)
+		isGrantable := false
+		if rawPrivilege.IsGrantable != nil {
+			if b, ok := rawPrivilege.IsGrantable.(bool); ok {
+				isGrantable = b
+			}
+		}
+		// PUBLIC holds USAGE on every type by default, so that row is the
+		// default state, not a grant the plan has to make.
+		if rawPrivilege.Grantee == "" && rawPrivilege.Privilege == "USAGE" && !isGrantable {
+			continue
+		}
+		privilegesByName[name.GetFQEscapedName()] = append(privilegesByName[name.GetFQEscapedName()], Privilege{
+			Grantee:     rawPrivilege.Grantee,
+			Privilege:   rawPrivilege.Privilege,
+			IsGrantable: isGrantable,
+		})
+	}
+	return privilegesByName, nil
+}
+
 func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
 	rawEnums, err := s.q.GetEnums(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetEnums: %w", err)
 	}
 
+	privilegesByName, err := s.fetchTypePrivileges(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var enums []Enum
 	for _, rawEnum := range rawEnums {
+		name := SchemaQualifiedName{
+			SchemaName:  rawEnum.EnumSchemaName,
+			EscapedName: EscapeIdentifier(rawEnum.EnumName),
+		}
 		enums = append(enums, Enum{
-			SchemaQualifiedName: SchemaQualifiedName{
-				SchemaName:  rawEnum.EnumSchemaName,
-				EscapedName: EscapeIdentifier(rawEnum.EnumName),
-			},
-			Owner:       rawEnum.Owner,
-			Labels:      rawEnum.EnumLabels,
-			Description: rawEnum.Description,
+			SchemaQualifiedName: name,
+			Owner:               rawEnum.Owner,
+			Labels:              rawEnum.EnumLabels,
+			Privileges:          privilegesByName[name.GetFQEscapedName()],
+			Description:         rawEnum.Description,
 		})
 	}
 
@@ -1458,6 +1505,11 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 		return nil, fmt.Errorf("GetCompositeTypes: %w", err)
 	}
 
+	privilegesByName, err := s.fetchTypePrivileges(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	type ctWithOid struct {
 		typeOid interface{}
 		relOid  interface{}
@@ -1468,12 +1520,14 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 	for _, row := range rawAttrs {
 		ct, ok := byOid[row.TypeOid]
 		if !ok {
+			name := SchemaQualifiedName{
+				SchemaName:  row.TypeSchemaName,
+				EscapedName: EscapeIdentifier(row.TypeName),
+			}
 			ct = &CompositeType{
-				SchemaQualifiedName: SchemaQualifiedName{
-					SchemaName:  row.TypeSchemaName,
-					EscapedName: EscapeIdentifier(row.TypeName),
-				},
-				Description: row.Description,
+				SchemaQualifiedName: name,
+				Privileges:          privilegesByName[name.GetFQEscapedName()],
+				Description:         row.Description,
 			}
 			byOid[row.TypeOid] = ct
 			ordered = append(ordered, ctWithOid{typeOid: row.TypeOid, relOid: row.TypeRelOid, ct: ct})
@@ -1541,6 +1595,11 @@ func (s *schemaFetcher) fetchDomains(ctx context.Context) ([]Domain, error) {
 		return nil, fmt.Errorf("GetDomains: %w", err)
 	}
 
+	privilegesByName, err := s.fetchTypePrivileges(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var domains []Domain
 	for _, rawDomain := range rawDomains {
 		rawConstraints, err := s.q.GetDomainConstraints(ctx, rawDomain.Oid)
@@ -1595,6 +1654,8 @@ func (s *schemaFetcher) fetchDomains(ctx context.Context) ([]Domain, error) {
 			DependsOnFunctions: dedupeSchemaQualifiedNames(dependsOnFunctions),
 			DependsOnDomains:   dependsOnDomains,
 			Description:        rawDomain.Description,
+			Privileges: privilegesByName[buildNameFromUnescaped(
+				rawDomain.DomainName, rawDomain.DomainSchemaName).GetFQEscapedName()],
 		})
 	}
 

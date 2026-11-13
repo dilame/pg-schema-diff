@@ -972,6 +972,73 @@ WHERE
     );
 
 
+-- name: GetTypePrivileges :many
+WITH type_acl AS (
+    SELECT
+        pg_type.typname AS type_name,
+        type_namespace.nspname AS type_schema_name,
+        pg_type.typowner AS owner_oid,
+        COALESCE(
+            pg_type.typacl,
+            pg_catalog.acldefault('T', pg_type.typowner)
+        ) AS acl
+    FROM pg_catalog.pg_type AS pg_type
+    INNER JOIN
+        pg_catalog.pg_namespace AS type_namespace
+        ON pg_type.typnamespace = type_namespace.oid
+    WHERE
+        type_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND type_namespace.nspname !~ '^pg_toast'
+        AND type_namespace.nspname !~ '^pg_temp'
+        -- The types this tool models: domains, enums, and user-defined
+        -- composite types. A table's implicit row type is a composite type in
+        -- the catalog but is not a type the plan creates or drops.
+        AND (
+            pg_type.typtype IN ('d', 'e')
+            OR (pg_type.typtype = 'c' AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_class AS type_relation
+                WHERE
+                    type_relation.oid = pg_type.typrelid
+                    AND type_relation.relkind = 'c'
+            ))
+        )
+        -- Exclude types belonging to extensions
+        AND NOT EXISTS (
+            SELECT ext_depend.objid
+            FROM pg_catalog.pg_depend AS ext_depend
+            WHERE
+                ext_depend.classid = 'pg_type'::REGCLASS
+                AND ext_depend.objid = pg_type.oid
+                AND ext_depend.deptype = 'e'
+        )
+),
+
+parsed_acl AS (
+    SELECT
+        type_acl.type_name,
+        type_acl.type_schema_name,
+        type_acl.owner_oid,
+        (ACLEXPLODE(type_acl.acl)).grantee AS grantee_oid,
+        (ACLEXPLODE(type_acl.acl)).privilege_type AS privilege_type,
+        (ACLEXPLODE(type_acl.acl)).is_grantable AS is_grantable
+    FROM type_acl
+)
+
+SELECT
+    pa.type_name::TEXT,
+    pa.type_schema_name::TEXT,
+    COALESCE(grantee_role.rolname, '')::TEXT AS grantee,
+    pa.privilege_type::TEXT AS privilege,
+    pa.is_grantable
+FROM parsed_acl AS pa
+LEFT JOIN pg_catalog.pg_roles AS grantee_role
+    ON pa.grantee_oid = grantee_role.oid
+-- Exclude privileges granted to the type owner (these are implicit)
+WHERE pa.grantee_oid != pa.owner_oid OR pa.grantee_oid = 0
+ORDER BY pa.type_schema_name, pa.type_name, grantee, pa.privilege_type;
+
+
 -- name: GetPolicies :many
 WITH roles AS (
     SELECT

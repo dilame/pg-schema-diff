@@ -20,8 +20,8 @@ feature areas on top of it:
 - `COMMENT ON` support for tables, views, materialized views, columns,
   routines, types, and domains
 - Privilege diffs (`GRANT`/`REVOKE`) for tables, views, materialized views,
-  columns, schemas, routines, and default privileges; object ownership drift
-  detection (`OWNER TO`)
+  columns, schemas, routines, types and domains, and default privileges; object
+  ownership drift detection (`OWNER TO`)
 - In-place replacement of views (`CREATE OR REPLACE VIEW`) when output columns
   stay compatible, including re-creation of dependent views and ordering
   around the relations and functions the definition reads

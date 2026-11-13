@@ -157,3 +157,65 @@ func (psg *privilegeSQLVertexGenerator) GetAddAlterDependencies(newPriv, _ schem
 func (psg *privilegeSQLVertexGenerator) GetDeleteDependencies(_ schema.Privilege) ([]dependency, error) {
 	return nil, nil
 }
+
+// typePrivilegeStatements generates the GRANT/REVOKE statements that move the
+// privileges of one type (or domain) from oldPrivileges to newPrivileges.
+// objKind is TYPE or DOMAIN, the keyword PostgreSQL expects after ON.
+func typePrivilegeStatements(
+	objKind string,
+	name schema.SchemaQualifiedName,
+	oldPrivileges []schema.Privilege,
+	newPrivileges []schema.Privilege,
+) []Statement {
+	target := fmt.Sprintf("%s %s", objKind, name.GetFQEscapedName())
+
+	oldByName := make(map[string]schema.Privilege, len(oldPrivileges))
+	for _, p := range oldPrivileges {
+		oldByName[p.GetName()] = p
+	}
+	newByName := make(map[string]schema.Privilege, len(newPrivileges))
+	for _, p := range newPrivileges {
+		newByName[p.GetName()] = p
+	}
+
+	var stmts []Statement
+	for _, oldPrivilege := range oldPrivileges {
+		newPrivilege, stillGranted := newByName[oldPrivilege.GetName()]
+		switch {
+		case !stillGranted:
+			stmts = append(stmts, Statement{
+				DDL: fmt.Sprintf("REVOKE %s ON %s FROM %s",
+					oldPrivilege.Privilege, target, privilegeGranteeSQL(oldPrivilege.Grantee)),
+				Timeout:     statementTimeoutDefault,
+				LockTimeout: lockTimeoutDefault,
+				Hazards:     []MigrationHazard{migrationHazardPrivilegeRevoked},
+			})
+		case oldPrivilege.IsGrantable && !newPrivilege.IsGrantable:
+			stmts = append(stmts, Statement{
+				DDL: fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON %s FROM %s",
+					oldPrivilege.Privilege, target, privilegeGranteeSQL(oldPrivilege.Grantee)),
+				Timeout:     statementTimeoutDefault,
+				LockTimeout: lockTimeoutDefault,
+				Hazards:     []MigrationHazard{migrationHazardPrivilegeRevoked},
+			})
+		}
+	}
+	for _, newPrivilege := range newPrivileges {
+		oldPrivilege, alreadyGranted := oldByName[newPrivilege.GetName()]
+		if alreadyGranted && (oldPrivilege.IsGrantable || !newPrivilege.IsGrantable) {
+			continue
+		}
+		ddl := fmt.Sprintf("GRANT %s ON %s TO %s",
+			newPrivilege.Privilege, target, privilegeGranteeSQL(newPrivilege.Grantee))
+		if newPrivilege.IsGrantable {
+			ddl += " WITH GRANT OPTION"
+		}
+		stmts = append(stmts, Statement{
+			DDL:         ddl,
+			Timeout:     statementTimeoutDefault,
+			LockTimeout: lockTimeoutDefault,
+			Hazards:     []MigrationHazard{migrationHazardPrivilegeGranted},
+		})
+	}
+	return stmts
+}

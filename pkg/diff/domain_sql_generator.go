@@ -40,15 +40,19 @@ func (d *domainSQLVertexGenerator) Add(domain schema.Domain) (partialSQLGraph, e
 	deps = append(deps, d.dependsOnDepsForAddAlter(domain)...)
 	deps = append(deps, d.consumerDepsForAddAlter(domain)...)
 
+	statements := append([]Statement{{
+		DDL:         buildCreateDomainDDL(domain),
+		Timeout:     statementTimeoutDefault,
+		LockTimeout: lockTimeoutDefault,
+	}}, commentDDLForAdd(commentTargetDomain(domain.SchemaQualifiedName), domain.Description)...)
+	statements = append(statements, stripMigrationHazards(typePrivilegeStatements(
+		"DOMAIN", domain.SchemaQualifiedName, nil, domain.Privileges)...)...)
+
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
-			id:       addVertexId,
-			priority: sqlPrioritySooner,
-			statements: append([]Statement{{
-				DDL:         buildCreateDomainDDL(domain),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-			}}, commentDDLForAdd(commentTargetDomain(domain.SchemaQualifiedName), domain.Description)...),
+			id:         addVertexId,
+			priority:   sqlPrioritySooner,
+			statements: statements,
 		}},
 		dependencies: deps,
 	}, nil
@@ -70,16 +74,18 @@ func (d *domainSQLVertexGenerator) Delete(domain schema.Domain) (partialSQLGraph
 	deps := d.dependsOnDepsForDelete(domain)
 	deps = append(deps, d.consumerDepsForDelete(domain)...)
 
+	statements := []Statement{{
+		DDL:         fmt.Sprintf("DROP DOMAIN %s", domain.GetFQEscapedName()),
+		Timeout:     statementTimeoutDefault,
+		LockTimeout: lockTimeoutDefault,
+		Hazards:     hazards,
+	}}
+
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
-			id:       deleteVertexId,
-			priority: sqlPriorityDropsLast,
-			statements: []Statement{{
-				DDL:         fmt.Sprintf("DROP DOMAIN %s", domain.GetFQEscapedName()),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-				Hazards:     hazards,
-			}},
+			id:         deleteVertexId,
+			priority:   sqlPriorityDropsLast,
+			statements: statements,
 		}},
 		dependencies: deps,
 	}, nil
@@ -101,6 +107,8 @@ func (d *domainSQLVertexGenerator) Alter(diff domainDiff) (partialSQLGraph, erro
 		return partialSQLGraph{}, err
 	}
 	statements = append(statements, commentDDLForAlter(commentTargetDomain(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
+	statements = append(statements, typePrivilegeStatements(
+		"DOMAIN", diff.new.SchemaQualifiedName, diff.old.Privileges, diff.new.Privileges)...)
 	if len(statements) == 0 {
 		return partialSQLGraph{}, nil
 	}
@@ -204,6 +212,8 @@ func buildAlterDomainStatements(old, new schema.Domain) ([]Statement, error) {
 	oldCopy.DependsOnDomains = new.DependsOnDomains
 	// The comment is resolved by an explicit COMMENT statement in Alter.
 	oldCopy.Description = new.Description
+	// Privileges are resolved by explicit GRANT/REVOKE statements in Alter.
+	oldCopy.Privileges = new.Privileges
 	if diff := cmp.Diff(oldCopy, new); diff != "" {
 		return nil, fmt.Errorf("unable to resolve the diff %s: %w", diff, ErrNotImplemented)
 	}

@@ -49,6 +49,7 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 		LockTimeout: lockTimeoutDefault,
 	}}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Description)...)
+	stmts = append(stmts, stripMigrationHazards(typePrivilegeStatements("TYPE", ct.SchemaQualifiedName, nil, ct.Privileges)...)...)
 
 	// The type must exist before any consumer (table/function/procedure/trigger)
 	// is added or altered. We add blanket "after-this" dependencies on the type
@@ -79,15 +80,17 @@ func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (parti
 	deps := c.consumerDepsForDelete(ct)
 	deps = append(deps, c.compositeTypeDepsForDelete(ct)...)
 
+	statements := []Statement{{
+		DDL:         fmt.Sprintf("DROP TYPE %s", ct.GetFQEscapedName()),
+		Timeout:     statementTimeoutDefault,
+		LockTimeout: lockTimeoutDefault,
+	}}
+
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
-			id:       deleteVertexId,
-			priority: sqlPriorityDropsLast,
-			statements: []Statement{{
-				DDL:         fmt.Sprintf("DROP TYPE %s", ct.GetFQEscapedName()),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-			}},
+			id:         deleteVertexId,
+			priority:   sqlPriorityDropsLast,
+			statements: statements,
 		}},
 		dependencies: deps,
 	}, nil
@@ -98,16 +101,19 @@ func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQL
 	// not require touching the type itself.
 	oldCopy := d.old
 	oldCopy.Description = d.new.Description
+	oldCopy.Privileges = d.new.Privileges
 	if cmp.Equal(oldCopy, d.new) {
-		commentStmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
-		if len(commentStmts) == 0 {
+		stmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
+		stmts = append(stmts, typePrivilegeStatements(
+			"TYPE", d.new.SchemaQualifiedName, d.old.Privileges, d.new.Privileges)...)
+		if len(stmts) == 0 {
 			return partialSQLGraph{}, nil
 		}
 		return partialSQLGraph{
 			vertices: []sqlVertex{{
 				id:         buildCompositeTypeVertexId(d.new.SchemaQualifiedName, diffTypeAddAlter),
 				priority:   sqlPrioritySooner,
-				statements: commentStmts,
+				statements: stmts,
 			}},
 		}, nil
 	}

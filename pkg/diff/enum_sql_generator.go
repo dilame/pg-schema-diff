@@ -28,6 +28,7 @@ func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 	}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(enum.SchemaQualifiedName), enum.Description)...)
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("TYPE", enum.SchemaQualifiedName), enum.Owner)...)
+	stmts = append(stmts, stripMigrationHazards(typePrivilegeStatements("TYPE", enum.SchemaQualifiedName, nil, enum.Privileges)...)...)
 	return stmts, nil
 }
 
@@ -95,6 +96,9 @@ func (e *enumSQLGenerator) Alter(diff enumDiff) ([]Statement, error) {
 	oldCopy.Labels = diff.new.Labels
 	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("TYPE", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	oldCopy.Owner = diff.new.Owner
+	stmts = append(stmts, typePrivilegeStatements(
+		"TYPE", diff.new.SchemaQualifiedName, diff.old.Privileges, diff.new.Privileges)...)
+	oldCopy.Privileges = diff.new.Privileges
 
 	if d := cmp.Diff(oldCopy, diff.new); d != "" {
 		return nil, fmt.Errorf("unable to resolve the diff %s: %w", d, ErrNotImplemented)
