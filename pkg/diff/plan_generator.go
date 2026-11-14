@@ -372,9 +372,7 @@ func (d *tempDbDrops) drop(ctx context.Context, db *tempdb.Database) {
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
-		// The drop must not wait for the caller's context: a canceled context means the plan is
-		// failing, and the temporary database still has to go.
-		if err := db.Close(context.WithoutCancel(ctx)); err != nil {
+		if err := db.Close(ctx); err != nil {
 			d.logger.Errorf("an error occurred while dropping the temp database: %s", err)
 		}
 	}()
