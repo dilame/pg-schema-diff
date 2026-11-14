@@ -15,6 +15,7 @@ import (
 	"github.com/stripe/pg-schema-diff/internal/graph"
 	"github.com/stripe/pg-schema-diff/internal/schema"
 	externalschema "github.com/stripe/pg-schema-diff/pkg/schema"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/stripe/pg-schema-diff/pkg/log"
 	"github.com/stripe/pg-schema-diff/pkg/tempdb"
@@ -272,22 +273,47 @@ func assertValidPlan(ctx context.Context,
 	plan Plan,
 	planOptions *planOptions,
 ) error {
-	return withTempDb(ctx, tempDbFactory, planOptions.logger, func(tempDb *tempdb.Database) error {
-		if err := setSchemaForEmptyDatabase(ctx, tempDb, currentSchema, planOptions); err != nil {
-			return fmt.Errorf("inserting schema in temporary database: %w", err)
-		}
+	var migratedSchema, expectedSchema schema.Schema
 
-		if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool, plan.Statements, planOptions.disableCheckFunctionBodies); err != nil {
-			return fmt.Errorf("running migration plan: %w", err)
-		}
+	// Validation builds two temporary databases. The first reconstructs the current schema and
+	// applies the plan to it. The second reconstructs the target schema so the migrated schema can be
+	// compared with the target's re-created form. Neither
+	// reads what the other writes, and both are rebuilt from schemas already in memory, so they run
+	// at the same time; a failure in either cancels the other through the shared context.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return withTempDb(gctx, tempDbFactory, planOptions.logger, func(tempDb *tempdb.Database) error {
+			if err := setSchemaForEmptyDatabase(gctx, tempDb, currentSchema, planOptions); err != nil {
+				return fmt.Errorf("inserting schema in temporary database: %w", err)
+			}
 
-		migratedSchema, err := schemaFromTempDb(ctx, tempDb, planOptions)
-		if err != nil {
-			return fmt.Errorf("fetching schema from migrated database: %w", err)
-		}
+			if err := executeStatementsIgnoreTimeouts(gctx, tempDb.ConnPool, plan.Statements, planOptions.disableCheckFunctionBodies); err != nil {
+				return fmt.Errorf("running migration plan: %w", err)
+			}
 
-		return assertMigratedSchemaMatchesTarget(ctx, tempDbFactory, migratedSchema, newSchema, planOptions)
+			var err error
+			migratedSchema, err = schemaFromTempDb(gctx, tempDb, planOptions)
+			if err != nil {
+				return fmt.Errorf("fetching schema from migrated database: %w", err)
+			}
+			return nil
+		})
 	})
+	g.Go(func() error {
+		// Clear privileges before reconstructing, as the comparison always has: the create-and-read
+		// cycle must not try to emit privilege statements for roles the temporary database lacks.
+		var err error
+		expectedSchema, err = schemaFromFreshTempDb(gctx, tempDbFactory, clearSkippedPrivileges(newSchema), planOptions)
+		if err != nil {
+			return fmt.Errorf("inserting target schema in temporary database: %w", err)
+		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	return assertMigratedSchemaMatchesExpected(migratedSchema, expectedSchema, planOptions)
 }
 
 // withTempDb creates a temporary database, caps its connections and drops it after fn returns.
@@ -302,7 +328,9 @@ func withTempDb(
 		return err
 	}
 	defer func(closer tempdb.ContextualCloser) {
-		if err := closer.Close(ctx); err != nil {
+		// The drop must run even when the caller's context was canceled because a concurrent branch
+		// failed: leaving the temporary database behind would outlive the plan it belonged to.
+		if err := closer.Close(context.WithoutCancel(ctx)); err != nil {
 			logger.Errorf("an error occurred while dropping the temp database: %s", err)
 		}
 	}(tempDb.ContextualCloser)
@@ -432,27 +460,18 @@ func clearSkippedPrivileges(s schema.Schema) schema.Schema {
 	return s
 }
 
-func assertMigratedSchemaMatchesTarget(
-	ctx context.Context,
-	tempDbFactory tempdb.Factory,
-	migratedSchema, targetSchema schema.Schema,
-	planOptions *planOptions,
-) error {
+// assertMigratedSchemaMatchesExpected compares a schema that came out of a temporary database with
+// the target schema that went through the same create-and-read cycle.
+//
+// PostgreSQL does not always print a definition back the way it parsed it: a trigger whose WHEN
+// condition compares three or more columns as a row is stored as nested ORs and prints that way,
+// but parses back into a flat OR. Comparing the migrated schema with the target as it was read from
+// its source would then report a difference where only the deparse differs. The target is therefore
+// put through the same cycle before the two are compared.
+func assertMigratedSchemaMatchesExpected(migratedSchema, expectedSchema schema.Schema, planOptions *planOptions) error {
 	// Clear privileges from both schemas since privilege statements are skipped during validation
 	// (roles don't exist in temp DB). We make copies to avoid modifying the original schemas.
 	migratedSchema = clearSkippedPrivileges(migratedSchema)
-	targetSchema = clearSkippedPrivileges(targetSchema)
-
-	// The migrated schema is the result of a create-and-read cycle in a temporary database.
-	// PostgreSQL does not always print a definition back the way it parsed it: a trigger whose WHEN
-	// condition compares three or more columns as a row is stored as nested ORs and prints that
-	// way, but parses back into a flat OR. Comparing the migrated schema with the target as it was
-	// read from its source would then report a difference where only the deparse differs. Put the
-	// target through the same cycle, so the two sides are comparable.
-	expectedSchema, err := schemaFromFreshTempDb(ctx, tempDbFactory, targetSchema, planOptions)
-	if err != nil {
-		return fmt.Errorf("inserting target schema in temporary database: %w", err)
-	}
 	expectedSchema = clearSkippedPrivileges(expectedSchema)
 
 	toTargetSchemaStmts, err := generateMigrationStatements(migratedSchema, expectedSchema, planOptions)
