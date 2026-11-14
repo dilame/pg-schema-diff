@@ -77,9 +77,8 @@ func newTypePrivilegeSQLVertexGenerator(name schema.SchemaQualifiedName, objKind
 	)
 }
 
-// generateTypePrivilegeStatements resolves the privilege diff of one type or domain. Revokes run
-// before grants, so a privilege moving between PUBLIC and a role never leaves the intermediate
-// state in which neither holds it.
+// generateTypePrivilegeStatements resolves the privilege diff of one type or domain through the
+// shared privilege generator.
 func generateTypePrivilegeStatements(
 	name schema.SchemaQualifiedName,
 	objKind string,
@@ -89,18 +88,6 @@ func generateTypePrivilegeStatements(
 	partialGraph, err := generatePartialGraph(generator, diffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving type privilege sql: %w", err)
-	}
-	// A recreation (a grant-option change) is already ordered delete-before-add by the
-	// generator; the remaining pairs are distinct privileges.
-	for _, deleted := range diffs.deletes {
-		for _, added := range diffs.adds {
-			if deleted.GetName() == added.GetName() {
-				continue
-			}
-			partialGraph.dependencies = append(partialGraph.dependencies,
-				mustRun(privilegeSQLVertexId(typePrivilegeObjType, name, deleted, diffTypeDelete)).
-					before(privilegeSQLVertexId(typePrivilegeObjType, name, added, diffTypeAddAlter)))
-		}
 	}
 	statements, err := graphStatements(partialGraph)
 	if err != nil {

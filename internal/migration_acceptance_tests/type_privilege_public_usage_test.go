@@ -27,8 +27,8 @@ var typePrivilegePublicUsageTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 		expectedPlanDDL: []string{
-			`REVOKE USAGE ON TYPE "public"."foo" FROM PUBLIC`,
 			`GRANT USAGE ON TYPE "public"."foo" TO "app_user"`,
+			`REVOKE USAGE ON TYPE "public"."foo" FROM PUBLIC`,
 		},
 	},
 	{
@@ -48,8 +48,8 @@ var typePrivilegePublicUsageTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 		expectedPlanDDL: []string{
-			`REVOKE USAGE ON TYPE "public"."foo" FROM PUBLIC`,
 			`GRANT USAGE ON TYPE "public"."foo" TO "app_user"`,
+			`REVOKE USAGE ON TYPE "public"."foo" FROM PUBLIC`,
 		},
 	},
 	{
@@ -69,8 +69,8 @@ var typePrivilegePublicUsageTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 		expectedPlanDDL: []string{
-			`REVOKE USAGE ON DOMAIN "public"."foo" FROM PUBLIC`,
 			`GRANT USAGE ON DOMAIN "public"."foo" TO "app_user"`,
+			`REVOKE USAGE ON DOMAIN "public"."foo" FROM PUBLIC`,
 		},
 	},
 	{

@@ -1146,12 +1146,12 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting type privileges future: %w", err)
 	}
-	typePrivileges, err := typePrivilegesFuture.Get(ctx)
-	if err != nil {
-		return Schema{}, fmt.Errorf("getting type privileges: %w", err)
-	}
 
 	enumsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Enum, error) {
+		typePrivileges, err := typePrivilegesFuture.Get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting type privileges: %w", err)
+		}
 		return s.fetchEnums(ctx, typePrivileges)
 	})
 	if err != nil {
@@ -1159,6 +1159,10 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	}
 
 	compositeTypesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]CompositeType, error) {
+		typePrivileges, err := typePrivilegesFuture.Get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting type privileges: %w", err)
+		}
 		return s.fetchCompositeTypes(ctx, typePrivileges)
 	})
 	if err != nil {
@@ -1166,6 +1170,10 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	}
 
 	domainsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Domain, error) {
+		typePrivileges, err := typePrivilegesFuture.Get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting type privileges: %w", err)
+		}
 		return s.fetchDomains(ctx, typePrivileges)
 	})
 	if err != nil {
