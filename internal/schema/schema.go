@@ -1018,9 +1018,19 @@ func GetSchema(ctx context.Context, db queries.DBTX, opts ...GetSchemaOpt) (Sche
 	// In the future, we should maybe create options where users can pass in a DB pool (WithPool(db) or WithConnection(db))
 	// and we can set concurrency to 1 if the passed in db is not a *sql.DB.
 	goroutineRunnerFactory := concurrent.NewSynchronousGoroutineRunner
-	if _, ok := db.(*sql.DB); ok {
+	// canonicalizerSessions is how many sessions canonicalization may hold at once; 0 means the
+	// source is not a pool and its statements must share one session.
+	canonicalizerSessions := 0
+	if pool, ok := db.(*sql.DB); ok {
 		goroutineRunnerFactory = func() concurrent.GoroutineRunner {
 			return concurrent.NewGoroutineLimiter(50)
+		}
+		canonicalizerSessions = canonicalizerMaxSessions
+		if max := pool.Stats().MaxOpenConnections; max > 0 && max < canonicalizerSessions {
+			canonicalizerSessions = max
+		}
+		if canonicalizerSessions < 1 {
+			canonicalizerSessions = 1
 		}
 	}
 
@@ -1038,6 +1048,7 @@ func GetSchema(ctx context.Context, db queries.DBTX, opts ...GetSchemaOpt) (Sche
 		q:                      queries.New(db),
 		db:                     db,
 		goroutineRunnerFactory: goroutineRunnerFactory,
+		canonicalizerSessions:  canonicalizerSessions,
 		nameFilter:             nameFilter,
 	}).getSchema(ctx)
 }
@@ -1104,6 +1115,10 @@ type (
 		// goroutineRunnerFactory is a factory function that returns a GoroutineRunner. We need to be able to construct
 		// multiple GoroutineRunners to avoid deadlock created by circular dependencies of submitted go routines.
 		goroutineRunnerFactory func() concurrent.GoroutineRunner
+		// canonicalizerSessions is how many sessions canonicalization may hold at once, decided by
+		// GetSchema from the source: 0 means the source is not a pool and its statements must share
+		// one session.
+		canonicalizerSessions int
 		// nameFilter is a filter that determines which schema objects to include in the schema via their
 		// schema name and object name.
 		//
@@ -2758,15 +2773,8 @@ const canonicalizerMaxSessions = 5
 // until none are left. An object's canonical form depends on nothing but its
 // own definition, so the order objects are claimed in does not matter.
 func (s *schemaFetcher) canonicalizeOverSessions(ctx context.Context, objects int, work func(ctx context.Context, claim func() (int, bool)) error) error {
-	sessions := canonicalizerMaxSessions
-	if pool, ok := s.db.(interface{ Stats() sql.DBStats }); ok {
-		if max := pool.Stats().MaxOpenConnections; max > 0 && max < sessions {
-			sessions = max
-		}
-	} else {
-		// Anything that is not a pool is one connection, and GetSchema passes
-		// a *sql.Conn or a driver connection for those: its statements must
-		// share one session.
+	sessions := s.canonicalizerSessions
+	if sessions < 1 {
 		sessions = 1
 	}
 	if sessions > objects {
@@ -2802,19 +2810,20 @@ func (s *schemaFetcher) canonicalizeOverSessions(ctx context.Context, objects in
 // them: two statements of one canonicalization could otherwise land on two
 // connections.
 func (s *schemaFetcher) pinnedConnection(ctx context.Context) (queries.DBTX, func(), error) {
-	if pool, ok := s.db.(interface {
-		Conn(context.Context) (*sql.Conn, error)
-	}); ok {
-		conn, err := pool.Conn(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("acquiring a connection for canonicalization: %w", err)
-		}
-		return conn, func() { _ = conn.Close() }, nil
+	// The session limit GetSchema decided is also the answer to "is this a pool": 0 means the
+	// source is one connection whose statements already share a session.
+	if s.canonicalizerSessions == 0 {
+		return s.db, func() {}, nil
 	}
-	// Anything that is not a pool is a single connection: GetSchema disables
-	// concurrency for those, and its callers pass a *sql.Conn or a driver
-	// connection.
-	return s.db, func() {}, nil
+	pool, ok := s.db.(*sql.DB)
+	if !ok {
+		return nil, nil, fmt.Errorf("canonicalization needs a session but the source is not a connection pool")
+	}
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("acquiring a connection for canonicalization: %w", err)
+	}
+	return conn, func() { _ = conn.Close() }, nil
 }
 
 // viewDefinitionCanonicalizer rewrites view definitions through a temporary view.
