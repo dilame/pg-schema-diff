@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -424,7 +425,7 @@ func setSchemaForEmptyDatabase(ctx context.Context, emptyDb *tempdb.Database, ta
 }
 
 func schemaFromTempDb(ctx context.Context, db *tempdb.Database, plan *planOptions) (schema.Schema, error) {
-	return schema.GetSchema(ctx, db.ConnPool, append(plan.getSchemaOpts, db.ExcludeMetadataOptions...)...)
+	return schema.GetSchema(ctx, db.ConnPool, append(slices.Clone(plan.getSchemaOpts), db.ExcludeMetadataOptions...)...)
 }
 
 // clearSkippedPrivileges returns a copy of the schema with all privileges cleared that are emitted
