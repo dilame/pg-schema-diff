@@ -43,7 +43,8 @@ func TestEnumSQLGenerator_Add_EscapesLabels(t *testing.T) {
 					SchemaName:  "public",
 					EscapedName: `"color"`,
 				},
-				Labels: tc.labels,
+				Labels:     tc.labels,
+				Privileges: []schema.Privilege{{Privilege: "USAGE"}},
 			})
 			require.NoError(t, err)
 			require.Len(t, stmts, 1)

@@ -60,9 +60,10 @@ func (p procedureSQLVertexGenerator) Add(s schema.Procedure) (partialSQLGraph, e
 	}}
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("PROCEDURE", s.SchemaQualifiedName), s.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetProcedure(s.SchemaQualifiedName), s.Description)...)
-	privilegeStmts, err := exactRoutinePrivilegeStatements(
+	privilegeStmts, err := exactPrivilegeStatements(
 		newProcedurePrivilegeSQLVertexGenerator(s.SchemaQualifiedName),
 		s.Privileges,
+		schema.Privilege{Privilege: "EXECUTE"},
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating procedure privilege statements: %w", err)

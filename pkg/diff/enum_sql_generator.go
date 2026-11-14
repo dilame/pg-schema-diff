@@ -28,6 +28,15 @@ func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 	}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(enum.SchemaQualifiedName), enum.Description)...)
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("TYPE", enum.SchemaQualifiedName), enum.Owner)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newTypePrivilegeSQLVertexGenerator(enum.SchemaQualifiedName, "TYPE"),
+		enum.Privileges,
+		schema.Privilege{Privilege: "USAGE"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generating enum privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 	return stmts, nil
 }
 
@@ -95,6 +104,12 @@ func (e *enumSQLGenerator) Alter(diff enumDiff) ([]Statement, error) {
 	oldCopy.Labels = diff.new.Labels
 	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("TYPE", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	oldCopy.Owner = diff.new.Owner
+	privilegeStmts, err := generateTypePrivilegeStatements(diff.new.SchemaQualifiedName, "TYPE", diff.privilegesDiff)
+	if err != nil {
+		return nil, err
+	}
+	stmts = append(stmts, privilegeStmts...)
+	oldCopy.Privileges = diff.new.Privileges
 
 	if d := cmp.Diff(oldCopy, diff.new); d != "" {
 		return nil, fmt.Errorf("unable to resolve the diff %s: %w", d, ErrNotImplemented)

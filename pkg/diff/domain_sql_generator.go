@@ -40,15 +40,26 @@ func (d *domainSQLVertexGenerator) Add(domain schema.Domain) (partialSQLGraph, e
 	deps = append(deps, d.dependsOnDepsForAddAlter(domain)...)
 	deps = append(deps, d.consumerDepsForAddAlter(domain)...)
 
+	statements := append([]Statement{{
+		DDL:         buildCreateDomainDDL(domain),
+		Timeout:     statementTimeoutDefault,
+		LockTimeout: lockTimeoutDefault,
+	}}, commentDDLForAdd(commentTargetDomain(domain.SchemaQualifiedName), domain.Description)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newTypePrivilegeSQLVertexGenerator(domain.SchemaQualifiedName, "DOMAIN"),
+		domain.Privileges,
+		schema.Privilege{Privilege: "USAGE"},
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating domain privilege statements: %w", err)
+	}
+	statements = append(statements, privilegeStmts...)
+
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
-			id:       addVertexId,
-			priority: sqlPrioritySooner,
-			statements: append([]Statement{{
-				DDL:         buildCreateDomainDDL(domain),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-			}}, commentDDLForAdd(commentTargetDomain(domain.SchemaQualifiedName), domain.Description)...),
+			id:         addVertexId,
+			priority:   sqlPrioritySooner,
+			statements: statements,
 		}},
 		dependencies: deps,
 	}, nil
@@ -101,6 +112,11 @@ func (d *domainSQLVertexGenerator) Alter(diff domainDiff) (partialSQLGraph, erro
 		return partialSQLGraph{}, err
 	}
 	statements = append(statements, commentDDLForAlter(commentTargetDomain(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
+	privilegeStmts, err := generateTypePrivilegeStatements(diff.new.SchemaQualifiedName, "DOMAIN", diff.privilegesDiff)
+	if err != nil {
+		return partialSQLGraph{}, err
+	}
+	statements = append(statements, privilegeStmts...)
 	if len(statements) == 0 {
 		return partialSQLGraph{}, nil
 	}
@@ -204,6 +220,8 @@ func buildAlterDomainStatements(old, new schema.Domain) ([]Statement, error) {
 	oldCopy.DependsOnDomains = new.DependsOnDomains
 	// The comment is resolved by an explicit COMMENT statement in Alter.
 	oldCopy.Description = new.Description
+	// Privileges are resolved by explicit GRANT/REVOKE statements in Alter.
+	oldCopy.Privileges = new.Privileges
 	if diff := cmp.Diff(oldCopy, new); diff != "" {
 		return nil, fmt.Errorf("unable to resolve the diff %s: %w", diff, ErrNotImplemented)
 	}

@@ -66,15 +66,50 @@ func newProcedurePrivilegeSQLVertexGenerator(procedureName schema.SchemaQualifie
 	)
 }
 
-func exactRoutinePrivilegeStatements(
+// typePrivilegeObjType is the vertex id prefix of a privilege on a type or domain.
+const typePrivilegeObjType = "type_privilege"
+
+func newTypePrivilegeSQLVertexGenerator(name schema.SchemaQualifiedName, objKind string) sqlVertexGenerator[schema.Privilege, privilegeDiff] {
+	return newPrivilegeSQLVertexGeneratorForObject(
+		typePrivilegeObjType,
+		name,
+		fmt.Sprintf("%s %s", objKind, name.GetFQEscapedName()),
+	)
+}
+
+// generateTypePrivilegeStatements resolves the privilege diff of one type or domain through the
+// shared privilege generator.
+func generateTypePrivilegeStatements(
+	name schema.SchemaQualifiedName,
+	objKind string,
+	diffs listDiff[schema.Privilege, privilegeDiff],
+) ([]Statement, error) {
+	generator := newTypePrivilegeSQLVertexGenerator(name, objKind)
+	partialGraph, err := generatePartialGraph(generator, diffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving type privilege sql: %w", err)
+	}
+	statements, err := graphStatements(partialGraph)
+	if err != nil {
+		return nil, fmt.Errorf("ordering type privilege sql: %w", err)
+	}
+	return statements, nil
+}
+
+// exactPrivilegeStatements emits the privileges of a newly created object, whose ACL
+// PostgreSQL initializes to the class default (PUBLIC EXECUTE on routines, PUBLIC USAGE on
+// types). The class-default row is part of the model but is not granted explicitly; when the
+// target does not hold it, it is revoked after the object is created.
+func exactPrivilegeStatements(
 	generator sqlVertexGenerator[schema.Privilege, privilegeDiff],
 	privileges []schema.Privilege,
+	classDefault schema.Privilege,
 ) ([]Statement, error) {
 	var stmts []Statement
-	hasDefaultPublicExecute := false
+	hasClassDefault := false
 	for _, p := range privileges {
-		if p.Grantee == "" && p.Privilege == "EXECUTE" && !p.IsGrantable {
-			hasDefaultPublicExecute = true
+		if p.Grantee == "" && p.Privilege == classDefault.Privilege && !p.IsGrantable {
+			hasClassDefault = true
 			continue
 		}
 		addPartialGraph, err := generator.Add(p)
@@ -83,10 +118,10 @@ func exactRoutinePrivilegeStatements(
 		}
 		stmts = append(stmts, stripMigrationHazards(addPartialGraph.statements()...)...)
 	}
-	if !hasDefaultPublicExecute {
-		deletePartialGraph, err := generator.Delete(schema.Privilege{Privilege: "EXECUTE"})
+	if !hasClassDefault {
+		deletePartialGraph, err := generator.Delete(classDefault)
 		if err != nil {
-			return nil, fmt.Errorf("generating revoke statement for default PUBLIC EXECUTE: %w", err)
+			return nil, fmt.Errorf("generating revoke statement for default PUBLIC %s: %w", classDefault.Privilege, err)
 		}
 		stmts = append(stripMigrationHazards(deletePartialGraph.statements()...), stmts...)
 	}

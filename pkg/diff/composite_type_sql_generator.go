@@ -49,6 +49,15 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 		LockTimeout: lockTimeoutDefault,
 	}}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Description)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newTypePrivilegeSQLVertexGenerator(ct.SchemaQualifiedName, "TYPE"),
+		ct.Privileges,
+		schema.Privilege{Privilege: "USAGE"},
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating composite type privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 
 	// The type must exist before any consumer (table/function/procedure/trigger)
 	// is added or altered. We add blanket "after-this" dependencies on the type
@@ -98,16 +107,22 @@ func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQL
 	// not require touching the type itself.
 	oldCopy := d.old
 	oldCopy.Description = d.new.Description
+	oldCopy.Privileges = d.new.Privileges
 	if cmp.Equal(oldCopy, d.new) {
-		commentStmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
-		if len(commentStmts) == 0 {
+		stmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
+		privilegeStmts, err := generateTypePrivilegeStatements(d.new.SchemaQualifiedName, "TYPE", d.privilegesDiff)
+		if err != nil {
+			return partialSQLGraph{}, err
+		}
+		stmts = append(stmts, privilegeStmts...)
+		if len(stmts) == 0 {
 			return partialSQLGraph{}, nil
 		}
 		return partialSQLGraph{
 			vertices: []sqlVertex{{
 				id:         buildCompositeTypeVertexId(d.new.SchemaQualifiedName, diffTypeAddAlter),
 				priority:   sqlPrioritySooner,
-				statements: commentStmts,
+				statements: stmts,
 			}},
 		}, nil
 	}
