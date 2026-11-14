@@ -8,11 +8,13 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v4"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/stripe/pg-schema-diff/internal/concurrent"
 	"github.com/stripe/pg-schema-diff/internal/queries"
+	"golang.org/x/sync/errgroup"
 )
 
 type (
@@ -2697,50 +2699,115 @@ func (s *schemaFetcher) fetchMaterializedViews(ctx context.Context) ([]Materiali
 // Materialized views go through a temporary view for the same reason — a
 // materialized view cannot be created in pg_temp.
 func (s *schemaFetcher) canonicalizeViewDefinitions(ctx context.Context, views []View, materializedViews []MaterializedView) ([]View, []MaterializedView, error) {
-	if len(views) == 0 && len(materializedViews) == 0 {
+	total := len(views) + len(materializedViews)
+	if total == 0 {
 		return views, materializedViews, nil
 	}
 
-	conn, release, err := s.pinnedConnection(ctx)
+	err := s.canonicalizeOverSessions(ctx, total, func(ctx context.Context, claim func() (int, bool)) error {
+		conn, release, err := s.pinnedConnection(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+
+		// One canonicalizer per session: its counter names the temporary views
+		// in that session's own temporary schema, and they are dropped as soon
+		// as they have been read.
+		canonicalizer := &viewDefinitionCanonicalizer{q: conn}
+		for {
+			i, ok := claim()
+			if !ok {
+				return nil
+			}
+			if i < len(views) {
+				if views[i].ViewDefinition == "" {
+					continue
+				}
+				canonical, err := canonicalizer.canonicalize(ctx, views[i].ViewDefinition)
+				if err != nil {
+					return fmt.Errorf("canonicalizing the definition of view %s: %w", views[i].GetFQEscapedName(), err)
+				}
+				views[i].ViewDefinitionCanonical = canonical
+				continue
+			}
+			j := i - len(views)
+			if materializedViews[j].ViewDefinition == "" {
+				continue
+			}
+			canonical, err := canonicalizer.canonicalize(ctx, materializedViews[j].ViewDefinition)
+			if err != nil {
+				return fmt.Errorf("canonicalizing the definition of materialized view %s: %w", materializedViews[j].GetFQEscapedName(), err)
+			}
+			materializedViews[j].ViewDefinitionCanonical = canonical
+		}
+	})
 	if err != nil {
 		return nil, nil, err
-	}
-	defer release()
-
-	canonicalizer := &viewDefinitionCanonicalizer{q: conn}
-	for i := range views {
-		if views[i].ViewDefinition == "" {
-			continue
-		}
-		canonical, err := canonicalizer.canonicalize(ctx, views[i].ViewDefinition)
-		if err != nil {
-			return nil, nil, fmt.Errorf("canonicalizing the definition of view %s: %w", views[i].GetFQEscapedName(), err)
-		}
-		views[i].ViewDefinitionCanonical = canonical
-	}
-	for i := range materializedViews {
-		if materializedViews[i].ViewDefinition == "" {
-			continue
-		}
-		canonical, err := canonicalizer.canonicalize(ctx, materializedViews[i].ViewDefinition)
-		if err != nil {
-			return nil, nil, fmt.Errorf("canonicalizing the definition of materialized view %s: %w", materializedViews[i].GetFQEscapedName(), err)
-		}
-		materializedViews[i].ViewDefinitionCanonical = canonical
 	}
 	return views, materializedViews, nil
 }
 
-// pinnedConnection returns a connection that will serve every statement of the
-// caller. Temporary objects live in a session, so a pool cannot be used: two
-// statements of one canonicalization could otherwise land on two connections.
+// canonicalizerMaxSessions is the most sessions a canonicalization uses at
+// once. Each session costs one of the pool's connections, and the plan's pools
+// hold five.
+const canonicalizerMaxSessions = 5
+
+// canonicalizeOverSessions runs work over at most sessions goroutines, each of
+// which holds one pinned connection and claims objects from a shared counter
+// until none are left. An object's canonical form depends on nothing but its
+// own definition, so the order objects are claimed in does not matter.
+func (s *schemaFetcher) canonicalizeOverSessions(ctx context.Context, objects int, work func(ctx context.Context, claim func() (int, bool)) error) error {
+	sessions := canonicalizerMaxSessions
+	if pool, ok := s.db.(interface{ Stats() sql.DBStats }); ok {
+		if max := pool.Stats().MaxOpenConnections; max > 0 && max < sessions {
+			sessions = max
+		}
+	} else {
+		// Anything that is not a pool is one connection, and GetSchema passes
+		// a *sql.Conn or a driver connection for those: its statements must
+		// share one session.
+		sessions = 1
+	}
+	if sessions > objects {
+		sessions = objects
+	}
+	if sessions <= 1 {
+		var next int
+		return work(ctx, func() (int, bool) {
+			if next >= objects {
+				return 0, false
+			}
+			i := next
+			next++
+			return i, true
+		})
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	var next atomic.Int64
+	for w := 0; w < sessions; w++ {
+		g.Go(func() error {
+			return work(gctx, func() (int, bool) {
+				i := int(next.Add(1)) - 1
+				return i, i < objects
+			})
+		})
+	}
+	return g.Wait()
+}
+
+// pinnedConnection returns a connection that serves one canonicalization
+// session. Temporary objects live in a session, so a pool cannot be used for
+// them: two statements of one canonicalization could otherwise land on two
+// connections.
 func (s *schemaFetcher) pinnedConnection(ctx context.Context) (queries.DBTX, func(), error) {
 	if pool, ok := s.db.(interface {
 		Conn(context.Context) (*sql.Conn, error)
 	}); ok {
 		conn, err := pool.Conn(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("acquiring a connection for canonicalizing view definitions: %w", err)
+			return nil, nil, fmt.Errorf("acquiring a connection for canonicalization: %w", err)
 		}
 		return conn, func() { _ = conn.Close() }, nil
 	}
@@ -2801,29 +2868,38 @@ func (s *schemaFetcher) canonicalizeFunctionDefinitions(ctx context.Context, fun
 		return functions, nil
 	}
 
-	conn, release, err := s.pinnedConnection(ctx)
+	err := s.canonicalizeOverSessions(ctx, len(functions), func(ctx context.Context, claim func() (int, bool)) error {
+		conn, release, err := s.pinnedConnection(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+
+		// Creating the temporary function must not require the reading role to see every object a
+		// body names. The deparser runs on the parse tree regardless of the check, so turning it off
+		// changes nothing about the canonical text.
+		if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = off"); err != nil {
+			return fmt.Errorf("disabling check_function_bodies for canonicalization: %w", err)
+		}
+
+		canonicalizer := &functionDefinitionCanonicalizer{q: conn}
+		for {
+			i, ok := claim()
+			if !ok {
+				return nil
+			}
+			if functions[i].FunctionDef == "" {
+				continue
+			}
+			canonical, err := canonicalizer.canonicalize(ctx, functions[i].FunctionDef)
+			if err != nil {
+				return fmt.Errorf("canonicalizing the definition of function %s: %w", functions[i].GetFQEscapedName(), err)
+			}
+			functions[i].FunctionDefCanonical = canonical
+		}
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer release()
-
-	// Creating the temporary function must not require the reading role to see every object a body
-	// names. The deparser runs on the parse tree regardless of the check, so turning it off changes
-	// nothing about the canonical text.
-	if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = off"); err != nil {
-		return nil, fmt.Errorf("disabling check_function_bodies for canonicalization: %w", err)
-	}
-
-	canonicalizer := &functionDefinitionCanonicalizer{q: conn}
-	for i := range functions {
-		if functions[i].FunctionDef == "" {
-			continue
-		}
-		canonical, err := canonicalizer.canonicalize(ctx, functions[i].FunctionDef)
-		if err != nil {
-			return nil, fmt.Errorf("canonicalizing the definition of function %s: %w", functions[i].GetFQEscapedName(), err)
-		}
-		functions[i].FunctionDefCanonical = canonical
 	}
 	return functions, nil
 }
