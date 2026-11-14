@@ -261,8 +261,14 @@ func (q *sourceQueue[V]) Pop() any {
 	return entry
 }
 
-// TopologicallySortWithPriority returns a consistent topological sort of the graph taking a greedy approach to put
-// high priority sources first. The output is deterministic. getPriority must be deterministic
+// TopologicallySortWithPriority returns a topological sort of the graph taking a greedy approach to put
+// high priority sources first: of the vertices no remaining edge points at, it emits the one no other is
+// lower priority than, the smaller id breaking a tie.
+//
+// isLowerPriority must be a strict weak ordering — each vertex is not lower priority than itself, no two
+// vertices are each lower than the other, and lower-than and its absence are both transitive. Under one,
+// the emitted order is deterministic. With a comparator that is not, the order depends on the map
+// iteration order the queue is seeded in, because the queue compares only the vertices it holds.
 func (g *Graph[V]) TopologicallySortWithPriority(isLowerPriority func(V, V) bool) ([]V, error) {
 	// This uses mutation. Copy the graph
 	graph := g.Copy()
@@ -313,6 +319,8 @@ func (g *Graph[V]) TopologicallySortWithPriority(isLowerPriority func(V, V) bool
 		delete(graph.verticesById, source.id)
 		// We don't need to worry about any incoming edges referencing this vertex, since it was a source
 		delete(graph.edges, source.id)
+		// The cycle diagnostic prints this map, so it must describe what remains, as the graph does.
+		delete(incomingEdgeCountByVertex, source.id)
 	}
 
 	// Every vertex emitted means the graph had no cycle; what is left lies on one.

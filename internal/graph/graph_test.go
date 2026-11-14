@@ -515,6 +515,25 @@ func TestTopologicallySortWithPriorityDoesNotFormatIdsWhileChoosing(t *testing.T
 	assert.Zero(t, calls)
 }
 
+func TestTopologicallySortWithPriorityCycleDiagnosticListsOnlyTheRemainingVertices(t *testing.T) {
+	// The diagnostic's count map describes what remains. An emitted vertex leaves no entry: a
+	// stale zero makes the counts disagree with the graph printed in the same message.
+	g := NewGraph[vertex]()
+	for _, id := range []string{"a", "b", "c", "d"} {
+		g.AddVertex(NewV(id))
+	}
+	require.NoError(t, g.AddEdge("a", "b"))
+	require.NoError(t, g.AddEdge("b", "c"))
+	require.NoError(t, g.AddEdge("c", "d"))
+	require.NoError(t, g.AddEdge("d", "c"))
+
+	_, err := g.TopologicallySortWithPriority(func(vertex, vertex) bool { return false })
+	var cycleErr *CycleError
+	require.ErrorAs(t, err, &cycleErr)
+	assert.Equal(t, []string{"c", "d"}, cycleErr.OnCycle)
+	assert.Contains(t, cycleErr.Error(), ", map[c:1 d:1]\n")
+}
+
 func getEdgeCount[V Vertex](g *Graph[V], v Vertex) int {
 	edgeCount := 0
 	for _, hasEdge := range g.edges[v.GetId()] {
