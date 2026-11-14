@@ -150,21 +150,38 @@ func Generate(
 		opt(planOptions)
 	}
 
-	currentSchema, err := fromSchema.GetSchema(ctx, schemaSourcePlanDeps{
-		tempDBFactory: planOptions.tempDbFactory,
-		logger:        planOptions.logger,
-		getSchemaOpts: planOptions.getSchemaOpts,
+	// The two schemas are read from independent sources: a database source reads its own catalog
+	// through its own pool, and a DDL source builds a temporary database of its own. Reading them one
+	// after the other made the plan wait for the first read while the second source sat idle, so both
+	// are read at the same time; a failure in either cancels the other through the shared context.
+	var currentSchema, newSchema schema.Schema
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		s, err := fromSchema.GetSchema(gctx, schemaSourcePlanDeps{
+			tempDBFactory: planOptions.tempDbFactory,
+			logger:        planOptions.logger,
+			getSchemaOpts: planOptions.getSchemaOpts,
+		})
+		if err != nil {
+			return fmt.Errorf("getting current schema: %w", err)
+		}
+		currentSchema = s
+		return nil
 	})
-	if err != nil {
-		return Plan{}, fmt.Errorf("getting current schema: %w", err)
-	}
-	newSchema, err := targetSchema.GetSchema(ctx, schemaSourcePlanDeps{
-		tempDBFactory: planOptions.tempDbFactory,
-		logger:        planOptions.logger,
-		getSchemaOpts: planOptions.getSchemaOpts,
+	g.Go(func() error {
+		s, err := targetSchema.GetSchema(gctx, schemaSourcePlanDeps{
+			tempDBFactory: planOptions.tempDbFactory,
+			logger:        planOptions.logger,
+			getSchemaOpts: planOptions.getSchemaOpts,
+		})
+		if err != nil {
+			return fmt.Errorf("getting new schema: %w", err)
+		}
+		newSchema = s
+		return nil
 	})
-	if err != nil {
-		return Plan{}, fmt.Errorf("getting new schema: %w", err)
+	if err := g.Wait(); err != nil {
+		return Plan{}, err
 	}
 
 	statements, err := generateMigrationStatements(currentSchema, newSchema, planOptions)
