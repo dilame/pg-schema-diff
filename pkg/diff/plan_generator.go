@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
@@ -292,6 +293,12 @@ func assertValidPlan(ctx context.Context,
 ) error {
 	var migratedSchema, expectedSchema schema.Schema
 
+	// A temporary database is dropped in the background as soon as the branch that read it is done,
+	// so the drop runs while the other branch or the final comparison still works. The plan is not
+	// returned before every drop has finished: a database left behind would outlive the plan.
+	drops := &tempDbDrops{logger: planOptions.logger}
+	defer drops.wait()
+
 	// Validation builds two temporary databases. The first reconstructs the current schema and
 	// applies the plan to it. The second reconstructs the target schema so the migrated schema can be
 	// compared with the target's re-created form. Neither
@@ -299,7 +306,7 @@ func assertValidPlan(ctx context.Context,
 	// at the same time; a failure in either cancels the other through the shared context.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return withTempDb(gctx, tempDbFactory, planOptions.logger, func(tempDb *tempdb.Database) error {
+		return withTempDb(gctx, tempDbFactory, planOptions.logger, drops, func(tempDb *tempdb.Database) error {
 			if err := setSchemaForEmptyDatabase(gctx, tempDb, currentSchema, planOptions); err != nil {
 				return fmt.Errorf("inserting schema in temporary database: %w", err)
 			}
@@ -320,7 +327,7 @@ func assertValidPlan(ctx context.Context,
 		// Clear privileges before reconstructing, as the comparison always has: the create-and-read
 		// cycle must not try to emit privilege statements for roles the temporary database lacks.
 		var err error
-		expectedSchema, err = schemaFromFreshTempDb(gctx, tempDbFactory, clearSkippedPrivileges(newSchema), planOptions)
+		expectedSchema, err = schemaFromFreshTempDb(gctx, tempDbFactory, drops, clearSkippedPrivileges(newSchema), planOptions)
 		if err != nil {
 			return fmt.Errorf("inserting target schema in temporary database: %w", err)
 		}
@@ -333,29 +340,48 @@ func assertValidPlan(ctx context.Context,
 	return assertMigratedSchemaMatchesExpected(migratedSchema, expectedSchema, planOptions)
 }
 
-// withTempDb creates a temporary database, caps its connections and drops it after fn returns.
+// withTempDb creates a temporary database, caps its connections and hands the drop to drops after
+// fn returns.
 func withTempDb(
 	ctx context.Context,
 	tempDbFactory tempdb.Factory,
 	logger log.Logger,
+	drops *tempDbDrops,
 	fn func(*tempdb.Database) error,
 ) error {
 	tempDb, err := tempDbFactory.Create(ctx)
 	if err != nil {
 		return err
 	}
-	defer func(closer tempdb.ContextualCloser) {
-		// The drop must run even when the caller's context was canceled because a concurrent branch
-		// failed: leaving the temporary database behind would outlive the plan it belonged to.
-		if err := closer.Close(context.WithoutCancel(ctx)); err != nil {
-			logger.Errorf("an error occurred while dropping the temp database: %s", err)
-		}
-	}(tempDb.ContextualCloser)
+	defer drops.drop(ctx, tempDb)
 	// Set a max connections if a user has not set one. This is to prevent us from exploding the number of connections
 	// on the database.
 	setMaxConnectionsIfNotSet(tempDb.ConnPool, tempDbMaxConnections)
 
 	return fn(tempDb)
+}
+
+// tempDbDrops drops temporary databases concurrently with the work that still needs the other
+// results, and joins them before the plan is returned.
+type tempDbDrops struct {
+	logger log.Logger
+	wg     sync.WaitGroup
+}
+
+func (d *tempDbDrops) drop(ctx context.Context, db *tempdb.Database) {
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		// The drop must not wait for the caller's context: a canceled context means the plan is
+		// failing, and the temporary database still has to go.
+		if err := db.Close(context.WithoutCancel(ctx)); err != nil {
+			d.logger.Errorf("an error occurred while dropping the temp database: %s", err)
+		}
+	}()
+}
+
+func (d *tempDbDrops) wait() {
+	d.wg.Wait()
 }
 
 func setMaxConnectionsIfNotSet(db *sql.DB, defaultMax int) {
@@ -512,11 +538,12 @@ func assertMigratedSchemaMatchesExpected(migratedSchema, expectedSchema schema.S
 func schemaFromFreshTempDb(
 	ctx context.Context,
 	tempDbFactory tempdb.Factory,
+	drops *tempDbDrops,
 	s schema.Schema,
 	planOptions *planOptions,
 ) (schema.Schema, error) {
 	var fetched schema.Schema
-	err := withTempDb(ctx, tempDbFactory, planOptions.logger, func(tempDb *tempdb.Database) error {
+	err := withTempDb(ctx, tempDbFactory, planOptions.logger, drops, func(tempDb *tempdb.Database) error {
 		if err := setSchemaForEmptyDatabase(ctx, tempDb, s, planOptions); err != nil {
 			return fmt.Errorf("inserting schema in temporary database: %w", err)
 		}
