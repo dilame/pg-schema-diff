@@ -2879,6 +2879,13 @@ func (s *schemaFetcher) canonicalizeFunctionDefinitions(ctx context.Context, fun
 		if _, err := conn.ExecContext(ctx, "SET SESSION check_function_bodies = off"); err != nil {
 			return fmt.Errorf("disabling check_function_bodies for canonicalization: %w", err)
 		}
+		if s.canonicalizerSessions > 0 {
+			// The connection returns to the pool with its session state, so restore the default
+			// before releasing it; the caller's later statements must validate function bodies.
+			defer func() {
+				_, _ = conn.ExecContext(context.WithoutCancel(ctx), "RESET check_function_bodies")
+			}()
+		}
 
 		canonicalizer := &functionDefinitionCanonicalizer{q: conn}
 		for {

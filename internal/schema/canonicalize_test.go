@@ -8,10 +8,44 @@ import (
 	"sync"
 	"testing"
 
+	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stripe/pg-schema-diff/internal/pgengine"
 	"github.com/stripe/pg-schema-diff/internal/queries"
 )
+
+func TestGetSchema_RestoresCheckFunctionBodiesOnPooledConnection(t *testing.T) {
+	engine, err := pgengine.StartEngine()
+	require.NoError(t, err)
+	defer engine.Close()
+
+	db, err := engine.CreateDatabase()
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.DropDB())
+	}()
+
+	pool, err := sql.Open("pgx", db.GetDSN())
+	require.NoError(t, err)
+	defer pool.Close()
+	// One connection makes the pool's only backend the one canonicalization uses, so its session
+	// state can be read back after GetSchema returns it.
+	pool.SetMaxOpenConns(1)
+
+	_, err = pool.Exec(`CREATE FUNCTION public.one() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;`)
+	require.NoError(t, err)
+
+	_, err = GetSchema(context.Background(), pool)
+	require.NoError(t, err)
+
+	conn, err := pool.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+	var setting string
+	require.NoError(t, conn.QueryRowContext(context.Background(), "SHOW check_function_bodies").Scan(&setting))
+	assert.Equal(t, "on", setting)
+}
 
 // poolStatsDB satisfies queries.DBTX and reports a pool cap; the scheduler only
 // reads Stats, and the work functions in these tests do not use the connection.
