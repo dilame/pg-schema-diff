@@ -2780,17 +2780,6 @@ func (s *schemaFetcher) canonicalizeOverSessions(ctx context.Context, objects in
 	if sessions > objects {
 		sessions = objects
 	}
-	if sessions <= 1 {
-		var next int
-		return work(ctx, func() (int, bool) {
-			if next >= objects {
-				return 0, false
-			}
-			i := next
-			next++
-			return i, true
-		})
-	}
 
 	g, gctx := errgroup.WithContext(ctx)
 	var next atomic.Int64
