@@ -7,12 +7,12 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stripe/pg-schema-diff/internal/pgengine"
-	"github.com/stripe/pg-schema-diff/internal/queries"
 )
 
 func TestGetSchema_RestoresCheckFunctionBodiesOnPooledConnection(t *testing.T) {
@@ -47,23 +47,6 @@ func TestGetSchema_RestoresCheckFunctionBodiesOnPooledConnection(t *testing.T) {
 	assert.Equal(t, "on", setting)
 }
 
-// poolStatsDB satisfies queries.DBTX and reports a pool cap; the scheduler only
-// reads Stats, and the work functions in these tests do not use the connection.
-type poolStatsDB struct {
-	queries.DBTX
-	maxOpen int
-}
-
-func (d poolStatsDB) Stats() sql.DBStats {
-	return sql.DBStats{MaxOpenConnections: d.maxOpen}
-}
-
-// singleConnectionDB satisfies queries.DBTX without a pool: GetSchema's callers
-// pass a single connection for those and the scheduler must stay serial.
-type singleConnectionDB struct {
-	queries.DBTX
-}
-
 func claimedIndices(t *testing.T, fetcher *schemaFetcher, objects int) []int {
 	t.Helper()
 	var mu sync.Mutex
@@ -86,18 +69,18 @@ func claimedIndices(t *testing.T, fetcher *schemaFetcher, objects int) []int {
 
 func TestCanonicalizeOverSessions_ClaimsEachObjectOnce(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		fetcher *schemaFetcher
-		objects int
+		name     string
+		sessions int
+		objects  int
 	}{
-		{name: "no objects", fetcher: &schemaFetcher{db: poolStatsDB{maxOpen: 4}}, objects: 0},
-		{name: "one object", fetcher: &schemaFetcher{db: poolStatsDB{maxOpen: 4}}, objects: 1},
-		{name: "more objects than sessions", fetcher: &schemaFetcher{db: poolStatsDB{maxOpen: 4}}, objects: 100},
-		{name: "pool cap of one", fetcher: &schemaFetcher{db: poolStatsDB{maxOpen: 1}}, objects: 20},
-		{name: "single connection", fetcher: &schemaFetcher{db: singleConnectionDB{}}, objects: 20},
+		{name: "no objects", sessions: 5, objects: 0},
+		{name: "one object", sessions: 5, objects: 1},
+		{name: "more objects than sessions", sessions: 5, objects: 100},
+		{name: "pool cap of one", sessions: 1, objects: 20},
+		{name: "single connection", sessions: 0, objects: 20},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			seen := claimedIndices(t, tc.fetcher, tc.objects)
+			seen := claimedIndices(t, &schemaFetcher{canonicalizerSessions: tc.sessions}, tc.objects)
 			require.Len(t, seen, tc.objects)
 			for i, index := range seen {
 				assert.Equal(t, i, index)
@@ -106,9 +89,64 @@ func TestCanonicalizeOverSessions_ClaimsEachObjectOnce(t *testing.T) {
 	}
 }
 
+// TestCanonicalizeOverSessions_Concurrency observes how many sessions the
+// scheduler starts at once: each work run signals its entry and blocks until
+// the test has seen the expected number and checked that no further session
+// starts.
+func TestCanonicalizeOverSessions_Concurrency(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sessions int
+		objects  int
+		want     int
+	}{
+		{name: "pool cap at least five", sessions: 5, objects: 100, want: 5},
+		{name: "pool cap three", sessions: 3, objects: 100, want: 3},
+		{name: "pool cap one", sessions: 1, objects: 100, want: 1},
+		{name: "single connection", sessions: 0, objects: 100, want: 1},
+		{name: "fewer objects than sessions", sessions: 5, objects: 3, want: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &schemaFetcher{canonicalizerSessions: tc.sessions}
+			entered := make(chan struct{}, tc.want+1)
+			release := make(chan struct{})
+			done := make(chan error, 1)
+
+			go func() {
+				done <- fetcher.canonicalizeOverSessions(context.Background(), tc.objects, func(_ context.Context, _ func() (int, bool)) error {
+					entered <- struct{}{}
+					<-release
+					return nil
+				})
+			}()
+
+			for i := 0; i < tc.want; i++ {
+				select {
+				case <-entered:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("only %d of %d expected sessions started", i, tc.want)
+				}
+			}
+			select {
+			case <-entered:
+				t.Fatalf("more than %d sessions started", tc.want)
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			close(release)
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("canonicalization did not finish")
+			}
+		})
+	}
+}
+
 func TestCanonicalizeOverSessions_ErrorSurfaces(t *testing.T) {
 	expectedErr := errors.New("some error")
-	fetcher := &schemaFetcher{db: poolStatsDB{maxOpen: 4}}
+	fetcher := &schemaFetcher{canonicalizerSessions: 5}
 
 	err := fetcher.canonicalizeOverSessions(context.Background(), 100, func(_ context.Context, claim func() (int, bool)) error {
 		if _, ok := claim(); !ok {
