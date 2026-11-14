@@ -231,6 +231,30 @@ func (suite *onInstanceTempDbFactorySuite) TestDropTempDB_CannotDropNonTempDb() 
 	suite.ErrorContains(factory.(*onInstanceFactory).dropTempDatabase(context.Background(), "some_db"), "drop non-temporary database")
 }
 
+func (suite *onInstanceTempDbFactorySuite) TestClose_DropsDatabaseWithCanceledContext() {
+	factory := suite.mustBuildFactory()
+	defer func(factory Factory) {
+		suite.Require().NoError(factory.Close())
+	}(factory)
+
+	tempDb, err := factory.Create(context.Background())
+	suite.Require().NoError(err)
+
+	var dbName string
+	suite.Require().NoError(tempDb.ConnPool.QueryRow("SELECT current_database()").Scan(&dbName))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	suite.Require().NoError(tempDb.Close(ctx))
+
+	// The pool has no connections until it is used, so the query opens one and finds the database
+	// gone if the drop ran despite the canceled context.
+	pool, err := suite.getConnPoolForDb(dbName)
+	suite.Require().NoError(err)
+	defer pool.Close()
+	suite.ErrorContains(pool.QueryRowContext(context.Background(), "SELECT 1").Scan(new(int)), "SQLSTATE 3D000")
+}
+
 func TestOnInstanceFactorySuite(t *testing.T) {
 	suite.Run(t, new(onInstanceTempDbFactorySuite))
 }

@@ -268,6 +268,10 @@ func assertConnPoolIsOnExpectedDatabase(ctx context.Context, connPool *sql.DB, e
 }
 
 func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string) (retErr error) {
+	// A temporary database exists because its creation succeeded, and it must not outlive its use
+	// for any reason, including a caller whose context was canceled. The drop is bounded by the
+	// statement timeout set below, not by the caller's cancellation.
+	ctx = context.WithoutCancel(ctx)
 	if !strings.HasPrefix(dbName, o.options.dbPrefix) {
 		return fmt.Errorf("drop non-temporary database: %s", dbName)
 	}
