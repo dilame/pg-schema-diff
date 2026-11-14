@@ -2,6 +2,8 @@ package graph
 
 import (
 	"fmt"
+	"math/rand"
+	"sort"
 	"strconv"
 	"testing"
 
@@ -397,6 +399,139 @@ func TestTopologicallySortWithPriority(t *testing.T) {
 	assert.NoError(t, g.AddEdge("10", "07"))
 	_, err := g.TopologicallySort()
 	assert.Error(t, err)
+}
+
+// greedySortReference is the order the sort has to produce, written the direct way: of the
+// vertices no remaining edge points at, emit the highest priority one, the smaller id when
+// neither is lower than the other, and repeat.
+func greedySortReference[V Vertex](g *Graph[V], isLowerPriority func(V, V) bool) ([]V, error) {
+	incomingEdgeCountByVertex := make(map[string]int, len(g.verticesById))
+	for _, adjacentEdges := range g.edges {
+		for target, isAdjacent := range adjacentEdges {
+			if isAdjacent {
+				incomingEdgeCountByVertex[target]++
+			}
+		}
+	}
+
+	remaining := make(map[string]V, len(g.verticesById))
+	for id, v := range g.verticesById {
+		remaining[id] = v
+	}
+
+	var output []V
+	for len(remaining) > 0 {
+		var sourceIds []string
+		for id := range remaining {
+			if incomingEdgeCountByVertex[id] == 0 {
+				sourceIds = append(sourceIds, id)
+			}
+		}
+		sort.Strings(sourceIds)
+		if len(sourceIds) == 0 {
+			return nil, &CycleError{}
+		}
+		chosen := sourceIds[0]
+		for _, id := range sourceIds[1:] {
+			if isLowerPriority(remaining[chosen], remaining[id]) {
+				chosen = id
+			}
+		}
+		output = append(output, remaining[chosen])
+		for target, hasEdge := range g.edges[chosen] {
+			if hasEdge {
+				incomingEdgeCountByVertex[target]--
+			}
+		}
+		delete(remaining, chosen)
+	}
+	return output, nil
+}
+
+func TestTopologicallySortWithPriorityMatchesTheGreedyRule(t *testing.T) {
+	// Random acyclic graphs with a small priority range, so ties are common: the emitted order
+	// must be exactly the greedy rule's, which decides every plan's statement order.
+	rng := rand.New(rand.NewSource(1))
+	for iteration := 0; iteration < 25; iteration++ {
+		g := NewGraph[vertex]()
+		var ids []string
+		count := 2 + rng.Intn(40)
+		for i := 0; i < count; i++ {
+			id := fmt.Sprintf("v%03d", i)
+			ids = append(ids, id)
+			g.AddVertex(NewV(id))
+		}
+
+		priority := make(map[string]int, len(ids))
+		for _, id := range ids {
+			priority[id] = rng.Intn(4)
+		}
+		for source := 0; source < len(ids); source++ {
+			for target := source + 1; target < len(ids); target++ {
+				if rng.Intn(6) == 0 {
+					require.NoError(t, g.AddEdge(ids[source], ids[target]))
+				}
+			}
+		}
+
+		isLowerPriority := func(left, right vertex) bool {
+			return priority[left.id] < priority[right.id]
+		}
+		got, err := g.TopologicallySortWithPriority(isLowerPriority)
+		require.NoError(t, err)
+		want, err := greedySortReference(g, isLowerPriority)
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
+}
+
+type countingVertex struct {
+	id    string
+	calls *int
+}
+
+func (v countingVertex) GetId() string {
+	*v.calls++
+	return v.id
+}
+
+func TestTopologicallySortWithPriorityDoesNotFormatIdsWhileChoosing(t *testing.T) {
+	// GetId formats the id of a schema vertex. The sort keys the graph by the ids it already
+	// holds, so choosing the order must not call it: a call per comparison, for every available
+	// source at every step, puts string formatting on the path of the whole schema's graph.
+	calls := 0
+	g := NewGraph[countingVertex]()
+	const vertexCount = 500
+	for i := 0; i < vertexCount; i++ {
+		g.AddVertex(countingVertex{id: fmt.Sprintf("v%04d", i), calls: &calls})
+	}
+
+	calls = 0
+	ordered, err := g.TopologicallySortWithPriority(IsLowerPriorityFromGetPriority(func(countingVertex) int {
+		return 0
+	}))
+	require.NoError(t, err)
+	require.Len(t, ordered, vertexCount)
+	assert.Zero(t, calls)
+}
+
+func TestTopologicallySortWithPriorityCycleDiagnosticListsOnlyTheRemainingVertices(t *testing.T) {
+	// The diagnostic's count map describes what remains. An emitted vertex leaves no entry: a
+	// stale zero makes the counts disagree with the graph printed in the same message.
+	g := NewGraph[vertex]()
+	for _, id := range []string{"a", "b", "c", "d"} {
+		g.AddVertex(NewV(id))
+	}
+	require.NoError(t, g.AddEdge("a", "b"))
+	require.NoError(t, g.AddEdge("b", "c"))
+	require.NoError(t, g.AddEdge("c", "d"))
+	require.NoError(t, g.AddEdge("d", "c"))
+
+	_, err := g.TopologicallySortWithPriority(func(vertex, vertex) bool { return false })
+	var cycleErr *CycleError
+	require.ErrorAs(t, err, &cycleErr)
+	assert.Equal(t, []string{"c", "d"}, cycleErr.OnCycle)
+	assert.Contains(t, cycleErr.Error(), ", map[c:1 d:1]\n")
 }
 
 func getEdgeCount[V Vertex](g *Graph[V], v Vertex) int {
