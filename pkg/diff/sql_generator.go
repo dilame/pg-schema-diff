@@ -105,14 +105,17 @@ type (
 
 	enumDiff struct {
 		oldAndNew[schema.Enum]
+		privilegesDiff listDiff[schema.Privilege, privilegeDiff]
 	}
 
 	compositeTypeDiff struct {
 		oldAndNew[schema.CompositeType]
+		privilegesDiff listDiff[schema.Privilege, privilegeDiff]
 	}
 
 	domainDiff struct {
 		oldAndNew[schema.Domain]
+		privilegesDiff listDiff[schema.Privilege, privilegeDiff]
 	}
 
 	extensionDiff struct {
@@ -293,11 +296,16 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	}
 
 	enumDiffs, err := diffLists(old.Enums, new.Enums, func(old, new schema.Enum, _, _ int) (enumDiff, bool, error) {
+		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
+		if err != nil {
+			return enumDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+		}
 		return enumDiff{
-			oldAndNew[schema.Enum]{
+			oldAndNew: oldAndNew[schema.Enum]{
 				old: old,
 				new: new,
 			},
+			privilegesDiff: privilegesDiff,
 		}, false, nil
 	})
 	if err != nil {
@@ -313,8 +321,13 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		return schemaDiff{}, false, err
 	}
 	domainDiffs, err := diffLists(old.Domains, new.Domains, func(old, new schema.Domain, _, _ int) (domainDiff, bool, error) {
+		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
+		if err != nil {
+			return domainDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+		}
 		return domainDiff{
-			oldAndNew[schema.Domain]{old: old, new: new},
+			oldAndNew:      oldAndNew[schema.Domain]{old: old, new: new},
+			privilegesDiff: privilegesDiff,
 		}, domainsBeingRecreated[new.GetName()], nil
 	})
 	if err != nil {
@@ -331,8 +344,13 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 		return schemaDiff{}, false, err
 	}
 	compositeTypeDiffs, err := diffLists(old.CompositeTypes, new.CompositeTypes, func(old, new schema.CompositeType, _, _ int) (compositeTypeDiff, bool, error) {
+		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
+		if err != nil {
+			return compositeTypeDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+		}
 		return compositeTypeDiff{
-			oldAndNew[schema.CompositeType]{old: old, new: new},
+			oldAndNew:      oldAndNew[schema.CompositeType]{old: old, new: new},
+			privilegesDiff: privilegesDiff,
 		}, compositeTypesBeingRecreated[new.GetName()], nil
 	})
 	if err != nil {

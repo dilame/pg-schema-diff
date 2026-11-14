@@ -331,7 +331,9 @@ type Enum struct {
 	// Owner is the role that owns the enum type.
 	Owner  string
 	Labels []string
-	// Privileges are the explicit privileges granted on the type (pg_type.typacl).
+	// Privileges are the type's ACL rows (pg_type.typacl), including PUBLIC's class-default
+	// USAGE. Keeping the default row distinguishes "PUBLIC keeps USAGE" from "PUBLIC's USAGE
+	// was revoked", which are different schemas.
 	Privileges []Privilege
 	// Description is the comment attached to the enum type (pg_description). Empty means no comment.
 	Description string
@@ -356,7 +358,9 @@ func (a CompositeTypeAttribute) GetName() string {
 type CompositeType struct {
 	SchemaQualifiedName
 	Attributes []CompositeTypeAttribute
-	// Privileges are the explicit privileges granted on the type (pg_type.typacl).
+	// Privileges are the type's ACL rows (pg_type.typacl), including PUBLIC's class-default
+	// USAGE. Keeping the default row distinguishes "PUBLIC keeps USAGE" from "PUBLIC's USAGE
+	// was revoked", which are different schemas.
 	Privileges []Privilege
 	// DependsOnCompositeTypes is the list of user-defined composite types referenced
 	// by this composite type's attributes, including references through array types.
@@ -408,7 +412,9 @@ type Domain struct {
 	DependsOnDomains []SchemaQualifiedName
 	// Description is the comment attached to the domain (pg_description). Empty means no comment.
 	Description string
-	// Privileges are the explicit privileges granted on the domain (pg_type.typacl).
+	// Privileges are the type's ACL rows (pg_type.typacl), including PUBLIC's class-default
+	// USAGE. Keeping the default row distinguishes "PUBLIC keeps USAGE" from "PUBLIC's USAGE
+	// was revoked", which are different schemas.
 	Privileges []Privilege
 }
 
@@ -1134,22 +1140,33 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("starting extensions future: %w", err)
 	}
 
+	typePrivilegesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() (map[string][]Privilege, error) {
+		return s.fetchTypePrivileges(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting type privileges future: %w", err)
+	}
+	typePrivileges, err := typePrivilegesFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting type privileges: %w", err)
+	}
+
 	enumsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Enum, error) {
-		return s.fetchEnums(ctx)
+		return s.fetchEnums(ctx, typePrivileges)
 	})
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting enums future: %w", err)
 	}
 
 	compositeTypesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]CompositeType, error) {
-		return s.fetchCompositeTypes(ctx)
+		return s.fetchCompositeTypes(ctx, typePrivileges)
 	})
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting composite types future: %w", err)
 	}
 
 	domainsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Domain, error) {
-		return s.fetchDomains(ctx)
+		return s.fetchDomains(ctx, typePrivileges)
 	})
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting domains future: %w", err)
@@ -1448,11 +1465,6 @@ func (s *schemaFetcher) fetchTypePrivileges(ctx context.Context) (map[string][]P
 				isGrantable = b
 			}
 		}
-		// PUBLIC holds USAGE on every type by default, so that row is the
-		// default state, not a grant the plan has to make.
-		if rawPrivilege.Grantee == "" && rawPrivilege.Privilege == "USAGE" && !isGrantable {
-			continue
-		}
 		privilegesByName[name.GetFQEscapedName()] = append(privilegesByName[name.GetFQEscapedName()], Privilege{
 			Grantee:     rawPrivilege.Grantee,
 			Privilege:   rawPrivilege.Privilege,
@@ -1462,15 +1474,10 @@ func (s *schemaFetcher) fetchTypePrivileges(ctx context.Context) (map[string][]P
 	return privilegesByName, nil
 }
 
-func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
+func (s *schemaFetcher) fetchEnums(ctx context.Context, privilegesByName map[string][]Privilege) ([]Enum, error) {
 	rawEnums, err := s.q.GetEnums(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetEnums: %w", err)
-	}
-
-	privilegesByName, err := s.fetchTypePrivileges(ctx)
-	if err != nil {
-		return nil, err
 	}
 
 	var enums []Enum
@@ -1499,15 +1506,10 @@ func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
 	return enums, nil
 }
 
-func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeType, error) {
+func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context, privilegesByName map[string][]Privilege) ([]CompositeType, error) {
 	rawAttrs, err := s.q.GetCompositeTypes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetCompositeTypes: %w", err)
-	}
-
-	privilegesByName, err := s.fetchTypePrivileges(ctx)
-	if err != nil {
-		return nil, err
 	}
 
 	type ctWithOid struct {
@@ -1589,15 +1591,10 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context) ([]CompositeTyp
 	return compositeTypes, nil
 }
 
-func (s *schemaFetcher) fetchDomains(ctx context.Context) ([]Domain, error) {
+func (s *schemaFetcher) fetchDomains(ctx context.Context, privilegesByName map[string][]Privilege) ([]Domain, error) {
 	rawDomains, err := s.q.GetDomains(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetDomains: %w", err)
-	}
-
-	privilegesByName, err := s.fetchTypePrivileges(ctx)
-	if err != nil {
-		return nil, err
 	}
 
 	var domains []Domain

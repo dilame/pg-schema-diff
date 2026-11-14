@@ -39,9 +39,10 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 	}}
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("FUNCTION", function.SchemaQualifiedName), function.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Description)...)
-	privilegeStmts, err := exactRoutinePrivilegeStatements(
+	privilegeStmts, err := exactPrivilegeStatements(
 		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
 		function.Privileges,
+		schema.Privilege{Privilege: "EXECUTE"},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generating function privilege statements: %w", err)

@@ -45,8 +45,15 @@ func (d *domainSQLVertexGenerator) Add(domain schema.Domain) (partialSQLGraph, e
 		Timeout:     statementTimeoutDefault,
 		LockTimeout: lockTimeoutDefault,
 	}}, commentDDLForAdd(commentTargetDomain(domain.SchemaQualifiedName), domain.Description)...)
-	statements = append(statements, stripMigrationHazards(typePrivilegeStatements(
-		"DOMAIN", domain.SchemaQualifiedName, nil, domain.Privileges)...)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newTypePrivilegeSQLVertexGenerator(domain.SchemaQualifiedName, "DOMAIN"),
+		domain.Privileges,
+		schema.Privilege{Privilege: "USAGE"},
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating domain privilege statements: %w", err)
+	}
+	statements = append(statements, privilegeStmts...)
 
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
@@ -74,18 +81,16 @@ func (d *domainSQLVertexGenerator) Delete(domain schema.Domain) (partialSQLGraph
 	deps := d.dependsOnDepsForDelete(domain)
 	deps = append(deps, d.consumerDepsForDelete(domain)...)
 
-	statements := []Statement{{
-		DDL:         fmt.Sprintf("DROP DOMAIN %s", domain.GetFQEscapedName()),
-		Timeout:     statementTimeoutDefault,
-		LockTimeout: lockTimeoutDefault,
-		Hazards:     hazards,
-	}}
-
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
-			id:         deleteVertexId,
-			priority:   sqlPriorityDropsLast,
-			statements: statements,
+			id:       deleteVertexId,
+			priority: sqlPriorityDropsLast,
+			statements: []Statement{{
+				DDL:         fmt.Sprintf("DROP DOMAIN %s", domain.GetFQEscapedName()),
+				Timeout:     statementTimeoutDefault,
+				LockTimeout: lockTimeoutDefault,
+				Hazards:     hazards,
+			}},
 		}},
 		dependencies: deps,
 	}, nil
@@ -107,8 +112,11 @@ func (d *domainSQLVertexGenerator) Alter(diff domainDiff) (partialSQLGraph, erro
 		return partialSQLGraph{}, err
 	}
 	statements = append(statements, commentDDLForAlter(commentTargetDomain(diff.new.SchemaQualifiedName), diff.old.Description, diff.new.Description)...)
-	statements = append(statements, typePrivilegeStatements(
-		"DOMAIN", diff.new.SchemaQualifiedName, diff.old.Privileges, diff.new.Privileges)...)
+	privilegeStmts, err := generateTypePrivilegeStatements(diff.new.SchemaQualifiedName, "DOMAIN", diff.privilegesDiff)
+	if err != nil {
+		return partialSQLGraph{}, err
+	}
+	statements = append(statements, privilegeStmts...)
 	if len(statements) == 0 {
 		return partialSQLGraph{}, nil
 	}

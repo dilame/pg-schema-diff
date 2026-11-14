@@ -281,8 +281,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash:           "ee17c8467833dad",
-			expectedHashBeforePG15: "26c4c4a508c71b69",
+			expectedHash:           "79b12dfd63e5727e",
+			expectedHashBeforePG15: "f1e53f385974c595",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -316,10 +316,12 @@ var (
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foobar_enum\""},
 						Labels:              []string{"foobar_1", "foobar_2", "foobar_3"},
+						Privileges:          []Privilege{{Privilege: "USAGE"}},
 					},
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"foobar_enum\""},
 						Labels:              []string{"foobar_1", "foobar_2"},
+						Privileges:          []Privilege{{Privilege: "USAGE"}},
 					},
 				},
 				Domains: []Domain{
@@ -337,6 +339,7 @@ var (
 						DependsOnDomains: []SchemaQualifiedName{
 							{EscapedName: "\"foobar_domain\"", SchemaName: "schema_1"},
 						},
+						Privileges: []Privilege{{Privilege: "USAGE"}},
 					},
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "schema_1", EscapedName: "\"foobar_domain\""},
@@ -348,6 +351,7 @@ var (
 							{Name: "foobar_domain_check", Def: "CHECK ((length(VALUE) > 0))"},
 						},
 						Description: "some domain comment",
+						Privileges:  []Privilege{{Privilege: "USAGE"}},
 					},
 				},
 				Tables: []Table{

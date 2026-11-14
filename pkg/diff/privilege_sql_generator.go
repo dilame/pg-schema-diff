@@ -66,15 +66,63 @@ func newProcedurePrivilegeSQLVertexGenerator(procedureName schema.SchemaQualifie
 	)
 }
 
-func exactRoutinePrivilegeStatements(
+// typePrivilegeObjType is the vertex id prefix of a privilege on a type or domain.
+const typePrivilegeObjType = "type_privilege"
+
+func newTypePrivilegeSQLVertexGenerator(name schema.SchemaQualifiedName, objKind string) sqlVertexGenerator[schema.Privilege, privilegeDiff] {
+	return newPrivilegeSQLVertexGeneratorForObject(
+		typePrivilegeObjType,
+		name,
+		fmt.Sprintf("%s %s", objKind, name.GetFQEscapedName()),
+	)
+}
+
+// generateTypePrivilegeStatements resolves the privilege diff of one type or domain. Revokes run
+// before grants, so a privilege moving between PUBLIC and a role never leaves the intermediate
+// state in which neither holds it.
+func generateTypePrivilegeStatements(
+	name schema.SchemaQualifiedName,
+	objKind string,
+	diffs listDiff[schema.Privilege, privilegeDiff],
+) ([]Statement, error) {
+	generator := newTypePrivilegeSQLVertexGenerator(name, objKind)
+	partialGraph, err := generatePartialGraph(generator, diffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving type privilege sql: %w", err)
+	}
+	// A recreation (a grant-option change) is already ordered delete-before-add by the
+	// generator; the remaining pairs are distinct privileges.
+	for _, deleted := range diffs.deletes {
+		for _, added := range diffs.adds {
+			if deleted.GetName() == added.GetName() {
+				continue
+			}
+			partialGraph.dependencies = append(partialGraph.dependencies,
+				mustRun(privilegeSQLVertexId(typePrivilegeObjType, name, deleted, diffTypeDelete)).
+					before(privilegeSQLVertexId(typePrivilegeObjType, name, added, diffTypeAddAlter)))
+		}
+	}
+	statements, err := graphStatements(partialGraph)
+	if err != nil {
+		return nil, fmt.Errorf("ordering type privilege sql: %w", err)
+	}
+	return statements, nil
+}
+
+// exactPrivilegeStatements emits the privileges of a newly created object, whose ACL
+// PostgreSQL initializes to the class default (PUBLIC EXECUTE on routines, PUBLIC USAGE on
+// types). The class-default row is part of the model but is not granted explicitly; when the
+// target does not hold it, it is revoked after the object is created.
+func exactPrivilegeStatements(
 	generator sqlVertexGenerator[schema.Privilege, privilegeDiff],
 	privileges []schema.Privilege,
+	classDefault schema.Privilege,
 ) ([]Statement, error) {
 	var stmts []Statement
-	hasDefaultPublicExecute := false
+	hasClassDefault := false
 	for _, p := range privileges {
-		if p.Grantee == "" && p.Privilege == "EXECUTE" && !p.IsGrantable {
-			hasDefaultPublicExecute = true
+		if p.Grantee == "" && p.Privilege == classDefault.Privilege && !p.IsGrantable {
+			hasClassDefault = true
 			continue
 		}
 		addPartialGraph, err := generator.Add(p)
@@ -83,10 +131,10 @@ func exactRoutinePrivilegeStatements(
 		}
 		stmts = append(stmts, stripMigrationHazards(addPartialGraph.statements()...)...)
 	}
-	if !hasDefaultPublicExecute {
-		deletePartialGraph, err := generator.Delete(schema.Privilege{Privilege: "EXECUTE"})
+	if !hasClassDefault {
+		deletePartialGraph, err := generator.Delete(classDefault)
 		if err != nil {
-			return nil, fmt.Errorf("generating revoke statement for default PUBLIC EXECUTE: %w", err)
+			return nil, fmt.Errorf("generating revoke statement for default PUBLIC %s: %w", classDefault.Privilege, err)
 		}
 		stmts = append(stripMigrationHazards(deletePartialGraph.statements()...), stmts...)
 	}
@@ -156,66 +204,4 @@ func (psg *privilegeSQLVertexGenerator) GetAddAlterDependencies(newPriv, _ schem
 
 func (psg *privilegeSQLVertexGenerator) GetDeleteDependencies(_ schema.Privilege) ([]dependency, error) {
 	return nil, nil
-}
-
-// typePrivilegeStatements generates the GRANT/REVOKE statements that move the
-// privileges of one type (or domain) from oldPrivileges to newPrivileges.
-// objKind is TYPE or DOMAIN, the keyword PostgreSQL expects after ON.
-func typePrivilegeStatements(
-	objKind string,
-	name schema.SchemaQualifiedName,
-	oldPrivileges []schema.Privilege,
-	newPrivileges []schema.Privilege,
-) []Statement {
-	target := fmt.Sprintf("%s %s", objKind, name.GetFQEscapedName())
-
-	oldByName := make(map[string]schema.Privilege, len(oldPrivileges))
-	for _, p := range oldPrivileges {
-		oldByName[p.GetName()] = p
-	}
-	newByName := make(map[string]schema.Privilege, len(newPrivileges))
-	for _, p := range newPrivileges {
-		newByName[p.GetName()] = p
-	}
-
-	var stmts []Statement
-	for _, oldPrivilege := range oldPrivileges {
-		newPrivilege, stillGranted := newByName[oldPrivilege.GetName()]
-		switch {
-		case !stillGranted:
-			stmts = append(stmts, Statement{
-				DDL: fmt.Sprintf("REVOKE %s ON %s FROM %s",
-					oldPrivilege.Privilege, target, privilegeGranteeSQL(oldPrivilege.Grantee)),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-				Hazards:     []MigrationHazard{migrationHazardPrivilegeRevoked},
-			})
-		case oldPrivilege.IsGrantable && !newPrivilege.IsGrantable:
-			stmts = append(stmts, Statement{
-				DDL: fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON %s FROM %s",
-					oldPrivilege.Privilege, target, privilegeGranteeSQL(oldPrivilege.Grantee)),
-				Timeout:     statementTimeoutDefault,
-				LockTimeout: lockTimeoutDefault,
-				Hazards:     []MigrationHazard{migrationHazardPrivilegeRevoked},
-			})
-		}
-	}
-	for _, newPrivilege := range newPrivileges {
-		oldPrivilege, alreadyGranted := oldByName[newPrivilege.GetName()]
-		if alreadyGranted && (oldPrivilege.IsGrantable || !newPrivilege.IsGrantable) {
-			continue
-		}
-		ddl := fmt.Sprintf("GRANT %s ON %s TO %s",
-			newPrivilege.Privilege, target, privilegeGranteeSQL(newPrivilege.Grantee))
-		if newPrivilege.IsGrantable {
-			ddl += " WITH GRANT OPTION"
-		}
-		stmts = append(stmts, Statement{
-			DDL:         ddl,
-			Timeout:     statementTimeoutDefault,
-			LockTimeout: lockTimeoutDefault,
-			Hazards:     []MigrationHazard{migrationHazardPrivilegeGranted},
-		})
-	}
-	return stmts
 }

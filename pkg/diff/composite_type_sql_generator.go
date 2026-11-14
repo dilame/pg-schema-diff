@@ -49,7 +49,15 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 		LockTimeout: lockTimeoutDefault,
 	}}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Description)...)
-	stmts = append(stmts, stripMigrationHazards(typePrivilegeStatements("TYPE", ct.SchemaQualifiedName, nil, ct.Privileges)...)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newTypePrivilegeSQLVertexGenerator(ct.SchemaQualifiedName, "TYPE"),
+		ct.Privileges,
+		schema.Privilege{Privilege: "USAGE"},
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating composite type privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 
 	// The type must exist before any consumer (table/function/procedure/trigger)
 	// is added or altered. We add blanket "after-this" dependencies on the type
@@ -80,17 +88,15 @@ func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (parti
 	deps := c.consumerDepsForDelete(ct)
 	deps = append(deps, c.compositeTypeDepsForDelete(ct)...)
 
-	statements := []Statement{{
-		DDL:         fmt.Sprintf("DROP TYPE %s", ct.GetFQEscapedName()),
-		Timeout:     statementTimeoutDefault,
-		LockTimeout: lockTimeoutDefault,
-	}}
-
 	return partialSQLGraph{
 		vertices: []sqlVertex{{
-			id:         deleteVertexId,
-			priority:   sqlPriorityDropsLast,
-			statements: statements,
+			id:       deleteVertexId,
+			priority: sqlPriorityDropsLast,
+			statements: []Statement{{
+				DDL:         fmt.Sprintf("DROP TYPE %s", ct.GetFQEscapedName()),
+				Timeout:     statementTimeoutDefault,
+				LockTimeout: lockTimeoutDefault,
+			}},
 		}},
 		dependencies: deps,
 	}, nil
@@ -104,8 +110,11 @@ func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQL
 	oldCopy.Privileges = d.new.Privileges
 	if cmp.Equal(oldCopy, d.new) {
 		stmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
-		stmts = append(stmts, typePrivilegeStatements(
-			"TYPE", d.new.SchemaQualifiedName, d.old.Privileges, d.new.Privileges)...)
+		privilegeStmts, err := generateTypePrivilegeStatements(d.new.SchemaQualifiedName, "TYPE", d.privilegesDiff)
+		if err != nil {
+			return partialSQLGraph{}, err
+		}
+		stmts = append(stmts, privilegeStmts...)
 		if len(stmts) == 0 {
 			return partialSQLGraph{}, nil
 		}

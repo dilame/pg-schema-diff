@@ -145,7 +145,10 @@ var typePrivilegeAcceptanceTestCases = []acceptanceTestCase{
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
-		expectedPlanDDL: []string{`GRANT USAGE ON DOMAIN "public"."foo" TO "app_user" WITH GRANT OPTION`},
+		expectedPlanDDL: []string{
+			`REVOKE USAGE ON DOMAIN "public"."foo" FROM "app_user"`,
+			`GRANT USAGE ON DOMAIN "public"."foo" TO "app_user" WITH GRANT OPTION`,
+		},
 	},
 	{
 		name:  "Remove GRANT OPTION from a domain privilege",
@@ -165,7 +168,10 @@ var typePrivilegeAcceptanceTestCases = []acceptanceTestCase{
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
-		expectedPlanDDL: []string{`REVOKE GRANT OPTION FOR USAGE ON DOMAIN "public"."foo" FROM "app_user"`},
+		expectedPlanDDL: []string{
+			`REVOKE USAGE ON DOMAIN "public"."foo" FROM "app_user"`,
+			`GRANT USAGE ON DOMAIN "public"."foo" TO "app_user"`,
+		},
 	},
 	{
 		name:  "Recreating a domain keeps its privileges",
