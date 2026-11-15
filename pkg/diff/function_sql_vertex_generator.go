@@ -21,6 +21,26 @@ func newFunctionSqlVertexGenerator(functionsInNewSchemaByName map[string]schema.
 }
 
 func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement, error) {
+	stmts, err := f.addDefinition(function)
+	if err != nil {
+		return nil, err
+	}
+	privilegeStmts, err := exactPrivilegeStatements(
+		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
+		function.Privileges,
+		schema.Privilege{Privilege: "EXECUTE"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generating function privilege statements: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
+	return stmts, nil
+}
+
+// addDefinition emits the statements that create or replace the function and set its owner and
+// comment, leaving its privileges to the caller: a new function starts from the class default ACL,
+// while a replaced one keeps the ACL it already had, so the two resolve their privileges differently.
+func (f *functionSQLVertexGenerator) addDefinition(function schema.Function) ([]Statement, error) {
 	var hazards []MigrationHazard
 	if !canFunctionDependenciesBeTracked(function) {
 		hazards = append(hazards, MigrationHazard{
@@ -39,15 +59,6 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 	}}
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("FUNCTION", function.SchemaQualifiedName), function.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetFunction(function.SchemaQualifiedName), function.Description)...)
-	privilegeStmts, err := exactPrivilegeStatements(
-		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
-		function.Privileges,
-		schema.Privilege{Privilege: "EXECUTE"},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("generating function privilege statements: %w", err)
-	}
-	stmts = append(stmts, privilegeStmts...)
 	return stmts, nil
 }
 
@@ -92,29 +103,29 @@ func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, erro
 
 	var stmts []Statement
 	if replaced {
-		// Add() emits CREATE OR REPLACE plus the COMMENT and privilege statements for the new
-		// schema, so the owner is masked out of it and set by an explicit statement below.
+		// The owner is masked out of the definition and set by an explicit statement below;
+		// privileges are resolved as a diff of the old and new ACL like any other alter, since
+		// CREATE OR REPLACE keeps the ACL the function already had.
 		newForAlter := diff.new
 		newForAlter.Owner = ""
-		addStmts, err := f.Add(newForAlter)
+		addStmts, err := f.addDefinition(newForAlter)
 		if err != nil {
 			return nil, err
 		}
 		stmts = append(stmts, addStmts...)
-	} else {
-		privilegesPartialGraph, err := generatePartialGraph(
-			newFunctionPrivilegeSQLVertexGenerator(diff.new.SchemaQualifiedName),
-			diff.privilegesDiff,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("resolving function privilege sql: %w", err)
-		}
-		privilegeStmts, err := graphStatements(privilegesPartialGraph)
-		if err != nil {
-			return nil, fmt.Errorf("ordering function privilege sql: %w", err)
-		}
-		stmts = append(stmts, privilegeStmts...)
 	}
+	privilegesPartialGraph, err := generatePartialGraph(
+		newFunctionPrivilegeSQLVertexGenerator(diff.new.SchemaQualifiedName),
+		diff.privilegesDiff,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolving function privilege sql: %w", err)
+	}
+	privilegeStmts, err := graphStatements(privilegesPartialGraph)
+	if err != nil {
+		return nil, fmt.Errorf("ordering function privilege sql: %w", err)
+	}
+	stmts = append(stmts, privilegeStmts...)
 
 	stmts = append(stmts, ownerDDLForAlter(ownershipTarget("FUNCTION", diff.new.SchemaQualifiedName), diff.old.Owner, diff.new.Owner)...)
 	if replaced {
