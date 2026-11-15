@@ -1499,8 +1499,8 @@ func (t *tableSQLVertexGenerator) alterBaseTable(diff tableDiff) ([]Statement, e
 	return stmts, nil
 }
 
-// buildTableOptionsClause renders storage parameters as the inside of a CREATE TABLE ... WITH (...)
-// or ALTER TABLE ... SET (...) clause. Keys are sorted so the generated DDL is deterministic.
+// buildTableOptionsClause renders a relation's storage parameters as the inside of a WITH (...)
+// or SET (...) clause. Keys are sorted so the generated DDL is deterministic.
 func buildTableOptionsClause(options map[string]string) string {
 	kvs := make([]string, 0, len(options))
 	for k, v := range options {

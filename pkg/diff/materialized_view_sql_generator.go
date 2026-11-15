@@ -110,14 +110,7 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 	materializedViewSb := strings.Builder{}
 	materializedViewSb.WriteString(fmt.Sprintf("CREATE MATERIALIZED VIEW %s", mv.GetFQEscapedName()))
 	if len(mv.Options) > 0 {
-		var kvs []string
-		for k, v := range mv.Options {
-			kvs = append(kvs, fmt.Sprintf("%s=%s", k, v))
-		}
-		// Sort kvs so the generated DDL is deterministic. This is unnecessarily verbose because the slices
-		// package is not yet available.
-		slices.Sort(kvs)
-		materializedViewSb.WriteString(fmt.Sprintf(" WITH (%s)", strings.Join(kvs, ", ")))
+		materializedViewSb.WriteString(fmt.Sprintf(" WITH (%s)", buildTableOptionsClause(mv.Options)))
 	}
 	if len(mv.Tablespace) > 0 {
 		materializedViewSb.WriteString(fmt.Sprintf(" TABLESPACE %s", schema.EscapeIdentifier(mv.Tablespace)))

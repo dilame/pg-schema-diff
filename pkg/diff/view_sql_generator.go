@@ -356,13 +356,7 @@ func buildViewDefinitionDDL(v schema.View, orReplace bool) string {
 	}
 	sb.WriteString(v.GetFQEscapedName())
 	if len(v.Options) > 0 {
-		var kvs []string
-		for k, val := range v.Options {
-			kvs = append(kvs, fmt.Sprintf("%s=%s", k, val))
-		}
-		// Sort kvs so the generated DDL is deterministic.
-		slices.Sort(kvs)
-		sb.WriteString(fmt.Sprintf(" WITH (%s)", strings.Join(kvs, ", ")))
+		sb.WriteString(fmt.Sprintf(" WITH (%s)", buildTableOptionsClause(v.Options)))
 	}
 	sb.WriteString(" AS\n")
 	sb.WriteString(v.ViewDefinition)
