@@ -145,6 +145,80 @@ var tableAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name:         "Create table with storage parameters",
+		oldSchemaDDL: nil,
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (fillfactor = 70, autovacuum_vacuum_scale_factor = 0.05);
+			`,
+		},
+		expectedPlanDDL: []string{
+			"CREATE TABLE \"public\".\"foobar\" (\n\t\"id\" integer\n) WITH (autovacuum_vacuum_scale_factor=0.05, fillfactor=70)",
+			"ALTER TABLE \"public\".\"foobar\" OWNER TO \"postgres\"",
+		},
+		// pg_class stores the parameters in the order they were declared, and pg_dump prints
+		// that order. The plan sorts the keys, so the re-created table's order differs from the
+		// source DDL's while the parameters themselves are the same.
+		expectedDBSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (autovacuum_vacuum_scale_factor = 0.05, fillfactor = 70);
+			`,
+		},
+	},
+	{
+		name: "Alter table storage parameters",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (fillfactor = 70);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (fillfactor = 80, autovacuum_enabled = false);
+			`,
+		},
+		expectedPlanDDL: []string{
+			`ALTER TABLE "public"."foobar" SET (autovacuum_enabled=false, fillfactor=80)`,
+		},
+		// See "Create table with storage parameters": the plan sets the parameters in sorted
+		// order, which is the order the catalog then stores.
+		expectedDBSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (autovacuum_enabled = false, fillfactor = 80);
+			`,
+		},
+	},
+	{
+		name: "Reset table storage parameter",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (fillfactor = 70, autovacuum_enabled = false);
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT
+            ) WITH (fillfactor = 70);
+			`,
+		},
+		expectedPlanDDL: []string{
+			`ALTER TABLE "public"."foobar" RESET (autovacuum_enabled)`,
+		},
+	},
+	{
 		name:         "Create table with RLS enabled",
 		oldSchemaDDL: nil,
 		newSchemaDDL: []string{

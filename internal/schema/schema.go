@@ -434,6 +434,10 @@ type Table struct {
 	RLSEnabled       bool
 	RLSForced        bool
 
+	// Options represents key value map of table storage parameters, i.e., pg_class.reloptions.
+	// Empty means the table has no storage parameters of its own.
+	Options map[string]string
+
 	// PartitionKeyDef is the output of Pg function pg_get_partkeydef:
 	// PARTITION BY $PartitionKeyDef
 	// If empty, then the table is not partitioned
@@ -1893,9 +1897,20 @@ func (s *schemaFetcher) buildTable(
 		SchemaName:  table.TableSchemaName,
 		EscapedName: EscapeIdentifier(table.TableName),
 	}
+	options, err := relOptionsToMap(table.RelOptions)
+	if err != nil {
+		return Table{}, fmt.Errorf("table (%q): %w", table.TableName, err)
+	}
+	// A table without its own storage parameters keeps the zero value so that the schema model
+	// compares equal to a table literal that declares none.
+	var tableOptions map[string]string
+	if len(options) > 0 {
+		tableOptions = options
+	}
 	return Table{
 		SchemaQualifiedName: schemaQualifiedName,
 		Owner:               table.Owner,
+		Options:             tableOptions,
 		Columns:             columns,
 		DependsOnDomains:    dependsOnDomains,
 		CheckConstraints:    checkConsByTable[schemaQualifiedName.GetFQEscapedName()],

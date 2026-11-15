@@ -2153,6 +2153,7 @@ SELECT
     c.relreplident::TEXT AS replica_identity,
     c.relrowsecurity AS rls_enabled,
     c.relforcerowsecurity AS rls_forced,
+    c.reloptions::TEXT [] AS rel_options,
     COALESCE(parent_c.relname, '')::TEXT AS parent_table_name,
     COALESCE(parent_namespace.nspname, '')::TEXT AS parent_table_schema_name,
     (CASE
@@ -2206,6 +2207,7 @@ type GetTablesRow struct {
 	ReplicaIdentity       string
 	RlsEnabled            bool
 	RlsForced             bool
+	RelOptions            []string
 	ParentTableName       string
 	ParentTableSchemaName string
 	PartitionKeyDef       string
@@ -2231,6 +2233,7 @@ func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
 			&i.ReplicaIdentity,
 			&i.RlsEnabled,
 			&i.RlsForced,
+			pq.Array(&i.RelOptions),
 			&i.ParentTableName,
 			&i.ParentTableSchemaName,
 			&i.PartitionKeyDef,

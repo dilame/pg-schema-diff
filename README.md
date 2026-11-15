@@ -37,6 +37,9 @@ feature areas on top of it:
   definition comparison, plan validation with `check_function_bodies` disabled
 - Schema-qualified object support, table persistence drift, ordering fixes
   (policies in their own vertex, routines after signature relations)
+- Table storage parameters (`pg_class.reloptions`): a new table's `CREATE TABLE`
+  carries its `WITH (...)`, a changed parameter is planned as
+  `ALTER TABLE ... SET/RESET`, and plan validation compares them
 
 The populated state of a materialized view (`pg_class.relispopulated`) is part
 of the schema and of the schema hash used for drift detection: a view that was
