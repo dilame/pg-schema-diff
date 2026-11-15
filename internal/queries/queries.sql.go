@@ -2153,6 +2153,7 @@ SELECT
     c.relreplident::TEXT AS replica_identity,
     c.relrowsecurity AS rls_enabled,
     c.relforcerowsecurity AS rls_forced,
+    c.reloptions::TEXT [] AS rel_options,
     COALESCE(parent_c.relname, '')::TEXT AS parent_table_name,
     COALESCE(parent_namespace.nspname, '')::TEXT AS parent_table_schema_name,
     (CASE
@@ -2167,8 +2168,7 @@ SELECT
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
-    c.relpersistence = 'u' AS is_unlogged,
-    c.reloptions::TEXT [] AS rel_options
+    c.relpersistence = 'u' AS is_unlogged
 FROM pg_catalog.pg_class AS c
 INNER JOIN
     pg_catalog.pg_namespace AS table_namespace
@@ -2207,13 +2207,13 @@ type GetTablesRow struct {
 	ReplicaIdentity       string
 	RlsEnabled            bool
 	RlsForced             bool
+	RelOptions            []string
 	ParentTableName       string
 	ParentTableSchemaName string
 	PartitionKeyDef       string
 	PartitionForValues    string
 	Description           string
 	IsUnlogged            bool
-	RelOptions            []string
 }
 
 func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
@@ -2233,13 +2233,13 @@ func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
 			&i.ReplicaIdentity,
 			&i.RlsEnabled,
 			&i.RlsForced,
+			pq.Array(&i.RelOptions),
 			&i.ParentTableName,
 			&i.ParentTableSchemaName,
 			&i.PartitionKeyDef,
 			&i.PartitionForValues,
 			&i.Description,
 			&i.IsUnlogged,
-			pq.Array(&i.RelOptions),
 		); err != nil {
 			return nil, err
 		}

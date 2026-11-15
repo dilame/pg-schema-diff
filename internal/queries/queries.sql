@@ -112,6 +112,7 @@ SELECT
     c.relreplident::TEXT AS replica_identity,
     c.relrowsecurity AS rls_enabled,
     c.relforcerowsecurity AS rls_forced,
+    c.reloptions::TEXT [] AS rel_options,
     COALESCE(parent_c.relname, '')::TEXT AS parent_table_name,
     COALESCE(parent_namespace.nspname, '')::TEXT AS parent_table_schema_name,
     (CASE
@@ -126,8 +127,7 @@ SELECT
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
-    c.relpersistence = 'u' AS is_unlogged,
-    c.reloptions::TEXT [] AS rel_options
+    c.relpersistence = 'u' AS is_unlogged
 FROM pg_catalog.pg_class AS c
 INNER JOIN
     pg_catalog.pg_namespace AS table_namespace
