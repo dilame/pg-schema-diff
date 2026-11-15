@@ -126,7 +126,8 @@ SELECT
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
-    c.relpersistence = 'u' AS is_unlogged
+    c.relpersistence = 'u' AS is_unlogged,
+    c.reloptions::TEXT [] AS rel_options
 FROM pg_catalog.pg_class AS c
 INNER JOIN
     pg_catalog.pg_namespace AS table_namespace

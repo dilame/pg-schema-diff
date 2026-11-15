@@ -332,6 +332,70 @@ func (suite *planGeneratorTestSuite) TestValidate_RejectsPlanThatLeavesRecreated
 	suite.ErrorContains(err, `REFRESH MATERIALIZED VIEW "public"."foobar_view"`)
 }
 
+func (suite *planGeneratorTestSuite) TestValidate_RejectsPlanThatDropsTableStorageParameters() {
+	ctx := context.Background()
+	ddl := []string{`CREATE TABLE foobar(id INT) WITH (fillfactor = 70)`}
+
+	currentDB, err := suite.pgEngine.CreateDatabase()
+	suite.Require().NoError(err)
+	defer currentDB.DropDB()
+	currentPool, err := sql.Open("pgx", currentDB.GetDSN())
+	suite.Require().NoError(err)
+	defer currentPool.Close()
+
+	targetDB, err := suite.pgEngine.CreateDatabase()
+	suite.Require().NoError(err)
+	defer targetDB.DropDB()
+	targetPool, err := sql.Open("pgx", targetDB.GetDSN())
+	suite.Require().NoError(err)
+	defer targetPool.Close()
+	for _, stmt := range ddl {
+		_, err := targetPool.ExecContext(ctx, stmt)
+		suite.Require().NoError(err)
+	}
+
+	currentSchema, err := schema.GetSchema(ctx, currentPool)
+	suite.Require().NoError(err)
+	targetSchema, err := schema.GetSchema(ctx, targetPool)
+	suite.Require().NoError(err)
+	suite.Require().Len(targetSchema.Tables, 1)
+	suite.Equal(map[string]string{"fillfactor": "70"}, targetSchema.Tables[0].Options,
+		"the target schema must carry the table's storage parameters")
+
+	tempDbFactory := suite.mustBuildTempDbFactory(ctx)
+	defer tempDbFactory.Close()
+
+	plan, err := Generate(ctx, DBSchemaSource(currentPool), DDLSchemaSource(ddl),
+		WithTempDbFactory(tempDbFactory), WithDoNotValidatePlan())
+	suite.Require().NoError(err)
+
+	var createStmt Statement
+	for _, stmt := range plan.Statements {
+		if strings.HasPrefix(stmt.DDL, "CREATE TABLE") {
+			createStmt = stmt
+			break
+		}
+	}
+	suite.Require().NotEmpty(createStmt.DDL, "the plan must create the table")
+	suite.Contains(createStmt.DDL, "WITH (fillfactor=70)",
+		"a new table's CREATE TABLE must carry its storage parameters")
+
+	// The plan the tool generated before the fix: the same table, created without its storage
+	// parameters. Validation must report the difference against the target schema.
+	withoutOptions := Statement{
+		DDL:         `CREATE TABLE "public"."foobar" ("id" integer)`,
+		Timeout:     createStmt.Timeout,
+		LockTimeout: createStmt.LockTimeout,
+	}
+	err = assertValidPlan(ctx, tempDbFactory, currentSchema, targetSchema, Plan{Statements: []Statement{withoutOptions}}, &planOptions{
+		logger:     log.SimpleLogger(),
+		randReader: rand.Reader,
+	})
+	suite.Require().Error(err, "validation must reject a plan that does not carry the table's storage parameters")
+	suite.ErrorContains(err, "validating plan failed")
+	suite.ErrorContains(err, `ALTER TABLE "public"."foobar" SET (fillfactor=70)`)
+}
+
 func (suite *planGeneratorTestSuite) TestGenerate_RefreshNamesUnreadableRelationWhenApplyingRoleCannotReadIt() {
 	ctx := context.Background()
 	adminPool := suite.mustGetTestDBPool()

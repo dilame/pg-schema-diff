@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1229,6 +1230,9 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 	if table.IsPartitioned() {
 		createTableSb.WriteString(fmt.Sprintf(" PARTITION BY %s", table.PartitionKeyDef))
 	}
+	if len(table.Options) > 0 {
+		createTableSb.WriteString(fmt.Sprintf(" WITH (%s)", buildTableOptionsClause(table.Options)))
+	}
 	stmts = append(stmts, Statement{
 		DDL:         createTableSb.String(),
 		Timeout:     statementTimeoutDefault,
@@ -1360,6 +1364,24 @@ func (t *tableSQLVertexGenerator) Alter(diff tableDiff) ([]Statement, error) {
 		stmts = append(stmts, alterBaseTableStmts...)
 	}
 
+	if optionsToSet, optionsToReset := diffTableOptions(diff.old.Options, diff.new.Options); len(optionsToSet) > 0 || len(optionsToReset) > 0 {
+		tableName := diff.new.SchemaQualifiedName
+		if len(optionsToSet) > 0 {
+			stmts = append(stmts, Statement{
+				DDL:         fmt.Sprintf("%s SET (%s)", alterTablePrefix(tableName), buildTableOptionsClause(optionsToSet)),
+				Timeout:     statementTimeoutDefault,
+				LockTimeout: lockTimeoutDefault,
+			})
+		}
+		if len(optionsToReset) > 0 {
+			stmts = append(stmts, Statement{
+				DDL:         fmt.Sprintf("%s RESET (%s)", alterTablePrefix(tableName), strings.Join(optionsToReset, ", ")),
+				Timeout:     statementTimeoutDefault,
+				LockTimeout: lockTimeoutDefault,
+			})
+		}
+	}
+
 	if diff.old.IsUnlogged != diff.new.IsUnlogged {
 		stmts = append(stmts, alterTablePersistenceStatement(diff.new.SchemaQualifiedName, diff.new.IsUnlogged))
 	}
@@ -1475,6 +1497,36 @@ func (t *tableSQLVertexGenerator) alterBaseTable(diff tableDiff) ([]Statement, e
 	stmts = append(stmts, dropTempCCs...)
 
 	return stmts, nil
+}
+
+// buildTableOptionsClause renders storage parameters as the inside of a CREATE TABLE ... WITH (...)
+// or ALTER TABLE ... SET (...) clause. Keys are sorted so the generated DDL is deterministic.
+func buildTableOptionsClause(options map[string]string) string {
+	kvs := make([]string, 0, len(options))
+	for k, v := range options {
+		kvs = append(kvs, fmt.Sprintf("%s=%s", k, v))
+	}
+	slices.Sort(kvs)
+	return strings.Join(kvs, ", ")
+}
+
+// diffTableOptions returns the storage parameters to set (added or changed) and the names of those
+// to reset (removed). Both are deterministic.
+func diffTableOptions(oldOptions, newOptions map[string]string) (map[string]string, []string) {
+	toSet := make(map[string]string)
+	var toReset []string
+	for k, newVal := range newOptions {
+		if oldVal, ok := oldOptions[k]; !ok || oldVal != newVal {
+			toSet[k] = newVal
+		}
+	}
+	for k := range oldOptions {
+		if _, ok := newOptions[k]; !ok {
+			toReset = append(toReset, k)
+		}
+	}
+	slices.Sort(toReset)
+	return toSet, toReset
 }
 
 func alterTablePersistenceStatement(table schema.SchemaQualifiedName, isUnlogged bool) Statement {

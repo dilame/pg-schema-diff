@@ -2167,7 +2167,8 @@ SELECT
     COALESCE(
         pg_catalog.obj_description(c.oid, 'pg_class'), ''
     )::TEXT AS description,
-    c.relpersistence = 'u' AS is_unlogged
+    c.relpersistence = 'u' AS is_unlogged,
+    c.reloptions::TEXT [] AS rel_options
 FROM pg_catalog.pg_class AS c
 INNER JOIN
     pg_catalog.pg_namespace AS table_namespace
@@ -2212,6 +2213,7 @@ type GetTablesRow struct {
 	PartitionForValues    string
 	Description           string
 	IsUnlogged            bool
+	RelOptions            []string
 }
 
 func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
@@ -2237,6 +2239,7 @@ func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
 			&i.PartitionForValues,
 			&i.Description,
 			&i.IsUnlogged,
+			pq.Array(&i.RelOptions),
 		); err != nil {
 			return nil, err
 		}
