@@ -54,6 +54,11 @@ func (o SchemaQualifiedName) IsEmpty() bool {
 
 // Schema is the schema of the database, not just a single Postgres schema.
 type Schema struct {
+	// ApplyingRole is the role the session that read the schema connects as (`current_user`). It
+	// is the role a plan generated against this schema runs as, so a default privilege scoped to
+	// another target role does not apply to the objects the plan creates. It describes the
+	// session, not the schema, so it is left out of the schema hash.
+	ApplyingRole          string `hash:"ignore"`
 	NamedSchemas          []NamedSchema
 	DefaultPrivileges     []DefaultPrivilege
 	Extensions            []Extension
@@ -239,7 +244,7 @@ func sortByKey[S any](vals []S, getValFn func(S) string) []S {
 }
 
 func (s Schema) Hash() (string, error) {
-	// alternatively, we can print the struct as a string and hash it
+	// ApplyingRole is tagged out of the hash: it describes the session, not the schema.
 	hashVal, err := hashstructure.Hash(s.Normalize(), hashstructure.FormatV2, nil)
 	if err != nil {
 		return "", fmt.Errorf("hashing schema: %w", err)
@@ -1151,6 +1156,11 @@ type (
 )
 
 func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
+	applyingRole, err := s.q.GetCurrentUser(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("GetCurrentUser: %w", err)
+	}
+
 	goroutineRunner := s.goroutineRunnerFactory()
 
 	namedSchemasFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]NamedSchema, error) {
@@ -1363,6 +1373,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	}
 
 	return Schema{
+		ApplyingRole:          applyingRole,
 		NamedSchemas:          schemas,
 		DefaultPrivileges:     defaultPrivileges,
 		Extensions:            extensions,

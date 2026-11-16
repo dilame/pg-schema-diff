@@ -829,6 +829,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		tablesInNewSchemaByName: tablesInNewSchemaByName,
 		tableDiffsByName:        buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
 		defaultPrivileges:       diff.new.DefaultPrivileges,
+		applyingRole:            diff.old.ApplyingRole,
 	}), diff.tableDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving table diff: %w", err)
@@ -853,6 +854,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 
 	enumStatements, err := diff.enumDiffs.resolveToSQLGroupedByEffect(&enumSQLGenerator{
 		defaultPrivileges: diff.new.DefaultPrivileges,
+		applyingRole:      diff.old.ApplyingRole,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolving enum diff: %w", err)
@@ -904,6 +906,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		deletedTablesByName: deletedTablesByName,
 		tableDiffsByName:    buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
 		defaultPrivileges:   diff.new.DefaultPrivileges,
+		applyingRole:        diff.old.ApplyingRole,
 	})
 	sequencesPartialGraph, err := generatePartialGraph(sequenceGenerator, diff.sequenceDiffs)
 	if err != nil {
@@ -940,7 +943,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, compositeTypesPartialGraph)
 
-	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName, diff.new.DefaultPrivileges)
+	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName, diff.new.DefaultPrivileges, diff.old.ApplyingRole)
 	functionsPartialGraph, err := generatePartialGraph(functionGenerator, diff.functionDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving function diff: %w", err)
@@ -954,7 +957,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, functionDependentsGraph)
 
-	procedureGenerator := newProcedureSqlVertexGenerator(diff.new)
+	procedureGenerator := newProcedureSqlVertexGenerator(diff.new, diff.old.ApplyingRole)
 	proceduresPartialGraph, err := generatePartialGraph(procedureGenerator, diff.proceduresDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving procedure diff: %w", err)
@@ -968,14 +971,14 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, triggersPartialGraph)
 
-	viewGenerator := newViewSQLVertexGenerator(diff.new.DefaultPrivileges)
+	viewGenerator := newViewSQLVertexGenerator(diff.new.DefaultPrivileges, diff.old.ApplyingRole)
 	viewPartialGraph, err := generatePartialGraph(viewGenerator, diff.viewDiff)
 	if err != nil {
 		return nil, fmt.Errorf("resolving view diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, viewPartialGraph)
 
-	materializedViewGenerator := newMaterializedViewSQLVertexGenerator(diff.new.DefaultPrivileges)
+	materializedViewGenerator := newMaterializedViewSQLVertexGenerator(diff.new.DefaultPrivileges, diff.old.ApplyingRole)
 	materializedViewPartialGraph, err := generatePartialGraph(materializedViewGenerator, diff.materializedViewDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving materialized view diff: %w", err)
@@ -1204,6 +1207,9 @@ type tableSQLVertexGenerator struct {
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created table comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect a table the plan creates.
+	applyingRole string
 }
 
 func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
@@ -1307,7 +1313,7 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(table.SchemaQualifiedName),
 		table.Privileges,
-		createTimePrivileges(t.defaultPrivileges, "TABLES", table.SchemaName),
+		createTimePrivileges(t.defaultPrivileges, t.applyingRole, "TABLES", table.SchemaName),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generating table privilege statements: %w", err)
@@ -3158,6 +3164,9 @@ type sequenceSQLVertexGenerator struct {
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created sequence comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect a sequence the plan creates.
+	applyingRole string
 }
 
 func (s *sequenceSQLVertexGenerator) Add(seq schema.Sequence) ([]Statement, error) {
@@ -3183,7 +3192,7 @@ func (s *sequenceSQLVertexGenerator) createPrivilegeStatements(seq schema.Sequen
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(seq.SchemaQualifiedName),
 		seq.Privileges,
-		createTimePrivileges(s.defaultPrivileges, "SEQUENCES", seq.SchemaName),
+		createTimePrivileges(s.defaultPrivileges, s.applyingRole, "SEQUENCES", seq.SchemaName),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generating sequence privilege statements: %w", err)

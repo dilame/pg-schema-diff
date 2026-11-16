@@ -89,7 +89,7 @@ func buildMaterializedViewDiff(
 		oldAndNew:      oldAndNew[schema.MaterializedView]{old: old, new: new},
 		privilegesDiff: privilegesDiff,
 	}
-	if _, err := newMaterializedViewSQLVertexGenerator(nil).Alter(d); err != nil {
+	if _, err := newMaterializedViewSQLVertexGenerator(nil, "").Alter(d); err != nil {
 		if errors.Is(err, ErrNotImplemented) {
 			// The SQL generator cannot alter the materialized view, so add and delete it.
 			return materializedViewDiff{}, true, nil
@@ -103,12 +103,16 @@ type materializedViewSQLGenerator struct {
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created materialized view comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect a materialized view the plan creates.
+	applyingRole string
 }
 
 func newMaterializedViewSQLVertexGenerator(
 	defaultPrivileges []schema.DefaultPrivilege,
+	applyingRole string,
 ) sqlVertexGenerator[schema.MaterializedView, materializedViewDiff] {
-	return &materializedViewSQLGenerator{defaultPrivileges: defaultPrivileges}
+	return &materializedViewSQLGenerator{defaultPrivileges: defaultPrivileges, applyingRole: applyingRole}
 }
 
 func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (partialSQLGraph, error) {
@@ -167,7 +171,7 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(mv.SchemaQualifiedName),
 		mv.Privileges,
-		createTimePrivileges(mvsg.defaultPrivileges, "TABLES", mv.SchemaName),
+		createTimePrivileges(mvsg.defaultPrivileges, mvsg.applyingRole, "TABLES", mv.SchemaName),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating materialized view privilege statements: %w", err)

@@ -106,14 +106,14 @@ var classDefaultTypeUsage = schema.Privilege{Privilege: "USAGE"}
 
 // createTimePrivileges returns the ACL a newly created object of objectType in schemaName holds
 // right after CREATE: the class defaults PostgreSQL attaches implicitly plus every schema-scoped
-// default privilege the target schema declares for that object class. The plan emits the target's
-// default privileges before it creates any object, so these are the grants the CREATE statement
-// leaves behind. A rule scoped to a role other than the one applying the plan does not take
-// effect; the model does not know the applying role, and the REVOKE emitted for such a rule is a
-// no-op.
+// default privilege the target schema declares for that object class and that applies to
+// applyingRole. The plan emits the target's default privileges before it creates any object, so
+// these are the grants the CREATE statement leaves behind. A rule scoped to another role does not
+// take effect: ALTER DEFAULT PRIVILEGES FOR ROLE only changes what that role's CREATE leaves
+// behind.
 func createTimePrivileges(
 	defaultPrivileges []schema.DefaultPrivilege,
-	objectType, schemaName string,
+	applyingRole, objectType, schemaName string,
 	classDefaults ...schema.Privilege,
 ) []schema.Privilege {
 	privileges := make([]schema.Privilege, 0, len(classDefaults)+len(defaultPrivileges))
@@ -132,7 +132,7 @@ func createTimePrivileges(
 		add(p)
 	}
 	for _, p := range defaultPrivileges {
-		if p.ObjectType != objectType || p.SchemaName != schemaName {
+		if p.TargetRole != applyingRole || p.ObjectType != objectType || p.SchemaName != schemaName {
 			continue
 		}
 		add(schema.Privilege{Grantee: p.Grantee, Privilege: p.Privilege, IsGrantable: p.IsGrantable})

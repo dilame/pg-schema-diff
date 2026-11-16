@@ -1522,6 +1522,9 @@ func runTestCase(t *testing.T, engine *pgengine.Engine, testCase *testCase, getD
 	expectedSchema := fillDefaultObjectOwners(testCase.expectedSchema)
 	var serverVersionNum int
 	require.NoError(t, connPool.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum))
+	// The schema records the role it was read as, so the expected schema carries the role this
+	// test connects as.
+	require.NoError(t, connPool.QueryRow("SELECT current_user").Scan(&expectedSchema.ApplyingRole))
 	if serverVersionNum < 150000 {
 		// PostgreSQL 15 moved the public schema from the bootstrap superuser to pg_database_owner
 		// and cut its privileges down to PUBLIC's USAGE.
