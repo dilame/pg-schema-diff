@@ -16,6 +16,9 @@ type enumSQLGenerator struct {
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created enum comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect an enum the plan creates.
+	applyingRole string
 }
 
 func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
@@ -35,7 +38,7 @@ func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(enum.SchemaQualifiedName, "TYPE"),
 		enum.Privileges,
-		createTimePrivileges(e.defaultPrivileges, "TYPES", enum.SchemaName,
+		createTimePrivileges(e.defaultPrivileges, e.applyingRole, "TYPES", enum.SchemaName,
 			classDefaultTypeUsage),
 	)
 	if err != nil {

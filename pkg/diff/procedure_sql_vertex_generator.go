@@ -9,11 +9,15 @@ import (
 
 type procedureSQLVertexGenerator struct {
 	newSchema schema.Schema
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect a procedure the plan creates.
+	applyingRole string
 }
 
-func newProcedureSqlVertexGenerator(newSchema schema.Schema) sqlVertexGenerator[schema.Procedure, procedureDiff] {
+func newProcedureSqlVertexGenerator(newSchema schema.Schema, applyingRole string) sqlVertexGenerator[schema.Procedure, procedureDiff] {
 	return &procedureSQLVertexGenerator{
-		newSchema: newSchema,
+		newSchema:    newSchema,
+		applyingRole: applyingRole,
 	}
 }
 
@@ -63,7 +67,7 @@ func (p procedureSQLVertexGenerator) Add(s schema.Procedure) (partialSQLGraph, e
 	privilegeStmts, err := exactPrivilegeStatements(
 		newProcedurePrivilegeSQLVertexGenerator(s.SchemaQualifiedName),
 		s.Privileges,
-		createTimePrivileges(p.newSchema.DefaultPrivileges, "FUNCTIONS", s.SchemaName,
+		createTimePrivileges(p.newSchema.DefaultPrivileges, p.applyingRole, "FUNCTIONS", s.SchemaName,
 			classDefaultRoutineExecute),
 	)
 	if err != nil {

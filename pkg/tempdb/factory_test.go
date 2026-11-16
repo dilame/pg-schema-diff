@@ -194,6 +194,7 @@ func (suite *onInstanceTempDbFactorySuite) TestCreate_CreateAndDropFlow() {
 		}
 	}
 	suite.Equal(internalschema.Schema{
+		ApplyingRole: "postgres",
 		NamedSchemas: []internalschema.NamedSchema{publicSchema},
 	}, schema)
 

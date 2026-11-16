@@ -15,15 +15,20 @@ type functionSQLVertexGenerator struct {
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created function comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect a function the plan creates.
+	applyingRole string
 }
 
 func newFunctionSqlVertexGenerator(
 	functionsInNewSchemaByName map[string]schema.Function,
 	defaultPrivileges []schema.DefaultPrivilege,
+	applyingRole string,
 ) sqlVertexGenerator[schema.Function, functionDiff] {
 	return legacyToNewSqlVertexGenerator[schema.Function, functionDiff](&functionSQLVertexGenerator{
 		functionsInNewSchemaByName: functionsInNewSchemaByName,
 		defaultPrivileges:          defaultPrivileges,
+		applyingRole:               applyingRole,
 	})
 }
 
@@ -59,7 +64,7 @@ func (f *functionSQLVertexGenerator) addStatements(function schema.Function, wit
 	privilegeStmts, err := exactPrivilegeStatements(
 		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
 		function.Privileges,
-		createTimePrivileges(f.defaultPrivileges, "FUNCTIONS", function.SchemaName,
+		createTimePrivileges(f.defaultPrivileges, f.applyingRole, "FUNCTIONS", function.SchemaName,
 			classDefaultRoutineExecute),
 	)
 	if err != nil {

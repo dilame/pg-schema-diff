@@ -90,7 +90,7 @@ func buildViewDiff(
 		privilegesDiff:          privilegesDiff,
 		stableTableDependencies: stableTableDependencies(new.TableDependencies, tableDiffsByName),
 	}
-	if _, err := newViewSQLVertexGenerator(nil).Alter(d); err != nil {
+	if _, err := newViewSQLVertexGenerator(nil, "").Alter(d); err != nil {
 		if errors.Is(err, ErrNotImplemented) {
 			// The SQL generator cannot alter the view, so add and delete it.
 			return viewDiff{}, true, nil
@@ -150,10 +150,13 @@ type viewSQLGenerator struct {
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created view comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
+	// applyingRole is the role the plan runs as; a default privilege scoped to another role
+	// does not affect a view the plan creates.
+	applyingRole string
 }
 
-func newViewSQLVertexGenerator(defaultPrivileges []schema.DefaultPrivilege) sqlVertexGenerator[schema.View, viewDiff] {
-	return &viewSQLGenerator{defaultPrivileges: defaultPrivileges}
+func newViewSQLVertexGenerator(defaultPrivileges []schema.DefaultPrivilege, applyingRole string) sqlVertexGenerator[schema.View, viewDiff] {
+	return &viewSQLGenerator{defaultPrivileges: defaultPrivileges, applyingRole: applyingRole}
 }
 
 func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
@@ -166,7 +169,7 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(v.SchemaQualifiedName),
 		v.Privileges,
-		createTimePrivileges(vsg.defaultPrivileges, "TABLES", v.SchemaName),
+		createTimePrivileges(vsg.defaultPrivileges, vsg.applyingRole, "TABLES", v.SchemaName),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating view privilege statements: %w", err)

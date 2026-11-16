@@ -23,10 +23,11 @@ feature areas on top of it:
   columns, schemas, routines, sequences, types and domains, and default
   privileges; object ownership drift detection (`OWNER TO`). A new object's ACL
   is compared with the class default and the default privileges its schema
-  grants, so a REVOKE that the target declares over such a grant is part of the
-  plan. A sequence's privileges are planned for standalone, serial-owned and
-  identity-owned sequences; an identity-owned sequence's definition stays with
-  its column
+  grants to the role the plan applies as (a rule scoped with `FOR ROLE` to
+  another role does not apply), so a REVOKE that the target declares over such
+  a grant is part of the plan. A sequence's privileges are planned for
+  standalone, serial-owned and identity-owned sequences; an identity-owned
+  sequence's definition stays with its column
 - In-place replacement of views (`CREATE OR REPLACE VIEW`) when output columns
   stay compatible, including re-creation of dependent views and ordering
   around the relations and functions the definition reads

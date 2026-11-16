@@ -22,6 +22,9 @@ WHERE
             AND depend.deptype = 'e'
     );
 
+-- name: GetCurrentUser :one
+SELECT current_user::TEXT;
+
 -- name: GetSchemaPrivileges :many
 WITH parsed_acl AS (
     SELECT
@@ -635,7 +638,7 @@ SELECT
             )::TEXT
         FROM
             ACLEXPLODE(
-                COALESCE(seq_c.relacl, ACLDEFAULT('S', seq_c.relowner))
+                COALESCE(seq_c.relacl, ACLDEFAULT('s', seq_c.relowner))
             ) AS acl
         LEFT JOIN pg_catalog.pg_roles AS role_r
             ON acl.grantee = role_r.oid
