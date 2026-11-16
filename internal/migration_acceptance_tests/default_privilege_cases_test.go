@@ -347,6 +347,69 @@ var defaultPrivilegeAcceptanceTestCases = []acceptanceTestCase{
 			diff.MigrationHazardTypeAuthzUpdate,
 		},
 	},
+	{
+		// ALTER DEFAULT PRIVILEGES FOR ROLE other_role only changes what other_role's CREATE
+		// leaves behind. The plan runs as postgres, so the new table does not receive the default
+		// grant and the target's explicit grant has to be planned.
+		name:  "a default privilege for another target role does not apply to a new table",
+		roles: []string{"app_user", "other_role"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES FOR ROLE other_role IN SCHEMA schema_1
+                    GRANT SELECT ON TABLES TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES FOR ROLE other_role IN SCHEMA schema_1
+                    GRANT SELECT ON TABLES TO app_user;
+                CREATE TABLE schema_1.foo(id INT);
+                GRANT SELECT ON schema_1.foo TO app_user;
+			`,
+		},
+		expectedPlanDDL: []string{
+			"CREATE TABLE \"schema_1\".\"foo\" (\n\t\"id\" integer\n)",
+			"ALTER TABLE \"schema_1\".\"foo\" OWNER TO \"postgres\"",
+			"GRANT SELECT ON \"schema_1\".\"foo\" TO \"app_user\"",
+		},
+	},
+	{
+		// The sequence path follows the same rule: the other_role's SEQUENCES rule does not reach
+		// the sequence postgres creates, so the target's explicit grant is planned.
+		name:  "a default privilege for another target role does not apply to a new sequence",
+		roles: []string{"app_user", "other_role"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES FOR ROLE other_role IN SCHEMA schema_1
+                    GRANT SELECT ON SEQUENCES TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES FOR ROLE other_role IN SCHEMA schema_1
+                    GRANT SELECT ON SEQUENCES TO app_user;
+                CREATE SEQUENCE schema_1.foo
+                    AS BIGINT
+                    INCREMENT BY 1
+                    MINVALUE 1 MAXVALUE 100
+                    START WITH 1 CACHE 1 NO CYCLE
+                    OWNED BY NONE;
+                GRANT SELECT ON SEQUENCE schema_1.foo TO app_user;
+			`,
+		},
+		expectedPlanDDL: []string{
+			"CREATE SEQUENCE \"schema_1\".\"foo\"\n\tAS bigint\n\tINCREMENT BY 1\n\tMINVALUE 1 MAXVALUE 100\n\tSTART WITH 1 CACHE 1 NO CYCLE\n",
+			"ALTER SEQUENCE \"schema_1\".\"foo\" OWNER TO \"postgres\"",
+			"GRANT SELECT ON \"schema_1\".\"foo\" TO \"app_user\"",
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeHasUntrackableDependencies,
+		},
+	},
 }
 
 func TestDefaultPrivilegeTestCases(t *testing.T) {
