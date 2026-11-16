@@ -317,7 +317,7 @@ var defaultPrivilegeAcceptanceTestCases = []acceptanceTestCase{
                 ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
                     GRANT SELECT ON TABLES TO app_user WITH GRANT OPTION;
                 CREATE TABLE schema_1.foo(id INT);
-                GRANT SELECT ON schema_1.foo TO app_user;
+                REVOKE GRANT OPTION FOR SELECT ON schema_1.foo FROM app_user;
 			`,
 		},
 	},
