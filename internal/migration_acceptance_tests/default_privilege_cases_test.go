@@ -197,6 +197,33 @@ var defaultPrivilegeAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		// CREATE OR REPLACE keeps the function's ACL, so a replaced function does not pick up the
+		// default privilege the target added; the plan has to grant it explicitly.
+		name:  "grant a default privilege to a function that is replaced",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                CREATE FUNCTION schema_1.value() RETURNS INT
+                    LANGUAGE sql IMMUTABLE
+                    RETURN 1;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT EXECUTE ON FUNCTIONS TO app_user;
+                CREATE FUNCTION schema_1.value() RETURNS INT
+                    LANGUAGE sql IMMUTABLE
+                    RETURN 2;
+			`,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
+	{
 		name:  "revoke from a new procedure the execute the schema's default privileges grant",
 		roles: []string{"app_user"},
 		oldSchemaDDL: []string{
