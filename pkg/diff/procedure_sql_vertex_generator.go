@@ -63,7 +63,8 @@ func (p procedureSQLVertexGenerator) Add(s schema.Procedure) (partialSQLGraph, e
 	privilegeStmts, err := exactPrivilegeStatements(
 		newProcedurePrivilegeSQLVertexGenerator(s.SchemaQualifiedName),
 		s.Privileges,
-		schema.Privilege{Privilege: "EXECUTE"},
+		createTimePrivileges(p.newSchema.DefaultPrivileges, "FUNCTIONS", s.SchemaName,
+			classDefaultRoutineExecute),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating procedure privilege statements: %w", err)

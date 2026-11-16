@@ -89,7 +89,7 @@ func buildMaterializedViewDiff(
 		oldAndNew:      oldAndNew[schema.MaterializedView]{old: old, new: new},
 		privilegesDiff: privilegesDiff,
 	}
-	if _, err := newMaterializedViewSQLVertexGenerator().Alter(d); err != nil {
+	if _, err := newMaterializedViewSQLVertexGenerator(nil).Alter(d); err != nil {
 		if errors.Is(err, ErrNotImplemented) {
 			// The SQL generator cannot alter the materialized view, so add and delete it.
 			return materializedViewDiff{}, true, nil
@@ -100,10 +100,15 @@ func buildMaterializedViewDiff(
 }
 
 type materializedViewSQLGenerator struct {
+	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
+	// newly created materialized view comes out of CREATE with.
+	defaultPrivileges []schema.DefaultPrivilege
 }
 
-func newMaterializedViewSQLVertexGenerator() sqlVertexGenerator[schema.MaterializedView, materializedViewDiff] {
-	return &materializedViewSQLGenerator{}
+func newMaterializedViewSQLVertexGenerator(
+	defaultPrivileges []schema.DefaultPrivilege,
+) sqlVertexGenerator[schema.MaterializedView, materializedViewDiff] {
+	return &materializedViewSQLGenerator{defaultPrivileges: defaultPrivileges}
 }
 
 func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (partialSQLGraph, error) {
@@ -159,15 +164,16 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 			LockTimeout: lockTimeoutDefault,
 		})
 	}
-	privilegeGenerator := newPrivilegeSQLVertexGenerator(mv.SchemaQualifiedName)
-	for _, privilege := range mv.Privileges {
-		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
-		if err != nil {
-			return partialSQLGraph{}, fmt.Errorf("generating add privilege statements for privilege %s: %w", privilege.GetName(), err)
-		}
-		// Remove hazards from statements since the materialized view is brand new
-		stmts = append(stmts, stripMigrationHazards(addPrivilegePartialGraph.statements()...)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newPrivilegeSQLVertexGenerator(mv.SchemaQualifiedName),
+		mv.Privileges,
+		createTimePrivileges(mvsg.defaultPrivileges, "TABLES", mv.SchemaName),
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating materialized view privilege statements: %w", err)
 	}
+	// Remove hazards from statements since the materialized view is brand new
+	stmts = append(stmts, privilegeStmts...)
 	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("MATERIALIZED VIEW", mv.SchemaQualifiedName), mv.Owner)...)
 	stmts = append(stmts, commentDDLForAdd(commentTargetMaterializedView(mv.SchemaQualifiedName), mv.Description)...)
 	stmts = append(stmts, viewColumnCommentDDLForAdd(mv.SchemaQualifiedName, mv.Columns)...)

@@ -52,7 +52,8 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(ct.SchemaQualifiedName, "TYPE"),
 		ct.Privileges,
-		schema.Privilege{Privilege: "USAGE"},
+		createTimePrivileges(c.newSchema.DefaultPrivileges, "TYPES", ct.SchemaName,
+			classDefaultTypeUsage),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating composite type privilege statements: %w", err)

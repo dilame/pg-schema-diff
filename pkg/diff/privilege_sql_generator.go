@@ -96,34 +96,83 @@ func generateTypePrivilegeStatements(
 	return statements, nil
 }
 
-// exactPrivilegeStatements emits the privileges of a newly created object, whose ACL
-// PostgreSQL initializes to the class default (PUBLIC EXECUTE on routines, PUBLIC USAGE on
-// types). The class-default row is part of the model but is not granted explicitly; when the
-// target does not hold it, it is revoked after the object is created.
-func exactPrivilegeStatements(
-	generator sqlVertexGenerator[schema.Privilege, privilegeDiff],
-	privileges []schema.Privilege,
-	classDefault schema.Privilege,
-) ([]Statement, error) {
-	var stmts []Statement
-	hasClassDefault := false
-	for _, p := range privileges {
-		if p.Grantee == "" && p.Privilege == classDefault.Privilege && !p.IsGrantable {
-			hasClassDefault = true
+// classDefaultRoutineExecute is the EXECUTE grant PostgreSQL gives PUBLIC on a newly created
+// function or procedure.
+var classDefaultRoutineExecute = schema.Privilege{Privilege: "EXECUTE"}
+
+// classDefaultTypeUsage is the USAGE grant PostgreSQL gives PUBLIC on a newly created type or
+// domain.
+var classDefaultTypeUsage = schema.Privilege{Privilege: "USAGE"}
+
+// createTimePrivileges returns the ACL a newly created object of objectType in schemaName holds
+// right after CREATE: the class defaults PostgreSQL attaches implicitly plus every schema-scoped
+// default privilege the target schema declares for that object class. The plan emits the target's
+// default privileges before it creates any object, so these are the grants the CREATE statement
+// leaves behind. A rule scoped to a role other than the one applying the plan does not take
+// effect; the model does not know the applying role, and the REVOKE emitted for such a rule is a
+// no-op.
+func createTimePrivileges(
+	defaultPrivileges []schema.DefaultPrivilege,
+	objectType, schemaName string,
+	classDefaults ...schema.Privilege,
+) []schema.Privilege {
+	privileges := make([]schema.Privilege, 0, len(classDefaults)+len(defaultPrivileges))
+	byName := make(map[string]int, len(classDefaults)+len(defaultPrivileges))
+	add := func(p schema.Privilege) {
+		if i, ok := byName[p.GetName()]; ok {
+			// More than one rule can grant the same privilege to the same grantee; the
+			// effective ACL carries the grant option if any of them does.
+			privileges[i].IsGrantable = privileges[i].IsGrantable || p.IsGrantable
+			return
+		}
+		byName[p.GetName()] = len(privileges)
+		privileges = append(privileges, p)
+	}
+	for _, p := range classDefaults {
+		add(p)
+	}
+	for _, p := range defaultPrivileges {
+		if p.ObjectType != objectType || p.SchemaName != schemaName {
 			continue
 		}
+		add(schema.Privilege{Grantee: p.Grantee, Privilege: p.Privilege, IsGrantable: p.IsGrantable})
+	}
+	return privileges
+}
+
+// exactPrivilegeStatements brings a newly created object from the ACL PostgreSQL leaves on it at
+// CREATE (createTimePrivileges) to the target ACL: a create-time privilege the target does not
+// hold is revoked after the create, and a target privilege the create-time ACL does not hold is
+// granted. Hazards are stripped because the object did not exist before, so a revoke cannot break
+// a caller already using it.
+func exactPrivilegeStatements(
+	generator sqlVertexGenerator[schema.Privilege, privilegeDiff],
+	targetPrivileges, createPrivileges []schema.Privilege,
+) ([]Statement, error) {
+	privilegesDiff, err := diffLists(createPrivileges, targetPrivileges,
+		func(old, new schema.Privilege, _, _ int) (privilegeDiff, bool, error) {
+			// There is no ALTER for a grant option change: revoke the grant and grant it again.
+			return privilegeDiff{oldAndNew[schema.Privilege]{old: old, new: new}},
+				old.IsGrantable != new.IsGrantable, nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("diffing the create-time privileges: %w", err)
+	}
+
+	var stmts []Statement
+	for _, p := range privilegesDiff.deletes {
+		deletePartialGraph, err := generator.Delete(p)
+		if err != nil {
+			return nil, fmt.Errorf("generating revoke statement for privilege %s: %w", p.GetName(), err)
+		}
+		stmts = append(stmts, stripMigrationHazards(deletePartialGraph.statements()...)...)
+	}
+	for _, p := range privilegesDiff.adds {
 		addPartialGraph, err := generator.Add(p)
 		if err != nil {
 			return nil, fmt.Errorf("generating grant statement for privilege %s: %w", p.GetName(), err)
 		}
 		stmts = append(stmts, stripMigrationHazards(addPartialGraph.statements()...)...)
-	}
-	if !hasClassDefault {
-		deletePartialGraph, err := generator.Delete(classDefault)
-		if err != nil {
-			return nil, fmt.Errorf("generating revoke statement for default PUBLIC %s: %w", classDefault.Privilege, err)
-		}
-		stmts = append(stripMigrationHazards(deletePartialGraph.statements()...), stmts...)
 	}
 	return stmts, nil
 }

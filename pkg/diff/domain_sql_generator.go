@@ -48,7 +48,8 @@ func (d *domainSQLVertexGenerator) Add(domain schema.Domain) (partialSQLGraph, e
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(domain.SchemaQualifiedName, "DOMAIN"),
 		domain.Privileges,
-		schema.Privilege{Privilege: "USAGE"},
+		createTimePrivileges(d.newSchema.DefaultPrivileges, "TYPES", domain.SchemaName,
+			classDefaultTypeUsage),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating domain privilege statements: %w", err)

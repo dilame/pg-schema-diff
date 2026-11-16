@@ -814,6 +814,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		deletedTablesByName:     deletedTablesByName,
 		tablesInNewSchemaByName: tablesInNewSchemaByName,
 		tableDiffsByName:        buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		defaultPrivileges:       diff.new.DefaultPrivileges,
 	}), diff.tableDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving table diff: %w", err)
@@ -836,7 +837,9 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving extension diff: %w", err)
 	}
 
-	enumStatements, err := diff.enumDiffs.resolveToSQLGroupedByEffect(&enumSQLGenerator{})
+	enumStatements, err := diff.enumDiffs.resolveToSQLGroupedByEffect(&enumSQLGenerator{
+		defaultPrivileges: diff.new.DefaultPrivileges,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("resolving enum diff: %w", err)
 	}
@@ -922,7 +925,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, compositeTypesPartialGraph)
 
-	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName)
+	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName, diff.new.DefaultPrivileges)
 	functionsPartialGraph, err := generatePartialGraph(functionGenerator, diff.functionDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving function diff: %w", err)
@@ -950,14 +953,14 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, triggersPartialGraph)
 
-	viewGenerator := newViewSQLVertexGenerator()
+	viewGenerator := newViewSQLVertexGenerator(diff.new.DefaultPrivileges)
 	viewPartialGraph, err := generatePartialGraph(viewGenerator, diff.viewDiff)
 	if err != nil {
 		return nil, fmt.Errorf("resolving view diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, viewPartialGraph)
 
-	materializedViewGenerator := newMaterializedViewSQLVertexGenerator()
+	materializedViewGenerator := newMaterializedViewSQLVertexGenerator(diff.new.DefaultPrivileges)
 	materializedViewPartialGraph, err := generatePartialGraph(materializedViewGenerator, diff.materializedViewDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving materialized view diff: %w", err)
@@ -1183,6 +1186,9 @@ type tableSQLVertexGenerator struct {
 	deletedTablesByName     map[string]schema.Table
 	tablesInNewSchemaByName map[string]schema.Table
 	tableDiffsByName        map[string]tableDiff
+	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
+	// newly created table comes out of CREATE with.
+	defaultPrivileges []schema.DefaultPrivilege
 }
 
 func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
@@ -1283,15 +1289,16 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		stmts = append(stmts, stripMigrationHazards(forceRLSForTable(table))...)
 	}
 
-	privilegeGenerator := newPrivilegeSQLVertexGenerator(table.SchemaQualifiedName)
-	for _, privilege := range table.Privileges {
-		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
-		if err != nil {
-			return nil, fmt.Errorf("generating add privilege statements for privilege %s: %w", privilege.GetName(), err)
-		}
-		// Remove hazards from statements since the table is brand new
-		stmts = append(stmts, stripMigrationHazards(addPrivilegePartialGraph.statements()...)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newPrivilegeSQLVertexGenerator(table.SchemaQualifiedName),
+		table.Privileges,
+		createTimePrivileges(t.defaultPrivileges, "TABLES", table.SchemaName),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generating table privilege statements: %w", err)
 	}
+	// Remove hazards from statements since the table is brand new
+	stmts = append(stmts, privilegeStmts...)
 
 	columnPrivilegeGenerator := &columnPrivilegeSQLVertexGenerator{tableName: table.SchemaQualifiedName}
 	for _, privilege := range table.ColumnPrivileges {
