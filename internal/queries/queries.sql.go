@@ -1967,7 +1967,7 @@ SELECT
     ARRAY(
         SELECT
             JSON_BUILD_OBJECT(
-                'grantee', COALESCE(grantee_role.rolname, ''),
+                'grantee', COALESCE(role_r.rolname, ''),
                 'privilege', acl.privilege_type,
                 'is_grantable', acl.is_grantable
             )::TEXT
@@ -1975,11 +1975,12 @@ SELECT
             ACLEXPLODE(
                 COALESCE(seq_c.relacl, ACLDEFAULT('S', seq_c.relowner))
             ) AS acl
-        LEFT JOIN pg_catalog.pg_roles AS grantee_role
-            ON acl.grantee = grantee_role.oid
+        LEFT JOIN pg_catalog.pg_roles AS role_r
+            ON acl.grantee = role_r.oid
         WHERE acl.grantee != seq_c.relowner OR acl.grantee = 0
-        ORDER BY COALESCE(grantee_role.rolname, ''), acl.privilege_type
-    )::TEXT [] AS privileges,
+        -- sqlfluff's RF01 cannot resolve an alias of a table function.
+        ORDER BY COALESCE(role_r.rolname, ''), acl.privilege_type -- noqa: RF01
+    )::TEXT [] AS privileges, -- noqa: RF04
     pg_seq.seqstart AS start_value,
     pg_seq.seqincrement AS increment_value,
     pg_seq.seqmax AS max_value,
@@ -2012,8 +2013,9 @@ WHERE
     seq_ns.nspname NOT IN ('pg_catalog', 'information_schema')
     AND seq_ns.nspname !~ '^pg_toast'
     AND seq_ns.nspname !~ '^pg_temp'
-    -- Identity-owned sequences are included: they are created and dropped with their identity
-    -- column, and the sequence generator plans only their privileges (dependency_type = 'i').
+    -- Identity-owned sequences are included: they are created and dropped with
+    -- their identity column, and the sequence generator plans only their
+    -- privileges (dependency_type = 'i').
     -- Exclude sequences belonging to extensions
     AND NOT EXISTS (
         SELECT ext_depend.objid
