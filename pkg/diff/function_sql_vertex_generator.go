@@ -12,11 +12,18 @@ type functionSQLVertexGenerator struct {
 	// functionsInNewSchemaByName is a map of function name to functions in the new schema.
 	// These functions are not necessarily new
 	functionsInNewSchemaByName map[string]schema.Function
+	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
+	// newly created function comes out of CREATE with.
+	defaultPrivileges []schema.DefaultPrivilege
 }
 
-func newFunctionSqlVertexGenerator(functionsInNewSchemaByName map[string]schema.Function) sqlVertexGenerator[schema.Function, functionDiff] {
+func newFunctionSqlVertexGenerator(
+	functionsInNewSchemaByName map[string]schema.Function,
+	defaultPrivileges []schema.DefaultPrivilege,
+) sqlVertexGenerator[schema.Function, functionDiff] {
 	return legacyToNewSqlVertexGenerator[schema.Function, functionDiff](&functionSQLVertexGenerator{
 		functionsInNewSchemaByName: functionsInNewSchemaByName,
+		defaultPrivileges:          defaultPrivileges,
 	})
 }
 
@@ -42,7 +49,8 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 	privilegeStmts, err := exactPrivilegeStatements(
 		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
 		function.Privileges,
-		schema.Privilege{Privilege: "EXECUTE"},
+		createTimePrivileges(f.defaultPrivileges, "FUNCTIONS", function.SchemaQualifiedName.SchemaName,
+			classDefaultRoutineExecute),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generating function privilege statements: %w", err)

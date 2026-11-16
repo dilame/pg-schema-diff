@@ -418,7 +418,7 @@ func (suite *planGeneratorTestSuite) TestGenerate_RefreshNamesUnreadableRelation
 		_, _ = adminPool.ExecContext(ctx, "DROP SCHEMA work CASCADE")
 	}()
 
-	graph, err := newMaterializedViewSQLVertexGenerator().Add(schema.MaterializedView{
+	graph, err := newMaterializedViewSQLVertexGenerator(nil).Add(schema.MaterializedView{
 		SchemaQualifiedName: schema.SchemaQualifiedName{
 			SchemaName:  "work",
 			EscapedName: schema.EscapeIdentifier("mv"),

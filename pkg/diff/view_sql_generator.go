@@ -90,7 +90,7 @@ func buildViewDiff(
 		privilegesDiff:          privilegesDiff,
 		stableTableDependencies: stableTableDependencies(new.TableDependencies, tableDiffsByName),
 	}
-	if _, err := newViewSQLVertexGenerator().Alter(d); err != nil {
+	if _, err := newViewSQLVertexGenerator(nil).Alter(d); err != nil {
 		if errors.Is(err, ErrNotImplemented) {
 			// The SQL generator cannot alter the view, so add and delete it.
 			return viewDiff{}, true, nil
@@ -147,10 +147,13 @@ func retypedColumnNames(td tableDiff) map[string]bool {
 }
 
 type viewSQLGenerator struct {
+	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
+	// newly created view comes out of CREATE with.
+	defaultPrivileges []schema.DefaultPrivilege
 }
 
-func newViewSQLVertexGenerator() sqlVertexGenerator[schema.View, viewDiff] {
-	return &viewSQLGenerator{}
+func newViewSQLVertexGenerator(defaultPrivileges []schema.DefaultPrivilege) sqlVertexGenerator[schema.View, viewDiff] {
+	return &viewSQLGenerator{defaultPrivileges: defaultPrivileges}
 }
 
 func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
@@ -160,15 +163,16 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 		LockTimeout: lockTimeoutDefault,
 	}}
 
-	privilegeGenerator := newPrivilegeSQLVertexGenerator(v.SchemaQualifiedName)
-	for _, privilege := range v.Privileges {
-		addPrivilegePartialGraph, err := privilegeGenerator.Add(privilege)
-		if err != nil {
-			return partialSQLGraph{}, fmt.Errorf("generating add privilege statements for privilege %s: %w", privilege.GetName(), err)
-		}
-		// Remove hazards from statements since the view is brand new
-		stmts = append(stmts, stripMigrationHazards(addPrivilegePartialGraph.statements()...)...)
+	privilegeStmts, err := exactPrivilegeStatements(
+		newPrivilegeSQLVertexGenerator(v.SchemaQualifiedName),
+		v.Privileges,
+		createTimePrivileges(vsg.defaultPrivileges, "TABLES", v.SchemaQualifiedName.SchemaName),
+	)
+	if err != nil {
+		return partialSQLGraph{}, fmt.Errorf("generating view privilege statements: %w", err)
 	}
+	// Remove hazards from statements since the view is brand new
+	stmts = append(stmts, privilegeStmts...)
 
 	addVertexId := buildTableVertexId(v.SchemaQualifiedName, diffTypeAddAlter)
 

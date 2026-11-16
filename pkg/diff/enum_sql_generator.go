@@ -12,7 +12,11 @@ import (
 // enumSQLGenerator is a SQL generator for enums. In the future, we might want to convert this to a sqlVertexGenerator
 // with dependencies on (table) columns that use this enum. It is much easier to implement this as a sqlGenerator for
 // now.
-type enumSQLGenerator struct{}
+type enumSQLGenerator struct {
+	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
+	// newly created enum comes out of CREATE with.
+	defaultPrivileges []schema.DefaultPrivilege
+}
 
 func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 	var escapedEnumVals []string
@@ -31,7 +35,8 @@ func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(enum.SchemaQualifiedName, "TYPE"),
 		enum.Privileges,
-		schema.Privilege{Privilege: "USAGE"},
+		createTimePrivileges(e.defaultPrivileges, "TYPES", enum.SchemaQualifiedName.SchemaName,
+			classDefaultTypeUsage),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generating enum privilege statements: %w", err)

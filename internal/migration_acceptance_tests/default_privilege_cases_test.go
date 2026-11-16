@@ -167,6 +167,134 @@ var defaultPrivilegeAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		// A function created in a schema whose default privileges grant EXECUTE to a role comes
+		// out of CREATE with that grant. The target revokes it, so the plan has to revoke it after
+		// the create; without that, the migrated database keeps a grant the target does not hold.
+		name:  "revoke from a new function the execute the schema's default privileges grant",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT EXECUTE ON FUNCTIONS TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT EXECUTE ON FUNCTIONS TO app_user;
+                CREATE FUNCTION schema_1.private_value() RETURNS INT
+                    LANGUAGE sql IMMUTABLE
+                    RETURN 1;
+                REVOKE EXECUTE ON FUNCTION schema_1.private_value() FROM app_user;
+			`,
+		},
+		expectedPlanDDL: []string{
+			"CREATE OR REPLACE FUNCTION schema_1.private_value()\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE\nRETURN 1\n",
+			"ALTER FUNCTION \"schema_1\".\"private_value\"() OWNER TO \"postgres\"",
+			"REVOKE EXECUTE ON FUNCTION \"schema_1\".\"private_value\"() FROM \"app_user\"",
+		},
+	},
+	{
+		name:  "revoke from a new procedure the execute the schema's default privileges grant",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT EXECUTE ON FUNCTIONS TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT EXECUTE ON FUNCTIONS TO app_user;
+                CREATE PROCEDURE schema_1.do_nothing()
+                    LANGUAGE sql
+                    AS $$ SELECT 1 $$;
+                REVOKE EXECUTE ON PROCEDURE schema_1.do_nothing() FROM app_user;
+			`,
+		},
+		// A procedure's dependencies are not tracked by Postgres, so its create always carries
+		// this hazard.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeHasUntrackableDependencies,
+		},
+	},
+	{
+		name:  "revoke from new relations the select the schema's default privileges grant",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT SELECT ON TABLES TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT SELECT ON TABLES TO app_user;
+                CREATE TABLE schema_1.foo(id INT);
+                REVOKE SELECT ON schema_1.foo FROM app_user;
+                CREATE VIEW schema_1.foo_view AS SELECT id FROM schema_1.foo;
+                REVOKE SELECT ON schema_1.foo_view FROM app_user;
+                CREATE MATERIALIZED VIEW schema_1.foo_mv AS SELECT id FROM schema_1.foo;
+                REVOKE SELECT ON schema_1.foo_mv FROM app_user;
+			`,
+		},
+	},
+	{
+		name:  "revoke from new types the usage the schema's default privileges grant",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT USAGE ON TYPES TO app_user;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT USAGE ON TYPES TO app_user;
+                CREATE TYPE schema_1.mood AS ENUM ('sad', 'ok');
+                REVOKE USAGE ON TYPE schema_1.mood FROM app_user;
+                CREATE DOMAIN schema_1.positive AS INT CHECK (VALUE > 0);
+                REVOKE USAGE ON DOMAIN schema_1.positive FROM app_user;
+                CREATE TYPE schema_1.pair AS (a INT, b INT);
+                REVOKE USAGE ON TYPE schema_1.pair FROM app_user;
+			`,
+		},
+	},
+	{
+		// A default grant carrying the grant option and a target grant without it cannot be
+		// resolved by GRANT alone: the option survives a plain GRANT, so the plan revokes the
+		// default grant and grants the target one again.
+		name:  "a new table's default grant option is revoked before the target grant",
+		roles: []string{"app_user"},
+		oldSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT SELECT ON TABLES TO app_user WITH GRANT OPTION;
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE SCHEMA schema_1;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA schema_1
+                    GRANT SELECT ON TABLES TO app_user WITH GRANT OPTION;
+                CREATE TABLE schema_1.foo(id INT);
+                GRANT SELECT ON schema_1.foo TO app_user;
+			`,
+		},
+	},
+	{
 		// A database-wide rule is not attached to any schema, so it is not extracted and never
 		// shows up in a plan — not even as the revoke that would otherwise pair with the
 		// schema-scoped grant below.
