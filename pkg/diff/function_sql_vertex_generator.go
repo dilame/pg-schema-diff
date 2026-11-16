@@ -49,7 +49,7 @@ func (f *functionSQLVertexGenerator) Add(function schema.Function) ([]Statement,
 	privilegeStmts, err := exactPrivilegeStatements(
 		newFunctionPrivilegeSQLVertexGenerator(function.SchemaQualifiedName),
 		function.Privileges,
-		createTimePrivileges(f.defaultPrivileges, "FUNCTIONS", function.SchemaQualifiedName.SchemaName,
+		createTimePrivileges(f.defaultPrivileges, "FUNCTIONS", function.SchemaName,
 			classDefaultRoutineExecute),
 	)
 	if err != nil {

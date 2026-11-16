@@ -52,7 +52,7 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(ct.SchemaQualifiedName, "TYPE"),
 		ct.Privileges,
-		createTimePrivileges(c.newSchema.DefaultPrivileges, "TYPES", ct.SchemaQualifiedName.SchemaName,
+		createTimePrivileges(c.newSchema.DefaultPrivileges, "TYPES", ct.SchemaName,
 			classDefaultTypeUsage),
 	)
 	if err != nil {

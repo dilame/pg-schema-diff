@@ -166,7 +166,7 @@ func (vsg *viewSQLGenerator) Add(v schema.View) (partialSQLGraph, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(v.SchemaQualifiedName),
 		v.Privileges,
-		createTimePrivileges(vsg.defaultPrivileges, "TABLES", v.SchemaQualifiedName.SchemaName),
+		createTimePrivileges(vsg.defaultPrivileges, "TABLES", v.SchemaName),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating view privilege statements: %w", err)

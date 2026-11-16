@@ -35,7 +35,7 @@ func (e *enumSQLGenerator) Add(enum schema.Enum) ([]Statement, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(enum.SchemaQualifiedName, "TYPE"),
 		enum.Privileges,
-		createTimePrivileges(e.defaultPrivileges, "TYPES", enum.SchemaQualifiedName.SchemaName,
+		createTimePrivileges(e.defaultPrivileges, "TYPES", enum.SchemaName,
 			classDefaultTypeUsage),
 	)
 	if err != nil {

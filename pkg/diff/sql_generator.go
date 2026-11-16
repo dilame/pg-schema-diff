@@ -1292,7 +1292,7 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(table.SchemaQualifiedName),
 		table.Privileges,
-		createTimePrivileges(t.defaultPrivileges, "TABLES", table.SchemaQualifiedName.SchemaName),
+		createTimePrivileges(t.defaultPrivileges, "TABLES", table.SchemaName),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generating table privilege statements: %w", err)

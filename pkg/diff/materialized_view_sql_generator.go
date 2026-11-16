@@ -167,7 +167,7 @@ func (mvsg *materializedViewSQLGenerator) Add(mv schema.MaterializedView) (parti
 	privilegeStmts, err := exactPrivilegeStatements(
 		newPrivilegeSQLVertexGenerator(mv.SchemaQualifiedName),
 		mv.Privileges,
-		createTimePrivileges(mvsg.defaultPrivileges, "TABLES", mv.SchemaQualifiedName.SchemaName),
+		createTimePrivileges(mvsg.defaultPrivileges, "TABLES", mv.SchemaName),
 	)
 	if err != nil {
 		return partialSQLGraph{}, fmt.Errorf("generating materialized view privilege statements: %w", err)
