@@ -117,7 +117,13 @@ func (s Schema) Normalize() Schema {
 
 	s.Indexes = sortSchemaObjectsByName(s.Indexes)
 	s.ForeignKeyConstraints = sortSchemaObjectsByName(s.ForeignKeyConstraints)
-	s.Sequences = sortSchemaObjectsByName(s.Sequences)
+
+	var normSequences []Sequence
+	for _, seq := range sortSchemaObjectsByName(s.Sequences) {
+		seq.Privileges = sortSchemaObjectsByName(seq.Privileges)
+		normSequences = append(normSequences, seq)
+	}
+	s.Sequences = normSequences
 
 	var normFunctions []Function
 	for _, function := range sortSchemaObjectsByName(s.Functions) {
@@ -716,6 +722,13 @@ type (
 		MinValue   int64
 		CacheSize  int64
 		Cycle      bool
+		// IsIdentity reports that PostgreSQL created the sequence for an identity column. Its
+		// lifecycle follows that column: the table's declaration creates and drops it, so the
+		// sequence generator plans only its privileges.
+		IsIdentity bool
+		// Privileges are the sequence's ACL rows (pg_class.relacl), excluding the owner's
+		// implicit grants.
+		Privileges []Privilege
 		// Description is the comment attached to the sequence (pg_description). Empty means no comment.
 		Description string
 	}
@@ -2128,6 +2141,10 @@ func (s *schemaFetcher) fetchSequences(ctx context.Context) ([]Sequence, error) 
 				ColumnName: rawSeq.OwnerColumnName,
 			}
 		}
+		privileges, err := parseJSONPrivileges(rawSeq.Privileges)
+		if err != nil {
+			return nil, fmt.Errorf("parseJSONPrivileges(%s): %w", rawSeq.SequenceName, err)
+		}
 		seqs = append(seqs, Sequence{
 			SchemaQualifiedName: SchemaQualifiedName{
 				SchemaName:  rawSeq.SequenceSchemaName,
@@ -2142,6 +2159,8 @@ func (s *schemaFetcher) fetchSequences(ctx context.Context) ([]Sequence, error) 
 			MinValue:    rawSeq.MinValue,
 			CacheSize:   rawSeq.CacheSize,
 			Cycle:       rawSeq.IsCycle,
+			IsIdentity:  rawSeq.DependencyType == "i",
+			Privileges:  privileges,
 			Description: rawSeq.Description,
 		})
 	}

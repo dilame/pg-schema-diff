@@ -281,8 +281,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash:           "78ec732e8cae3b8a",
-			expectedHashBeforePG15: "4fcf56401b6eb1dc",
+			expectedHash:           "fb22a22d0772d3a0",
+			expectedHashBeforePG15: "1d70cafb8f5b8609",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -709,8 +709,8 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash:           "7b57f3d7109ba6e3",
-			expectedHashBeforePG15: "ec13d3e5504f5c2",
+			expectedHash:           "f535980ab1634df4",
+			expectedHashBeforePG15: "8e5ae5a31bc09668",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -994,6 +994,21 @@ var (
 						CacheSize:  1,
 						Cycle:      false,
 					},
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_version_seq\""},
+						Owner: &SequenceOwner{
+							TableName:  SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
+							ColumnName: "version",
+						},
+						Type:       "integer",
+						StartValue: 1,
+						Increment:  1,
+						MaxValue:   2147483647,
+						MinValue:   1,
+						CacheSize:  1,
+						Cycle:      false,
+						IsIdentity: true,
+					},
 				},
 				Functions: []Function{
 					{
@@ -1145,6 +1160,36 @@ var (
 					},
 				},
 				Sequences: []Sequence{
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_identity_always_seq\""},
+						Owner: &SequenceOwner{
+							TableName:  SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
+							ColumnName: "identity_always",
+						},
+						Type:       "bigint",
+						StartValue: 3,
+						Increment:  4,
+						MaxValue:   9,
+						MinValue:   2,
+						CacheSize:  5,
+						Cycle:      false,
+						IsIdentity: true,
+					},
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_identity_default_seq\""},
+						Owner: &SequenceOwner{
+							TableName:  SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
+							ColumnName: "identity_default",
+						},
+						Type:       "bigint",
+						StartValue: 30,
+						Increment:  40,
+						MaxValue:   90,
+						MinValue:   20,
+						CacheSize:  50,
+						Cycle:      true,
+						IsIdentity: true,
+					},
 					{
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo_serial_seq\""},
 						Owner: &SequenceOwner{

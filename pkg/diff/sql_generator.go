@@ -160,6 +160,7 @@ type (
 
 	sequenceDiff struct {
 		oldAndNew[schema.Sequence]
+		privilegesDiff listDiff[schema.Privilege, privilegeDiff]
 	}
 
 	functionDiff struct {
@@ -376,11 +377,24 @@ func buildSchemaDiff(old, new schema.Schema, recreatedViews map[string]bool) (sc
 	}
 
 	sequencesDiffs, err := diffLists(old.Sequences, new.Sequences, func(old, new schema.Sequence, oldIndex, newIndex int) (diff sequenceDiff, requiresRecreation bool, error error) {
+		if old.IsIdentity != new.IsIdentity {
+			return sequenceDiff{}, false, fmt.Errorf("changing whether a sequence belongs to an identity column: %w", ErrNotImplemented)
+		}
+		privilegesDiff, err := buildPrivilegeDiffs(old.Privileges, new.Privileges)
+		if err != nil {
+			return sequenceDiff{}, false, fmt.Errorf("diffing privileges: %w", err)
+		}
 		seqDiff := sequenceDiff{
 			oldAndNew[schema.Sequence]{
 				old: old,
 				new: new,
 			},
+			privilegesDiff,
+		}
+		if new.IsIdentity {
+			// The identity column's declaration creates and drops the sequence; only its
+			// privileges are planned.
+			return seqDiff, false, nil
 		}
 		if new.Owner != nil && cmp.Equal(old.Owner, new.Owner) {
 			if _, isOnNewTable := addedTablesByName[new.Owner.TableName.GetName()]; isOnNewTable {
@@ -889,6 +903,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	sequenceGenerator := legacyToNewSqlVertexGenerator[schema.Sequence, sequenceDiff](&sequenceSQLVertexGenerator{
 		deletedTablesByName: deletedTablesByName,
 		tableDiffsByName:    buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		defaultPrivileges:   diff.new.DefaultPrivileges,
 	})
 	sequencesPartialGraph, err := generatePartialGraph(sequenceGenerator, diff.sequenceDiffs)
 	if err != nil {
@@ -3140,18 +3155,47 @@ func (f *foreignKeyConstraintSQLVertexGenerator) GetDeleteDependencies(con schem
 type sequenceSQLVertexGenerator struct {
 	deletedTablesByName map[string]schema.Table
 	tableDiffsByName    map[string]tableDiff
+	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
+	// newly created sequence comes out of CREATE with.
+	defaultPrivileges []schema.DefaultPrivilege
 }
 
 func (s *sequenceSQLVertexGenerator) Add(seq schema.Sequence) ([]Statement, error) {
-	stmts := []Statement{
-		s.buildAddAlterSequenceStatement(seq, false),
+	var stmts []Statement
+	if !seq.IsIdentity {
+		// An identity column creates its sequence with the table; only its privileges are planned.
+		stmts = append(stmts, s.buildAddAlterSequenceStatement(seq, false))
+		stmts = append(stmts, ownerDDLForAdd(ownershipTarget("SEQUENCE", seq.SchemaQualifiedName), seq.RoleOwner)...)
+		stmts = append(stmts, commentDDLForAdd(commentTargetSequence(seq.SchemaQualifiedName), seq.Description)...)
 	}
-	stmts = append(stmts, ownerDDLForAdd(ownershipTarget("SEQUENCE", seq.SchemaQualifiedName), seq.RoleOwner)...)
-	stmts = append(stmts, commentDDLForAdd(commentTargetSequence(seq.SchemaQualifiedName), seq.Description)...)
+	privilegeStmts, err := s.createPrivilegeStatements(seq)
+	if err != nil {
+		return nil, err
+	}
+	stmts = append(stmts, privilegeStmts...)
 	return stmts, nil
 }
 
+// createPrivilegeStatements plans the privileges a newly created sequence comes out of CREATE
+// with. A sequence has no class default; the schema's default privileges for sequences are the
+// grants the create leaves behind.
+func (s *sequenceSQLVertexGenerator) createPrivilegeStatements(seq schema.Sequence) ([]Statement, error) {
+	privilegeStmts, err := exactPrivilegeStatements(
+		newPrivilegeSQLVertexGenerator(seq.SchemaQualifiedName),
+		seq.Privileges,
+		createTimePrivileges(s.defaultPrivileges, "SEQUENCES", seq.SchemaName),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generating sequence privilege statements: %w", err)
+	}
+	return privilegeStmts, nil
+}
+
 func (s *sequenceSQLVertexGenerator) Delete(seq schema.Sequence) ([]Statement, error) {
+	if seq.IsIdentity {
+		// The identity column's table drops the sequence.
+		return nil, nil
+	}
 	hazards := []MigrationHazard{{
 		Type:    MigrationHazardTypeDeletesData,
 		Message: "By deleting a sequence, its value will be permanently lost",
@@ -3170,6 +3214,12 @@ func (s *sequenceSQLVertexGenerator) Delete(seq schema.Sequence) ([]Statement, e
 }
 
 func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, error) {
+	if diff.new.IsIdentity {
+		// The identity column's definition owns the sequence's attributes; only its privileges
+		// are planned.
+		return s.alterPrivilegeStatements(diff.new, diff.privilegesDiff)
+	}
+
 	var stmts []Statement
 	// Ownership changes handled by the sequenceOwnershipSQLVertexGenerator
 	diff.old.Owner = diff.new.Owner
@@ -3179,6 +3229,8 @@ func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, erro
 	// Mask Description: handled by an explicit COMMENT statement below.
 	descChanged := diff.old.Description != diff.new.Description
 	diff.old.Description = diff.new.Description
+	// Mask Privileges: handled by an explicit GRANT/REVOKE diff below.
+	diff.old.Privileges = diff.new.Privileges
 
 	// Explicitly list all the diffs supported by the alter statement, rather than just using !cmp.Equal, so we don't
 	// risk introducing a bug if we add new fields to schema.Sequence
@@ -3212,7 +3264,33 @@ func (s *sequenceSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, erro
 		stmts = append(stmts, commentOnStatement(commentTargetSequence(diff.new.SchemaQualifiedName), diff.new.Description))
 	}
 
+	privilegeStmts, err := s.alterPrivilegeStatements(diff.new, diff.privilegesDiff)
+	if err != nil {
+		return nil, err
+	}
+	stmts = append(stmts, privilegeStmts...)
+
 	return stmts, nil
+}
+
+// alterPrivilegeStatements resolves the grant diff of an existing sequence through the shared
+// privilege generator.
+func (s *sequenceSQLVertexGenerator) alterPrivilegeStatements(
+	seq schema.Sequence,
+	diffs listDiff[schema.Privilege, privilegeDiff],
+) ([]Statement, error) {
+	privilegesPartialGraph, err := generatePartialGraph(
+		newPrivilegeSQLVertexGenerator(seq.SchemaQualifiedName),
+		diffs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolving sequence privilege sql: %w", err)
+	}
+	privilegeStmts, err := graphStatements(privilegesPartialGraph)
+	if err != nil {
+		return nil, fmt.Errorf("ordering sequence privilege sql: %w", err)
+	}
+	return privilegeStmts, nil
 }
 
 func (s *sequenceSQLVertexGenerator) buildAddAlterSequenceStatement(seq schema.Sequence, isAlter bool) Statement {
@@ -3253,6 +3331,15 @@ func buildSequenceVertexId(name schema.SchemaQualifiedName, diffType diffType) s
 }
 
 func (s *sequenceSQLVertexGenerator) GetAddAlterDependencies(new schema.Sequence, _ schema.Sequence) ([]dependency, error) {
+	if new.IsIdentity {
+		if new.Owner == nil {
+			return nil, nil
+		}
+		// The identity column creates the sequence with its table; the privileges must follow.
+		return []dependency{
+			mustRun(s.GetSQLVertexId(new, diffTypeAddAlter)).after(buildTableVertexId(new.Owner.TableName, diffTypeAddAlter)),
+		}, nil
+	}
 	deps := []dependency{
 		mustRun(s.GetSQLVertexId(new, diffTypeAddAlter)).after(s.GetSQLVertexId(new, diffTypeDelete)),
 	}
@@ -3264,6 +3351,9 @@ func (s *sequenceSQLVertexGenerator) GetAddAlterDependencies(new schema.Sequence
 }
 
 func (s *sequenceSQLVertexGenerator) GetDeleteDependencies(seq schema.Sequence) ([]dependency, error) {
+	if seq.IsIdentity {
+		return nil, nil
+	}
 	var deps []dependency
 	// This is an unfortunate hackaround. It would make sense to also have a dependency on the owner column, such that
 	// the sequence can only be considered deleted after the owning column is deleted. However, we currently don't separate
@@ -3298,6 +3388,10 @@ func (s *sequenceSQLVertexGenerator) isDeletedWithColumns(seq schema.Sequence) b
 type sequenceOwnershipSQLVertexGenerator struct{}
 
 func (s sequenceOwnershipSQLVertexGenerator) Add(seq schema.Sequence) ([]Statement, error) {
+	if seq.IsIdentity {
+		// An identity column's sequence is owned by its column by definition.
+		return nil, nil
+	}
 	if seq.Owner == nil {
 		// If a new sequence has no owner, we don't need to alter it. The default is no owner
 		return nil, nil
@@ -3310,6 +3404,9 @@ func (s sequenceOwnershipSQLVertexGenerator) Delete(_ schema.Sequence) ([]Statem
 }
 
 func (s sequenceOwnershipSQLVertexGenerator) Alter(diff sequenceDiff) ([]Statement, error) {
+	if diff.new.IsIdentity {
+		return nil, nil
+	}
 	if cmp.Equal(diff.new.Owner, diff.old.Owner) {
 		return nil, nil
 	}
@@ -3334,6 +3431,10 @@ func (s sequenceOwnershipSQLVertexGenerator) GetSQLVertexId(seq schema.Sequence,
 }
 
 func (s sequenceOwnershipSQLVertexGenerator) GetAddAlterDependencies(new schema.Sequence, old schema.Sequence) ([]dependency, error) {
+	if new.IsIdentity || old.IsIdentity {
+		// An identity column's sequence is owned by its column by definition.
+		return nil, nil
+	}
 	if cmp.Equal(old.Owner, new.Owner) {
 		return nil, nil
 	}
