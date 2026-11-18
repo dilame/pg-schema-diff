@@ -245,23 +245,37 @@ SELECT
     -- the default exists.
     ARRAY(
         SELECT ref_attr.attname::TEXT
-        FROM pg_catalog.pg_depend AS depend
-        INNER JOIN
-            pg_catalog.pg_attribute AS ref_attr
-            ON
-                depend.refobjid = ref_attr.attrelid
-                AND depend.refobjsubid = ref_attr.attnum
+        FROM pg_catalog.pg_attribute AS ref_attr
         WHERE
             a.attgenerated != ''
-            AND depend.classid = 'pg_attrdef'::REGCLASS
-            AND depend.objid = d.oid
-            AND depend.refclassid = 'pg_class'::REGCLASS
-            AND depend.refobjid = a.attrelid
-            AND depend.refobjsubid != a.attnum
+            AND ref_attr.attrelid = a.attrelid
+            AND ref_attr.attnum > 0
+            AND ref_attr.attnum != a.attnum
+            AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_depend AS depend
+                WHERE
+                    depend.refclassid = 'pg_class'::REGCLASS
+                    AND depend.refobjid = ref_attr.attrelid
+                    AND depend.refobjsubid = ref_attr.attnum
+                    AND (
+                        (
+                            depend.classid = 'pg_attrdef'::REGCLASS
+                            AND depend.objid = d.oid
+                        )
+                        OR (
+                            depend.classid = 'pg_class'::REGCLASS
+                            AND depend.objid = a.attrelid
+                            AND depend.objsubid = a.attnum
+                        )
+                    )
+            )
         ORDER BY ref_attr.attnum
     )::TEXT [] AS generation_depends_on_columns,
     -- The other columns of the table a generated column's expression reads,
-    -- in their physical order; empty for an ordinary column.
+    -- in their physical order; empty for an ordinary column. Where PostgreSQL
+    -- records the reads depends on its version (14: dependencies of the column
+    -- itself; 18: dependencies of its pg_attrdef row), so both are read.
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN
