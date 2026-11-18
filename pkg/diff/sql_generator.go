@@ -828,6 +828,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		deletedTablesByName:     deletedTablesByName,
 		tablesInNewSchemaByName: tablesInNewSchemaByName,
 		tableDiffsByName:        buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		droppedRelationsByName:  buildDroppedRelationsByName(diff),
 		defaultPrivileges:       diff.new.DefaultPrivileges,
 		applyingRole:            diff.old.ApplyingRole,
 	}), diff.tableDiffs)
@@ -1204,6 +1205,9 @@ type tableSQLVertexGenerator struct {
 	deletedTablesByName     map[string]schema.Table
 	tablesInNewSchemaByName map[string]schema.Table
 	tableDiffsByName        map[string]tableDiff
+	// droppedRelationsByName holds every table, view and materialized view the plan drops,
+	// re-created ones included: the relations whose delete vertex actually runs a DROP.
+	droppedRelationsByName map[string]bool
 	// defaultPrivileges are the new schema's default privileges; they are part of the ACL a
 	// newly created table comes out of CREATE with.
 	defaultPrivileges []schema.DefaultPrivilege
@@ -1451,7 +1455,7 @@ func (t *tableSQLVertexGenerator) alterBaseTable(diff tableDiff) ([]Statement, e
 
 	var partialGraph partialSQLGraph
 
-	columnGenerator := newColumnSQLVertexGenerator(diff.new.SchemaQualifiedName)
+	columnGenerator := newColumnSQLVertexGenerator(diff.new, diff.columnsDiff.adds)
 	columnsPartialGraph, err := generatePartialGraph(columnGenerator, diff.columnsDiff)
 	if err != nil {
 		return nil, fmt.Errorf("resolving index diff: %w", err)
@@ -1729,6 +1733,7 @@ func (t *tableSQLVertexGenerator) GetAddAlterDependencies(table, oldTable schema
 	// SQL-standard body reads the table) a cycle even though neither statement does anything.
 	if !cmp.Equal(oldTable, schema.Table{}) {
 		deps = append(deps, consumerPolicyFunctionDependencies(oldTable, table)...)
+		deps = append(deps, replacedPolicyRelationDeleteDependencies(oldTable, table, t.droppedRelationsByName)...)
 	}
 	return deps, nil
 }
@@ -1798,7 +1803,7 @@ func (t *tableSQLVertexGenerator) GetDeleteDependencies(table schema.Table) ([]d
 			mustRun(t.GetSQLVertexId(table, diffTypeDelete)).after(buildTableVertexId(*table.ParentTable, diffTypeDelete)),
 		)
 	}
-	deps = append(deps, policyFunctionDeleteDependencies(table)...)
+	deps = append(deps, policyFunctionDeleteDependencies(table, t.droppedRelationsByName)...)
 	return deps, nil
 }
 
@@ -1827,17 +1832,49 @@ func consumerPolicyFunctionDependencies(oldTable, newTable schema.Table) []depen
 	return deps
 }
 
+// replacedPolicyRelationDeleteDependencies orders an altered table's vertex before the drop of
+// every relation the plan drops that a policy of the table drops, alters or re-creates stops
+// reading. PostgreSQL records the relations a policy expression reads as dependencies of the policy
+// and refuses to drop one while the old expression still reads it, so the table's statement
+// stream, which carries the policy's DROP / ALTER, has to run first. A relation the policy keeps
+// reading is left out: the policy still needs it afterwards.
+func replacedPolicyRelationDeleteDependencies(oldTable, newTable schema.Table, droppedRelationsByName map[string]bool) []dependency {
+	newPoliciesByName := buildSchemaObjByNameMap(newTable.Policies)
+	var deps []dependency
+	for _, oldPolicy := range oldTable.Policies {
+		newPolicy, kept := newPoliciesByName[oldPolicy.GetName()]
+		if kept && cmp.Equal(oldPolicy, newPolicy) {
+			continue
+		}
+		stillRead := make(map[string]bool)
+		if kept {
+			for _, rel := range newPolicy.DependsOnRelations {
+				stillRead[rel.GetName()] = true
+			}
+		}
+		for _, rel := range oldPolicy.DependsOnRelations {
+			if rel.GetName() == oldTable.GetName() || stillRead[rel.GetName()] || !droppedRelationsByName[rel.GetName()] {
+				continue
+			}
+			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).before(buildRelationVertexId(rel, diffTypeDelete)))
+		}
+	}
+	return deps
+}
+
 // policyFunctionDeleteDependencies orders a table's drop before the drop of every function its
-// policies call: a policy lives and dies with its table, so the function may only be dropped after
-// the policy is gone.
-func policyFunctionDeleteDependencies(table schema.Table) []dependency {
+// policies call and of every relation they read that the plan drops: a policy lives and dies with
+// its table, so what it reads may only be dropped after the policy is gone. A relation the plan
+// keeps is left out: its delete vertex drops nothing, and since it precedes the relation's own
+// alter, an edge to it would hold that alter back behind this drop for no reason.
+func policyFunctionDeleteDependencies(table schema.Table, droppedRelationsByName map[string]bool) []dependency {
 	var deps []dependency
 	for _, policy := range table.Policies {
 		for _, depFunction := range policy.DependsOnFunctions {
 			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)).before(buildFunctionVertexId(depFunction, diffTypeDelete)))
 		}
 		for _, depRelation := range policy.DependsOnRelations {
-			if depRelation.GetName() == table.GetName() {
+			if depRelation.GetName() == table.GetName() || !droppedRelationsByName[depRelation.GetName()] {
 				continue
 			}
 			deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)).before(buildRelationVertexId(depRelation, diffTypeDelete)))
@@ -1846,12 +1883,48 @@ func policyFunctionDeleteDependencies(table schema.Table) []dependency {
 	return deps
 }
 
-type columnSQLVertexGenerator struct {
-	tableName schema.SchemaQualifiedName
+// buildDroppedRelationsByName returns the names of the tables, views and materialized views the
+// plan drops, including the ones it drops to re-create.
+func buildDroppedRelationsByName(diff schemaDiff) map[string]bool {
+	dropped := make(map[string]bool)
+	for _, t := range diff.tableDiffs.deletes {
+		dropped[t.GetName()] = true
+	}
+	for _, v := range diff.viewDiff.deletes {
+		dropped[v.GetName()] = true
+	}
+	for _, mv := range diff.materializedViewDiffs.deletes {
+		dropped[mv.GetName()] = true
+	}
+	return dropped
 }
 
-func newColumnSQLVertexGenerator(tableName schema.SchemaQualifiedName) sqlVertexGenerator[schema.Column, columnDiff] {
-	return legacyToNewSqlVertexGenerator[schema.Column, columnDiff](&columnSQLVertexGenerator{tableName: tableName})
+type columnSQLVertexGenerator struct {
+	tableName schema.SchemaQualifiedName
+	// previousAddedColumnByName maps each column the plan adds to the added column that precedes it
+	// in the target table. ADD COLUMN appends, so the adds have to run in the target's physical order.
+	previousAddedColumnByName map[string]string
+}
+
+// newColumnSQLVertexGenerator builds the column generator of an existing table. newTable is the
+// target table and addedColumns the columns the plan adds to it, in any order.
+func newColumnSQLVertexGenerator(newTable schema.Table, addedColumns []schema.Column) sqlVertexGenerator[schema.Column, columnDiff] {
+	added := buildSchemaObjByNameMap(addedColumns)
+	previousAddedColumnByName := make(map[string]string)
+	previous := ""
+	for _, c := range newTable.Columns {
+		if _, ok := added[c.GetName()]; !ok {
+			continue
+		}
+		if previous != "" {
+			previousAddedColumnByName[c.GetName()] = previous
+		}
+		previous = c.GetName()
+	}
+	return legacyToNewSqlVertexGenerator[schema.Column, columnDiff](&columnSQLVertexGenerator{
+		tableName:                 newTable.SchemaQualifiedName,
+		previousAddedColumnByName: previousAddedColumnByName,
+	})
 }
 
 func (csg *columnSQLVertexGenerator) Add(column schema.Column) ([]Statement, error) {
@@ -2130,9 +2203,13 @@ func buildColumnVertexId(columnName string, diffType diffType) sqlVertexId {
 }
 
 func (csg *columnSQLVertexGenerator) GetAddAlterDependencies(col, _ schema.Column) ([]dependency, error) {
-	return []dependency{
+	deps := []dependency{
 		mustRun(csg.GetSQLVertexId(col, diffTypeDelete)).before(csg.GetSQLVertexId(col, diffTypeAddAlter)),
-	}, nil
+	}
+	if previous, ok := csg.previousAddedColumnByName[col.GetName()]; ok {
+		deps = append(deps, mustRun(csg.GetSQLVertexId(col, diffTypeAddAlter)).after(buildColumnVertexId(previous, diffTypeAddAlter)))
+	}
+	return deps, nil
 }
 
 func (csg *columnSQLVertexGenerator) GetDeleteDependencies(_ schema.Column) ([]dependency, error) {

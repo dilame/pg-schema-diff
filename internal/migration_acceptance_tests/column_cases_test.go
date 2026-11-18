@@ -123,6 +123,30 @@ var columnAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name: "Add several columns in the target's order",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY
+            );
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                zeta INT,
+                beta INT,
+                alpha INT
+            );
+            COMMENT ON COLUMN foobar.alpha IS 'carries one more statement than the other columns';
+			`,
+		},
+		// The column names sort against the declared order, and the last column carries an extra
+		// statement, so neither the vertex id nor the statement count may decide the order. The
+		// dump comparison fails unless the columns are appended exactly as declared.
+	},
+	{
 		name: "Add one column and change ordering",
 		oldSchemaDDL: []string{
 			`
@@ -1296,19 +1320,7 @@ var columnAcceptanceTestCases = []acceptanceTestCase{
             );
 			`,
 		},
-		// expectedDBSchemaDDL reflects the actual column order after migration
-		// PostgreSQL adds columns in the order of execution, not declaration order
-		expectedDBSchemaDDL: []string{
-			`
-            CREATE TABLE products (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                price NUMERIC(10,2) NOT NULL,
-                display_name TEXT GENERATED ALWAYS AS (upper(name)) STORED,
-                price_with_tax NUMERIC(10,2) GENERATED ALWAYS AS (price * 1.1) STORED
-            );
-			`,
-		},
+		// The columns are appended in the declared order, so the migrated table matches the target.
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
