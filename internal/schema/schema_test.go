@@ -281,8 +281,8 @@ var (
 			GRANT SELECT (content, author) ON schema_2.foo TO some_role_1;
 			GRANT UPDATE (content) ON schema_2.foo TO some_role_2 WITH GRANT OPTION;
 		`},
-			expectedHash:           "fb22a22d0772d3a0",
-			expectedHashBeforePG15: "1d70cafb8f5b8609",
+			expectedHash:           "dd71fe342e60085a",
+			expectedHashBeforePG15: "7e99bb41a4a43a4d",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -709,8 +709,8 @@ var (
 			ALTER TABLE foo_fk_1 ADD CONSTRAINT foo_fk_1_fk FOREIGN KEY (author, content) REFERENCES foo_1 (author, content)
 				NOT VALID;
 		`},
-			expectedHash:           "f535980ab1634df4",
-			expectedHashBeforePG15: "8e5ae5a31bc09668",
+			expectedHash:           "4f03d80eb8b66427",
+			expectedHashBeforePG15: "3ab9212bc21a1b01",
 			expectedSchema: Schema{
 				NamedSchemas: []NamedSchema{
 					publicSchema,
@@ -1372,6 +1372,43 @@ var (
 						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
 						Columns: []Column{
 							{Name: "value", Type: "text", IsNullable: true, Size: -1, Collation: defaultCollation},
+						},
+						CheckConstraints: nil,
+						ReplicaIdentity:  ReplicaIdentityDefault,
+					},
+				},
+			},
+		},
+		{
+			name: "Generated column reads other columns",
+			ddl: []string{`
+			CREATE TABLE foo (
+				id INT,
+				g INT GENERATED ALWAYS AS (b + id) STORED,
+				b INT,
+				c INT DEFAULT 5
+			);
+		`},
+			expectedSchema: Schema{
+				NamedSchemas: []NamedSchema{
+					publicSchema,
+				},
+				Tables: []Table{
+					{
+						SchemaQualifiedName: SchemaQualifiedName{SchemaName: "public", EscapedName: "\"foo\""},
+						Columns: []Column{
+							{Name: "id", Type: "integer", IsNullable: true, Size: 4},
+							{
+								Name:                       "g",
+								Type:                       "integer",
+								IsNullable:                 true,
+								Size:                       4,
+								GeneratedColumnType:        GeneratedColumnTypeStored,
+								GenerationExpression:       "(b + id)",
+								GenerationDependsOnColumns: []string{"id", "b"},
+							},
+							{Name: "b", Type: "integer", IsNullable: true, Size: 4},
+							{Name: "c", Type: "integer", Default: "5", IsNullable: true, Size: 4},
 						},
 						CheckConstraints: nil,
 						ReplicaIdentity:  ReplicaIdentityDefault,

@@ -161,8 +161,8 @@ var databaseSchemaSourceTestCases = []acceptanceTestCase{
 			`
                 CREATE TYPE color AS ENUM ('red', 'green', 'blue');
                 CREATE TABLE foobar(
-                    color color,
-                    id varchar(255) PRIMARY KEY
+                    id varchar(255) PRIMARY KEY,
+                    color color
                 );
                 CREATE TABLE foobar_fk(
                     id TEXT REFERENCES foobar(id)

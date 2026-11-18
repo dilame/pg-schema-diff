@@ -268,6 +268,39 @@ SELECT
     -- The functions the column's default calls, as JSON objects of schema, name
     -- and identity arguments. PostgreSQL refuses to drop such a function while
     -- the default exists.
+    ARRAY(
+        SELECT ref_attr.attname::TEXT
+        FROM pg_catalog.pg_attribute AS ref_attr
+        WHERE
+            a.attgenerated != ''
+            AND ref_attr.attrelid = a.attrelid
+            AND ref_attr.attnum > 0
+            AND ref_attr.attnum != a.attnum
+            AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_depend AS depend
+                WHERE
+                    depend.refclassid = 'pg_class'::REGCLASS
+                    AND depend.refobjid = ref_attr.attrelid
+                    AND depend.refobjsubid = ref_attr.attnum
+                    AND (
+                        (
+                            depend.classid = 'pg_attrdef'::REGCLASS
+                            AND depend.objid = d.oid
+                        )
+                        OR (
+                            depend.classid = 'pg_class'::REGCLASS
+                            AND depend.objid = a.attrelid
+                            AND depend.objsubid = a.attnum
+                        )
+                    )
+            )
+        ORDER BY ref_attr.attnum
+    )::TEXT [] AS generation_depends_on_columns,
+    -- The other columns of the table a generated column's expression reads,
+    -- in their physical order; empty for an ordinary column. Where PostgreSQL
+    -- records the reads depends on its version (14: dependencies of the column
+    -- itself; 18: dependencies of its pg_attrdef row), so both are read.
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS column_type
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN
@@ -290,25 +323,26 @@ ORDER BY a.attnum
 `
 
 type GetColumnsForTableRow struct {
-	ColumnName                string
-	IsNotNull                 bool
-	HasMissingValOptimization bool
-	ColumnSize                int16
-	IdentityType              string
-	StartValue                sql.NullInt64
-	IncrementValue            sql.NullInt64
-	MaxValue                  sql.NullInt64
-	MinValue                  sql.NullInt64
-	CacheSize                 sql.NullInt64
-	IsCycle                   sql.NullBool
-	CollationName             string
-	CollationSchemaName       string
-	DefaultValue              string
-	GenerationExpression      string
-	GenerationType            string
-	Description               string
-	DefaultDependsOnFunctions []string
-	ColumnType                string
+	ColumnName                 string
+	IsNotNull                  bool
+	HasMissingValOptimization  bool
+	ColumnSize                 int16
+	IdentityType               string
+	StartValue                 sql.NullInt64
+	IncrementValue             sql.NullInt64
+	MaxValue                   sql.NullInt64
+	MinValue                   sql.NullInt64
+	CacheSize                  sql.NullInt64
+	IsCycle                    sql.NullBool
+	CollationName              string
+	CollationSchemaName        string
+	DefaultValue               string
+	GenerationExpression       string
+	GenerationType             string
+	Description                string
+	DefaultDependsOnFunctions  []string
+	GenerationDependsOnColumns []string
+	ColumnType                 string
 }
 
 func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) ([]GetColumnsForTableRow, error) {
@@ -339,6 +373,7 @@ func (q *Queries) GetColumnsForTable(ctx context.Context, attrelid interface{}) 
 			&i.GenerationType,
 			&i.Description,
 			pq.Array(&i.DefaultDependsOnFunctions),
+			pq.Array(&i.GenerationDependsOnColumns),
 			&i.ColumnType,
 		); err != nil {
 			return nil, err

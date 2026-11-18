@@ -42,7 +42,13 @@ feature areas on top of it:
 - SQL-standard function bodies (`BEGIN ATOMIC`), canonical function and view
   definition comparison, plan validation with `check_function_bodies` disabled
 - Schema-qualified object support, table persistence drift, ordering fixes
-  (policies in their own vertex, routines after signature relations)
+  (policies in their own vertex, routines after signature relations, a
+  policy's drop or change before the drop of a relation its old expression
+  reads and its new one does not, columns added to an existing table in the
+  target's physical order, except that a generated column is added after the
+  columns it reads). Known limit: a changed policy that still reads a relation
+  the plan drops and re-creates is not ordered against that relation, so such
+  a plan fails validation at the relation's `DROP`
 - Table storage parameters (`pg_class.reloptions`): a new table's `CREATE TABLE`
   carries its `WITH (...)`, a changed parameter is planned as
   `ALTER TABLE ... SET/RESET`, and plan validation compares them

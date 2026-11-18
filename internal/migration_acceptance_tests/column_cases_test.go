@@ -123,6 +123,30 @@ var columnAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name: "Add several columns in the target's order",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY
+            );
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                zeta INT,
+                beta INT,
+                alpha INT
+            );
+            COMMENT ON COLUMN foobar.alpha IS 'carries one more statement than the other columns';
+			`,
+		},
+		// The column names sort against the declared order, and the last column carries an extra
+		// statement, so neither the vertex id nor the statement count may decide the order. The
+		// dump comparison fails unless the columns are appended exactly as declared.
+	},
+	{
 		name: "Add one column and change ordering",
 		oldSchemaDDL: []string{
 			`
@@ -1296,16 +1320,51 @@ var columnAcceptanceTestCases = []acceptanceTestCase{
             );
 			`,
 		},
-		// expectedDBSchemaDDL reflects the actual column order after migration
-		// PostgreSQL adds columns in the order of execution, not declaration order
+		// The columns are appended in the declared order, so the migrated table matches the target.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
+	},
+	{
+		name:         "Add generated column that reads a later declared column",
+		oldSchemaDDL: []string{`CREATE TABLE foobar(id INT PRIMARY KEY);`},
+		newSchemaDDL: []string{`CREATE TABLE foobar(id INT PRIMARY KEY, g INT GENERATED ALWAYS AS (b + 1) STORED, b INT);`},
+		// ADD COLUMN g cannot run before b exists, so the target's order is unreachable: b comes first.
+		expectedDBSchemaDDL: []string{`CREATE TABLE foobar(id INT PRIMARY KEY, b INT, g INT GENERATED ALWAYS AS (b + 1) STORED);`},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
+	},
+	{
+		name: "Add generated column that reads a later declared column among other added columns",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY
+            );
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                zeta INT,
+                g INT GENERATED ALWAYS AS (beta + id) STORED,
+                beta INT,
+                alpha INT
+            );
+			`,
+		},
+		// g waits for beta, which it reads; every other column keeps the target's order, so g
+		// moves only as far as beta and alpha still comes last.
 		expectedDBSchemaDDL: []string{
 			`
-            CREATE TABLE products (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                price NUMERIC(10,2) NOT NULL,
-                display_name TEXT GENERATED ALWAYS AS (upper(name)) STORED,
-                price_with_tax NUMERIC(10,2) GENERATED ALWAYS AS (price * 1.1) STORED
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                zeta INT,
+                beta INT,
+                g INT GENERATED ALWAYS AS (beta + id) STORED,
+                alpha INT
             );
 			`,
 		},

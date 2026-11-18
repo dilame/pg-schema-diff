@@ -852,6 +852,113 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 		// Between the two the restrictive policy is absent, which the hazards say.
 		expectedHazardTypes: []diff.MigrationHazardType{diff.MigrationHazardTypeAuthzUpdate},
 	},
+	{
+		name: "Alter policy to stop reading a table the plan drops",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE TABLE foobar_grant(id INT, grantee UUID);
+                CREATE VIEW foobar_view AS SELECT id FROM foobar;
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar_grant g WHERE g.id = foobar.grant_id
+                    ));
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE TABLE foobar_access(foobar_id INT, grantee UUID);
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar_access a WHERE a.foobar_id = foobar.id
+                    ));
+			`,
+		},
+		// PostgreSQL refuses DROP TABLE foobar_grant while the policy's expression still reads it,
+		// so the ALTER POLICY has to run before the drop (and after foobar_access exists). The
+		// dropped view holds the table's own vertex back behind a deletion, so only an explicit
+		// dependency keeps it ahead of the drop of foobar_grant.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeDeletesData,
+		},
+	},
+	{
+		name: "Alter policy to stop reading a dropped table whose own policy reads the altered table",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE TABLE foobar_grant(id INT, foobar_id INT);
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar_grant g WHERE g.id = foobar.grant_id
+                    ));
+                CREATE POLICY foobar_grant_policy ON foobar_grant
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar f WHERE f.id = foobar_grant.foobar_id
+                    ));
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (grant_id IS NOT NULL);
+			`,
+		},
+		// The two policies read each other's tables. foobar's policy has to change before
+		// foobar_grant is dropped; foobar_grant's policy goes with its table and needs foobar to
+		// exist, which it does throughout. Ordering the drop before foobar's (no-op) delete would
+		// put it before foobar's alter too, a cycle with the first requirement.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeDeletesData,
+		},
+	},
+	{
+		name: "Drop policy of an existing table together with the table it reads",
+		oldSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+                CREATE VIEW foobar_grant AS SELECT 1 AS id;
+                CREATE VIEW foobar_view AS SELECT id FROM foobar;
+                CREATE POLICY foobar_policy ON foobar
+                    AS PERMISSIVE
+                    FOR SELECT
+                    TO PUBLIC
+                    USING (EXISTS (
+                        SELECT 1 FROM foobar_grant g WHERE g.id = foobar.grant_id
+                    ));
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+                CREATE TABLE foobar(id INT, grant_id INT);
+			`,
+		},
+		// The relation is a view here, so the order holds for every relation kind a policy reads.
+		// The dropped foobar_view holds the table's vertex, which drops the policy, back behind a
+		// deletion, as in the case above.
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
 }
 
 func TestPolicyCases(t *testing.T) {
