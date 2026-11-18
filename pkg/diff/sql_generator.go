@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stripe/pg-schema-diff/internal/graph"
 	"github.com/stripe/pg-schema-diff/internal/pgidentifier"
 	"github.com/stripe/pg-schema-diff/internal/schema"
 )
@@ -1455,7 +1456,10 @@ func (t *tableSQLVertexGenerator) alterBaseTable(diff tableDiff) ([]Statement, e
 
 	var partialGraph partialSQLGraph
 
-	columnGenerator := newColumnSQLVertexGenerator(diff.new, diff.columnsDiff.adds)
+	columnGenerator, err := newColumnSQLVertexGenerator(diff.new, diff.columnsDiff.adds)
+	if err != nil {
+		return nil, err
+	}
 	columnsPartialGraph, err := generatePartialGraph(columnGenerator, diff.columnsDiff)
 	if err != nil {
 		return nil, fmt.Errorf("resolving index diff: %w", err)
@@ -1837,7 +1841,9 @@ func consumerPolicyFunctionDependencies(oldTable, newTable schema.Table) []depen
 // reading. PostgreSQL records the relations a policy expression reads as dependencies of the policy
 // and refuses to drop one while the old expression still reads it, so the table's statement
 // stream, which carries the policy's DROP / ALTER, has to run first. A relation the policy keeps
-// reading is left out: the policy still needs it afterwards.
+// reading is left out: the policy still needs it afterwards. That includes a relation the plan
+// drops and re-creates, which this does not order against the policy (a known limit, stated in the
+// README).
 func replacedPolicyRelationDeleteDependencies(oldTable, newTable schema.Table, droppedRelationsByName map[string]bool) []dependency {
 	newPoliciesByName := buildSchemaObjByNameMap(newTable.Policies)
 	var deps []dependency
@@ -1853,7 +1859,7 @@ func replacedPolicyRelationDeleteDependencies(oldTable, newTable schema.Table, d
 			}
 		}
 		for _, rel := range oldPolicy.DependsOnRelations {
-			if rel.GetName() == oldTable.GetName() || stillRead[rel.GetName()] || !droppedRelationsByName[rel.GetName()] {
+			if stillRead[rel.GetName()] || !droppedRelationsByName[rel.GetName()] {
 				continue
 			}
 			deps = append(deps, mustRun(buildTableVertexId(newTable.SchemaQualifiedName, diffTypeAddAlter)).before(buildRelationVertexId(rel, diffTypeDelete)))
@@ -1901,30 +1907,75 @@ func buildDroppedRelationsByName(diff schemaDiff) map[string]bool {
 
 type columnSQLVertexGenerator struct {
 	tableName schema.SchemaQualifiedName
-	// previousAddedColumnByName maps each column the plan adds to the added column that precedes it
-	// in the target table. ADD COLUMN appends, so the adds have to run in the target's physical order.
+	// previousAddedColumnByName maps each column the plan adds to the added column that runs right
+	// before it (see addedColumnsInAddOrder).
 	previousAddedColumnByName map[string]string
 }
 
 // newColumnSQLVertexGenerator builds the column generator of an existing table. newTable is the
 // target table and addedColumns the columns the plan adds to it, in any order.
-func newColumnSQLVertexGenerator(newTable schema.Table, addedColumns []schema.Column) sqlVertexGenerator[schema.Column, columnDiff] {
-	added := buildSchemaObjByNameMap(addedColumns)
+func newColumnSQLVertexGenerator(newTable schema.Table, addedColumns []schema.Column) (sqlVertexGenerator[schema.Column, columnDiff], error) {
+	addOrder, err := addedColumnsInAddOrder(newTable, addedColumns)
+	if err != nil {
+		return nil, fmt.Errorf("ordering the columns added to %s: %w", newTable.GetFQEscapedName(), err)
+	}
 	previousAddedColumnByName := make(map[string]string)
-	previous := ""
-	for _, c := range newTable.Columns {
-		if _, ok := added[c.GetName()]; !ok {
-			continue
-		}
-		if previous != "" {
-			previousAddedColumnByName[c.GetName()] = previous
-		}
-		previous = c.GetName()
+	for i := 1; i < len(addOrder); i++ {
+		previousAddedColumnByName[addOrder[i]] = addOrder[i-1]
 	}
 	return legacyToNewSqlVertexGenerator[schema.Column, columnDiff](&columnSQLVertexGenerator{
 		tableName:                 newTable.SchemaQualifiedName,
 		previousAddedColumnByName: previousAddedColumnByName,
+	}), nil
+}
+
+// addedColumnVertex is a column the plan adds to an existing table, placed by its position in the
+// target table.
+type addedColumnVertex struct {
+	name     string
+	position int
+}
+
+func (v addedColumnVertex) GetId() string {
+	return v.name
+}
+
+// addedColumnsInAddOrder returns the names of the columns the plan adds to an existing table in the
+// order their ADD COLUMN statements run. A column comes after every added column its generation
+// expression reads, since PostgreSQL refuses the ADD COLUMN before they exist; among the columns
+// those dependencies leave free, the one declared first in the target goes first. ADD COLUMN
+// appends, so this keeps the target's physical order wherever the dependencies allow it, and the
+// target order never outranks a dependency.
+func addedColumnsInAddOrder(newTable schema.Table, addedColumns []schema.Column) ([]string, error) {
+	added := buildSchemaObjByNameMap(addedColumns)
+	g := graph.NewGraph[addedColumnVertex]()
+	for position, c := range newTable.Columns {
+		if _, ok := added[c.GetName()]; ok {
+			g.AddVertex(addedColumnVertex{name: c.GetName(), position: position})
+		}
+	}
+	for _, c := range addedColumns {
+		for _, read := range c.GenerationDependsOnColumns {
+			if !g.HasVertexWithId(read) {
+				// The column already exists, so nothing orders the add against it.
+				continue
+			}
+			if err := g.AddEdge(read, c.GetName()); err != nil {
+				return nil, fmt.Errorf("ordering %q after the column %q it reads: %w", c.GetName(), read, err)
+			}
+		}
+	}
+	vertices, err := g.TopologicallySortWithPriority(func(v1, v2 addedColumnVertex) bool {
+		return v1.position > v2.position
 	})
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, v := range vertices {
+		names = append(names, v.name)
+	}
+	return names, nil
 }
 
 func (csg *columnSQLVertexGenerator) Add(column schema.Column) ([]Statement, error) {

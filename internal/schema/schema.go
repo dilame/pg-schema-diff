@@ -554,7 +554,11 @@ type (
 		//   (price * 1.1)
 		// Only populated if GeneratedColumnType is not empty.
 		GenerationExpression string
-		IsNullable           bool
+		// GenerationDependsOnColumns names the other columns of the table the generation
+		// expression reads, in their physical order. PostgreSQL refuses to add a generated column
+		// before the columns it reads exist. Empty for an ordinary column.
+		GenerationDependsOnColumns []string
+		IsNullable                 bool
 		// HasMissingValOptimization refers to the 'attmissingval' optimization for adding columns with a default.
 		HasMissingValOptimization bool
 		// Size is the number of bytes required to store the value.
@@ -1866,6 +1870,11 @@ func (s *schemaFetcher) buildTable(
 		if err != nil {
 			return Table{}, fmt.Errorf("parsing the functions the default of column %q calls: %w", column.ColumnName, err)
 		}
+		// The query returns an empty array for a column that reads none; the model holds nil.
+		var generationDependsOnColumns []string
+		if len(column.GenerationDependsOnColumns) > 0 {
+			generationDependsOnColumns = column.GenerationDependsOnColumns
+		}
 		collation := SchemaQualifiedName{}
 		if len(column.CollationName) > 0 {
 			collation = SchemaQualifiedName{
@@ -1906,7 +1915,8 @@ func (s *schemaFetcher) buildTable(
 			Identity:             identity,
 			Description:          column.Description,
 
-			DefaultDependsOnFunctions: defaultDependsOnFunctions,
+			GenerationDependsOnColumns: generationDependsOnColumns,
+			DefaultDependsOnFunctions:  defaultDependsOnFunctions,
 		})
 	}
 

@@ -1326,6 +1326,53 @@ var columnAcceptanceTestCases = []acceptanceTestCase{
 		},
 	},
 	{
+		name:         "Add generated column that reads a later declared column",
+		oldSchemaDDL: []string{`CREATE TABLE foobar(id INT PRIMARY KEY);`},
+		newSchemaDDL: []string{`CREATE TABLE foobar(id INT PRIMARY KEY, g INT GENERATED ALWAYS AS (b + 1) STORED, b INT);`},
+		// ADD COLUMN g cannot run before b exists, so the target's order is unreachable: b comes first.
+		expectedDBSchemaDDL: []string{`CREATE TABLE foobar(id INT PRIMARY KEY, b INT, g INT GENERATED ALWAYS AS (b + 1) STORED);`},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
+	},
+	{
+		name: "Add generated column that reads a later declared column among other added columns",
+		oldSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY
+            );
+			`,
+		},
+		newSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                zeta INT,
+                g INT GENERATED ALWAYS AS (beta + id) STORED,
+                beta INT,
+                alpha INT
+            );
+			`,
+		},
+		// g waits for beta, which it reads; every other column keeps the target's order, so g
+		// moves only as far as beta and alpha still comes last.
+		expectedDBSchemaDDL: []string{
+			`
+            CREATE TABLE foobar(
+                id INT PRIMARY KEY,
+                zeta INT,
+                beta INT,
+                g INT GENERATED ALWAYS AS (beta + id) STORED,
+                alpha INT
+            );
+			`,
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
+	},
+	{
 		name: "Generated column with index",
 		oldSchemaDDL: []string{
 			`
