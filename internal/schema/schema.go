@@ -359,6 +359,9 @@ type CompositeTypeAttribute struct {
 	// `text[]`, or another schema-qualified composite type).
 	Type      string
 	Collation SchemaQualifiedName
+	// Description is the comment attached to the attribute (`COMMENT ON COLUMN type.attribute`).
+	// Empty means no comment.
+	Description string
 }
 
 func (a CompositeTypeAttribute) GetName() string {
@@ -1604,9 +1607,10 @@ func (s *schemaFetcher) fetchCompositeTypes(ctx context.Context, privilegesByNam
 			}
 		}
 		ct.Attributes = append(ct.Attributes, CompositeTypeAttribute{
-			Name:      row.AttributeName,
-			Type:      row.AttributeType,
-			Collation: collation,
+			Name:        row.AttributeName,
+			Type:        row.AttributeType,
+			Collation:   collation,
+			Description: row.AttributeDescription,
 		})
 	}
 

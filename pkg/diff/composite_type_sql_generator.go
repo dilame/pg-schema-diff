@@ -49,6 +49,9 @@ func (c *compositeTypeSQLVertexGenerator) Add(ct schema.CompositeType) (partialS
 		LockTimeout: lockTimeoutDefault,
 	}}
 	stmts = append(stmts, commentDDLForAdd(commentTargetType(ct.SchemaQualifiedName), ct.Description)...)
+	for _, attr := range ct.Attributes {
+		stmts = append(stmts, commentDDLForAdd(commentTargetColumn(ct.SchemaQualifiedName, attr.Name), attr.Description)...)
+	}
 	privilegeStmts, err := exactPrivilegeStatements(
 		newTypePrivilegeSQLVertexGenerator(ct.SchemaQualifiedName, "TYPE"),
 		ct.Privileges,
@@ -104,13 +107,22 @@ func (c *compositeTypeSQLVertexGenerator) Delete(ct schema.CompositeType) (parti
 }
 
 func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQLGraph, error) {
-	// Comment-only diffs are emitted as a COMMENT ON TYPE statement and do
-	// not require touching the type itself.
+	// Comment-only diffs — on the type or on its attributes — are emitted as
+	// COMMENT statements and do not require touching the type itself.
 	oldCopy := d.old
 	oldCopy.Description = d.new.Description
 	oldCopy.Privileges = d.new.Privileges
+	oldCopy.Attributes = withAttributeDescriptionsOf(d.old.Attributes, d.new.Attributes)
 	if cmp.Equal(oldCopy, d.new) {
 		stmts := commentDDLForAlter(commentTargetType(d.new.SchemaQualifiedName), d.old.Description, d.new.Description)
+		// The attribute lists are equal apart from their comments here, so the
+		// two lists pair by position.
+		for i, attr := range d.new.Attributes {
+			stmts = append(stmts, commentDDLForAlter(
+				commentTargetColumn(d.new.SchemaQualifiedName, attr.Name),
+				d.old.Attributes[i].Description, attr.Description,
+			)...)
+		}
 		privilegeStmts, err := generateTypePrivilegeStatements(d.new.SchemaQualifiedName, "TYPE", d.privilegesDiff)
 		if err != nil {
 			return partialSQLGraph{}, err
@@ -134,6 +146,21 @@ func (c *compositeTypeSQLVertexGenerator) Alter(d compositeTypeDiff) (partialSQL
 	// ErrNotImplemented so the user gets an explicit error rather than a
 	// silent drop.
 	return partialSQLGraph{}, fmt.Errorf("altering composite type attributes: %w", ErrNotImplemented)
+}
+
+// withAttributeDescriptionsOf returns attrs with each attribute's comment
+// replaced by the comment of the attribute at the same position in from. Lists
+// of different length come back unchanged: such a diff is not comment-only.
+func withAttributeDescriptionsOf(attrs, from []schema.CompositeTypeAttribute) []schema.CompositeTypeAttribute {
+	if len(attrs) != len(from) {
+		return attrs
+	}
+	out := make([]schema.CompositeTypeAttribute, len(attrs))
+	for i, attr := range attrs {
+		attr.Description = from[i].Description
+		out[i] = attr
+	}
+	return out
 }
 
 func buildCompositeTypeVertexId(name schema.SchemaQualifiedName, d diffType) sqlVertexId {

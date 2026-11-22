@@ -79,6 +79,68 @@ var compositeTypeAcceptanceTestCases = []acceptanceTestCase{
 		`},
 	},
 	{
+		name:         "create composite type with attribute comments",
+		oldSchemaDDL: []string{},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			COMMENT ON TYPE pair IS 'pair of values';
+			COMMENT ON COLUMN pair.a IS 'the first value';
+			COMMENT ON COLUMN pair.b IS 'the second value''s label';
+		`},
+		expectedPlanDDL: []string{
+			"CREATE TYPE \"public\".\"pair\" AS (\n\t\"a\" integer,\n\t\"b\" text COLLATE \"pg_catalog\".\"default\"\n)",
+			"COMMENT ON TYPE \"public\".\"pair\" IS 'pair of values'",
+			"COMMENT ON COLUMN \"public\".\"pair\".\"a\" IS 'the first value'",
+			"COMMENT ON COLUMN \"public\".\"pair\".\"b\" IS 'the second value''s label'",
+		},
+	},
+	{
+		name: "add comment to composite type attribute",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			COMMENT ON COLUMN pair.b IS 'the second value';
+		`},
+		expectedPlanDDL: []string{
+			"COMMENT ON COLUMN \"public\".\"pair\".\"b\" IS 'the second value'",
+		},
+	},
+	{
+		name: "change and remove composite type attribute comments",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			COMMENT ON COLUMN pair.a IS 'the first value';
+			COMMENT ON COLUMN pair.b IS 'the second value';
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			COMMENT ON COLUMN pair.a IS 'the leading value';
+		`},
+		expectedPlanDDL: []string{
+			"COMMENT ON COLUMN \"public\".\"pair\".\"a\" IS 'the leading value'",
+			"COMMENT ON COLUMN \"public\".\"pair\".\"b\" IS NULL",
+		},
+	},
+	{
+		name: "change attribute comment of composite type used by a table column and a function",
+		oldSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			CREATE TABLE holder (id int PRIMARY KEY, p pair);
+			CREATE FUNCTION first_of(p pair) RETURNS int LANGUAGE sql AS $$ SELECT (p).a $$;
+		`},
+		newSchemaDDL: []string{`
+			CREATE TYPE pair AS (a int, b text);
+			COMMENT ON COLUMN pair.a IS 'the first value';
+			CREATE TABLE holder (id int PRIMARY KEY, p pair);
+			CREATE FUNCTION first_of(p pair) RETURNS int LANGUAGE sql AS $$ SELECT (p).a $$;
+		`},
+		expectedPlanDDL: []string{
+			"COMMENT ON COLUMN \"public\".\"pair\".\"a\" IS 'the first value'",
+		},
+	},
+	{
 		name:         "create composite type used by function",
 		oldSchemaDDL: []string{},
 		newSchemaDDL: []string{`

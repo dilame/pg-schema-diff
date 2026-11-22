@@ -877,7 +877,10 @@ SELECT
     COALESCE(coll_ns.nspname, '')::TEXT AS collation_schema_name,
     COALESCE(
         pg_catalog.obj_description(pg_type.oid, 'pg_type'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    COALESCE(
+        pg_catalog.col_description(rel.oid, att.attnum), ''
+    )::TEXT AS attribute_description
 FROM pg_catalog.pg_type AS pg_type
 INNER JOIN
     pg_catalog.pg_namespace AS type_namespace
