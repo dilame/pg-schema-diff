@@ -459,7 +459,10 @@ SELECT
     COALESCE(coll_ns.nspname, '')::TEXT AS collation_schema_name,
     COALESCE(
         pg_catalog.obj_description(pg_type.oid, 'pg_type'), ''
-    )::TEXT AS description
+    )::TEXT AS description,
+    COALESCE(
+        pg_catalog.col_description(rel.oid, att.attnum), ''
+    )::TEXT AS attribute_description
 FROM pg_catalog.pg_type AS pg_type
 INNER JOIN
     pg_catalog.pg_namespace AS type_namespace
@@ -500,15 +503,16 @@ ORDER BY pg_type.oid, att.attnum
 `
 
 type GetCompositeTypesRow struct {
-	TypeOid             interface{}
-	TypeRelOid          interface{}
-	TypeName            string
-	TypeSchemaName      string
-	AttributeName       string
-	AttributeType       string
-	CollationName       string
-	CollationSchemaName string
-	Description         string
+	TypeOid              interface{}
+	TypeRelOid           interface{}
+	TypeName             string
+	TypeSchemaName       string
+	AttributeName        string
+	AttributeType        string
+	CollationName        string
+	CollationSchemaName  string
+	Description          string
+	AttributeDescription string
 }
 
 // Returns one row per (composite type, attribute)
@@ -534,6 +538,7 @@ func (q *Queries) GetCompositeTypes(ctx context.Context) ([]GetCompositeTypesRow
 			&i.CollationName,
 			&i.CollationSchemaName,
 			&i.Description,
+			&i.AttributeDescription,
 		); err != nil {
 			return nil, err
 		}

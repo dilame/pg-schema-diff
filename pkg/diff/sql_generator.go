@@ -1092,7 +1092,9 @@ func identifyCompositeTypesToRecreate(old, new []schema.CompositeType, recreated
 		if !ok {
 			continue
 		}
-		if !cmp.Equal(oldType.Attributes, newType.Attributes) {
+		// An attribute's comment is not part of the type's layout: a comment-only
+		// change is a COMMENT statement, never a re-creation.
+		if !cmp.Equal(withAttributeDescriptionsOf(oldType.Attributes, newType.Attributes), newType.Attributes) {
 			if oldType.IsUsedByTable {
 				return nil, fmt.Errorf("changing attributes of composite type %s used by a table column: %w", newType.GetFQEscapedName(), ErrNotImplemented)
 			}
